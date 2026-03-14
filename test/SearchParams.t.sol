@@ -1118,8 +1118,8 @@ contract SearchParams is Test {
     /// @notice Debug: observe D changes per round for remain=67000
     function test_debugDConvergence67000() public {
         uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
-        uint256 balWETH = 10000;
-        uint256 balOSETH = 10000;
+        uint256 balWETH = 67000;
+        uint256 balOSETH = 67000;
         uint256 prevD = _getInvariant(balWETH, balOSETH);
 
         console.log("=== D CONVERGENCE DEBUG: remain=67000 ===");
