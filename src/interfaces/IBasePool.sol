@@ -133,6 +133,14 @@ interface IBasePool {
     function getRate() external view returns (uint256);
 
     /**
+     * @dev Returns the cached protocol fee percentage for a given fee type.
+     * Fee types: 0 = SWAP, 1 = AUM, 2 = YIELD.
+     */
+    function getProtocolFeePercentageCache(uint256 feeType) external view returns (uint256);
+
+    function getLastJoinExitData() external view returns (uint256 lastJoinExitAmplification, uint256 lastPostJoinExitInvariant);
+
+    /**
      * @dev Returns the scaling factors of each of the Pool's tokens. This is an implementation detail that is typically
      * not relevant for outside parties, but which might be useful for some types of Pools.
      */

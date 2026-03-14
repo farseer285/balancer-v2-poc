@@ -10,6 +10,28 @@ library FixedPoint {
         return product / ONE;
     }
 
+    function mulUp(uint256 a, uint256 b) internal pure returns (uint256 result) {
+        uint256 product = a * b;
+
+        // The traditional divUp formula is:
+        // divUp(x, y) := (x + y - 1) / y
+        // To avoid intermediate overflow in the addition, we distribute the division and get:
+        // divUp(x, y) := (x - 1) / y + 1
+        // Note that this requires x != 0, if x == 0 then the result is zero
+        assembly {
+            result := mul(iszero(iszero(product)), add(div(sub(product, 1), 1000000000000000000), 1))
+        }
+    }
+
+    function divDown(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b != 0, "ZERO_DIVISION");
+
+        uint256 aInflated = a * ONE;
+        require(a == 0 || aInflated / a == ONE, "DIV_INTERNAL"); // mul overflow
+
+        return aInflated / b;
+    }
+
     function divUp(uint256 a, uint256 b) internal pure returns (uint256 result) {
         require(b != 0, "ZERO_DIVISION");
 
