@@ -144,11 +144,43 @@ contract SwapMath {
         uint256 amountIn =
             StableMath._calcInGivenOut(amp, balances, indexIn, indexOut, swapOutAmountAfterScale, invariant);
 
-        // Apply swap fee in upscaled domain first: amountIn / (1 - swapFee)
-        amountIn = amountIn.divUp(swapFeePercentage.complement());
+        // Downscale first (round up), then apply swap fee — matches on-chain BaseGeneralPool._swapGivenOut
+        uint256 rawAmountIn = _downscaleUp(amountIn, scalingFactors[indexIn]);
 
-        // Then downscale to raw units (round up)
-        uint256 rawAmountInWithFee = _downscaleUp(amountIn, scalingFactors[indexIn]);
+        // Then add swap fee: rawAmountIn / (1 - swapFee)
+        uint256 rawAmountInWithFee = rawAmountIn.divUp(swapFeePercentage.complement());
+
+        uint256[] memory newBalances = new uint256[](balances.length);
+        newBalances[indexIn] = balancesIn + rawAmountInWithFee;
+        newBalances[indexOut] = balancesOut - swapOutAmount;
+
+        return newBalances;
+    }
+
+    /// @notice Same as getAfterSwapOutBalances but with downscale→fee order (like BalancerV2_exp Helper)
+    function getAfterSwapOutBalances_downscaleThenFee(
+        uint256[] memory balances,
+        uint256[] memory scalingFactors,
+        uint256 indexIn,
+        uint256 indexOut,
+        uint256 swapOutAmount,
+        uint256 amp,
+        uint256 swapFeePercentage
+    ) external pure returns (uint256[] memory) {
+        uint256 balancesIn = balances[indexIn];
+        uint256 balancesOut = balances[indexOut];
+
+        _upscaleArray(balances, scalingFactors);
+
+        uint256 swapOutAmountAfterScale = swapOutAmount * scalingFactors[indexOut] / FixedPoint.ONE;
+
+        uint256 invariant = StableMath._calculateInvariant(amp, balances);
+        uint256 amountIn =
+            StableMath._calcInGivenOut(amp, balances, indexIn, indexOut, swapOutAmountAfterScale, invariant);
+
+        // Downscale first, then apply fee (BalancerV2_exp order)
+        uint256 rawAmountIn = _downscaleUp(amountIn, scalingFactors[indexIn]);
+        uint256 rawAmountInWithFee = rawAmountIn.divUp(swapFeePercentage.complement());
 
         uint256[] memory newBalances = new uint256[](balances.length);
         newBalances[indexIn] = balancesIn + rawAmountInWithFee;
