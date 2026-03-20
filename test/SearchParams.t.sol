@@ -444,21 +444,29 @@ contract SearchParams is Test {
         internal pure returns (uint256[] memory amounts, uint256 count)
     {
         amounts = new uint256[](maxLength);
-        uint256 remaining = balance;
+        uint256 preAmount = 0;
+        uint256 sumAmount = 0;
         count = 0;
 
         for (uint256 i = 0; i < maxLength; i++) {
-            if (remaining <= targetRemain) break;
-            uint256 excess = remaining - targetRemain;
-            uint256 amount = excess * 99 / 100;
-            if (amount == 0) {
-                amounts[i] = excess;
+            uint256 amount;
+            if (preAmount == 0) {
+                preAmount = 99 * balance - 99 * targetRemain;
+            } else {
+                preAmount = preAmount - 99 * (preAmount / 100);
+            }
+            amount = preAmount / 100;
+            uint256 nextAmount = preAmount - 99 * (preAmount / 100);
+            if (nextAmount < 100) {
+                amount = balance - sumAmount - targetRemain;
+                amounts[i] = amount;
                 count++;
                 break;
+            } else {
+                sumAmount += amount;
+                amounts[i] = amount;
+                count++;
             }
-            amounts[i] = amount;
-            remaining -= amount;
-            count++;
         }
     }
 
