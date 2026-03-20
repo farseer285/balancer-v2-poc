@@ -23,6 +23,7 @@ contract SearchParams is Test {
 
     function setUp() public {
         vm.createSelectFork("ETH", 23717396);
+        vm.warp(1762156007); // block 23717397's timestamp, so rate provider returns the same rate as the real attack
         swapMath = new SwapMath();
 
         // Fetch pool parameters
