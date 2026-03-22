@@ -42,7 +42,7 @@ library StableMath {
         uint256 invariant = sum; // D in the Curve version
         uint256 ampTimesTotal = amplificationParameter * numTokens; // Ann in the Curve version
 
-        for (uint256 i = 0; i < 30; i++) {
+        for (uint256 i = 0; i < 255; i++) {
             uint256 D_P = invariant;
 
             for (uint256 j = 0; j < numTokens; j++) {
@@ -256,7 +256,7 @@ library StableMath {
         // initial approximation.
         uint256 tokenBalance = Math.divUp(inv2 + c, invariant + b);
 
-        for (uint256 i = 0; i < 30; i++) {
+        for (uint256 i = 0; i < 255; i++) {
             prevTokenBalance = tokenBalance;
 
             tokenBalance =
