@@ -61,6 +61,30 @@ contract SwapMath {
         return amountIn;
     }
 
+    /// @notice Like getTokenInForBptOut, but also returns the exact post-join invariant
+    /// computed from the original upscaled amountIn (before downscaling).
+    /// This avoids the 1-wei error from downscale→re-upscale roundtrip on non-1e18 scaling factors.
+    function getTokenInForBptOutAndPostInvariant(
+        uint256[] memory balances,
+        uint256[] memory scalingFactors,
+        uint256 tokenIndex,
+        uint256 bptAmountOut,
+        uint256 bptTotalSupply,
+        uint256 amp,
+        uint256 swapFeePercentage
+    ) external pure returns (uint256 rawAmountIn, uint256 postInvariant) {
+        _upscaleArray(balances, scalingFactors);
+        uint256 invariant = StableMath._calculateInvariant(amp, balances);
+        uint256 amountIn = StableMath._calcTokenInGivenExactBptOut(
+            amp, balances, tokenIndex, bptAmountOut, bptTotalSupply, invariant, swapFeePercentage
+        );
+        // Compute post-invariant using the ORIGINAL upscaled amountIn (before downscaling)
+        balances[tokenIndex] += amountIn;
+        postInvariant = StableMath._calculateInvariant(amp, balances);
+        // Downscale for the raw return value
+        rawAmountIn = _downscaleUp(amountIn, scalingFactors[tokenIndex]);
+    }
+
     /// @notice Calculate how many tokens a user receives when burning `bptAmountIn` BPT,
     /// matching ComposableStablePool's _onExitSwap logic.
     /// Returns the raw amountOut (after swap fee deduction).
@@ -155,6 +179,46 @@ contract SwapMath {
         newBalances[indexOut] = balancesOut - swapOutAmount;
 
         return newBalances;
+    }
+
+    /// @notice Like getAfterSwapOutBalances, but also returns the post-swap invariant
+    /// computed from the upscaled post-swap balances (matching the contract's _afterSwapJoinExit).
+    function getAfterSwapOutBalancesAndPostInvariant(
+        uint256[] memory balances,
+        uint256[] memory scalingFactors,
+        uint256 indexIn,
+        uint256 indexOut,
+        uint256 swapOutAmount,
+        uint256 amp,
+        uint256 swapFeePercentage
+    ) external pure returns (uint256[] memory, uint256 postInvariant) {
+        uint256 balancesIn = balances[indexIn];
+        uint256 balancesOut = balances[indexOut];
+
+        _upscaleArray(balances, scalingFactors);
+
+        uint256 swapOutAmountAfterScale = swapOutAmount * scalingFactors[indexOut] / FixedPoint.ONE;
+
+        uint256 invariant = StableMath._calculateInvariant(amp, balances);
+        uint256 amountIn =
+            StableMath._calcInGivenOut(amp, balances, indexIn, indexOut, swapOutAmountAfterScale, invariant);
+
+        // Downscale first (round up), then apply swap fee
+        uint256 rawAmountIn = _downscaleUp(amountIn, scalingFactors[indexIn]);
+        uint256 rawAmountInWithFee = rawAmountIn.divUp(swapFeePercentage.complement());
+
+        // Compute post-invariant from upscaled post-swap balances (as the contract does)
+        // The fee portion stays in the pool, so upscale the raw fee-inclusive amount
+        uint256 upscaledAmountInWithFee = rawAmountInWithFee * scalingFactors[indexIn] / FixedPoint.ONE;
+        balances[indexIn] += upscaledAmountInWithFee;
+        balances[indexOut] -= swapOutAmountAfterScale;
+        postInvariant = StableMath._calculateInvariant(amp, balances);
+
+        uint256[] memory newBalances = new uint256[](balances.length);
+        newBalances[indexIn] = balancesIn + rawAmountInWithFee;
+        newBalances[indexOut] = balancesOut - swapOutAmount;
+
+        return (newBalances, postInvariant);
     }
 
     /// @notice Same as getAfterSwapOutBalances but with downscale→fee order (like BalancerV2_exp Helper)

