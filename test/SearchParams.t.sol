@@ -1599,9 +1599,13 @@ contract SearchParams is Test {
             console.log("[SP] yieldFeeBpt: 0 (no yield fee or fee rate is 0)");
         }
 
-        console.log("=== DETAILED TOKEN BREAKDOWN: remain=94000, N=30 ===");
+        console.log("=== DETAILED TOKEN BREAKDOWN: remain=67000, N=30 ===");
 
         // Step 1: extract tokens (per-token)
+        // The attacker's total BPT debt (bptSold) consists of two parts:
+        //   bptSold = (actualSupply - finalSupply) + totalFeeBpt
+        //   1. actualSupply - finalSupply: BPT shares genuinely redeemed from the pool
+        //   2. totalFeeBpt: extra BPT cost caused by protocol fee minting inflating virtualSupply
         (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply) =
             _simulateStep1ExtractionDetailed(realWETH, realOSETH, remain, totalBPT);
         console.log("--- Step 1: Token Extraction ---");
