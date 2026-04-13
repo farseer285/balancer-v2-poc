@@ -759,7 +759,9 @@ contract SearchParams is Test {
         // This is a GAIN for the attacker, not a cost.
         uint256 cyclingGain = sumAfter < 2 * remain ? 2 * remain - sumAfter : 0;
         // Step 2 (cycling) doesn't involve BPT, so virtualSupply stays at postStep1Supply
-        uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptSold, postStep1Supply);
+        // Use the real attack's bptTarget = actualSupply * 10030 / 10000 (not bptSold)
+        uint256 bptTarget = totalBPT * 10030 / 10000;
+        uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptTarget, postStep1Supply);
         if (tokensExtracted + cyclingGain < repaymentCost) return 0; // net loss
         return tokensExtracted + cyclingGain - repaymentCost;
     }
@@ -1669,6 +1671,7 @@ contract SearchParams is Test {
         console.log("Net osETH (ETH):", netOseth / 1e18);
         console.log("Net BPT (wei):", netBpt);
         console.log("Net BPT (ETH):", netBpt / 1e18);
+        console.log("Total profit (ETH):", netWeth + netOseth);
         console.log("Total profit (ETH):", (netWeth + netOseth) / 1e18);
 
         console.log("=== REAL ATTACK COMPARISON ===");
