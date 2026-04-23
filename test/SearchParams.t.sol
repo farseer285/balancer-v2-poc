@@ -107,8 +107,10 @@ contract SearchParams is Test {
     /// Returns (swapOut3, newBalWETH, newBalOSETH). Reverts if all 3 attempts fail.
     function _computeSwap3(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256) {
         uint256 swapOut3 = _truncateToTop2Digits(balWETH);
-        // parameters [950 / 1000, 66000, 30] make total profit 11514 ETH
-        //uint256 swapOut3 = balWETH * 999 / 1000;
+        // parameters [950 / 1000, 66000,  30] make total profit 11514 ETH
+        // parameters [850 / 1000, 94000,  30] make total profit 11560 ETH
+        // parameters [920 / 1000, 100000, 30] make total profit 11572 ETH
+        // uint256 swapOut3 = balWETH * 999 / 1000;
 
         // Attempt 1: truncated amount
         try this.trySwap(balWETH, balOSETH, 1, 0, swapOut3) returns (uint256 w, uint256 o) {
