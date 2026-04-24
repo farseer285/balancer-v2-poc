@@ -110,6 +110,7 @@ contract SearchParams is Test {
         // parameters [950 / 1000, 66000,  30] make total profit 11514 ETH
         // parameters [850 / 1000, 94000,  30] make total profit 11560 ETH
         // parameters [920 / 1000, 100000, 30] make total profit 11572 ETH
+        // parameters [920 / 1000, 238000, 30] make total profit 11660 ETH
         // uint256 swapOut3 = balWETH * 999 / 1000;
 
         // Attempt 1: truncated amount
