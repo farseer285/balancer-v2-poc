@@ -3,6 +3,7 @@ src = "src"
 out = "out"
 libs = ["dependencies"]
 via_ir = true
+#optimizer = true
 
 remappings = [
     "forge-std/=dependencies/forge-std-1.11.0/src/"

@@ -1467,12 +1467,20 @@ contract SearchParams is Test {
         newSupply = postSupply + feeBpt;
     }
 
+    struct Step1DetailedResult {
+        uint256 totalWethOut;
+        uint256 totalOsethOut;
+        uint256 totalBptSold;
+        uint256 remainingSupply;
+        uint256 lastPostJoinExitInvariant;
+    }
+
     function _simulateStep1ExtractionDetailed(
         uint256 realWETH,
         uint256 realOSETH,
         uint256 targetRemain,
         uint256 bptSupply
-    ) internal returns (uint256 totalWethOut, uint256 totalOsethOut, uint256 totalBptSold, uint256 remainingSupply, uint256 lastPostJoinExitInvariant) {
+    ) internal returns (Step1DetailedResult memory r) {
         (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(realWETH, targetRemain, 15);
         (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(realOSETH, targetRemain, 15);
 
@@ -1489,9 +1497,9 @@ contract SearchParams is Test {
                 uint256 bptIn;
                 uint256 postInv;
                 (bW, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 0, wethAmounts[i], preInv);
-                totalBptSold += bptIn;
-                totalWethOut += wethAmounts[i];
-                lastPostJoinExitInvariant = postInv;
+                r.totalBptSold += bptIn;
+                r.totalWethOut += wethAmounts[i];
+                r.lastPostJoinExitInvariant = postInv;
                 console.log("[SP1] step", i, "WETH supply_after:", supply);
             }
             if (i < osethCount) {
@@ -1499,13 +1507,13 @@ contract SearchParams is Test {
                 uint256 bptIn;
                 uint256 postInv;
                 (bO, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 1, osethAmounts[i], preInv);
-                totalBptSold += bptIn;
-                totalOsethOut += osethAmounts[i];
-                lastPostJoinExitInvariant = postInv;
+                r.totalBptSold += bptIn;
+                r.totalOsethOut += osethAmounts[i];
+                r.lastPostJoinExitInvariant = postInv;
                 console.log("[SP1] step", i, "OSETH supply_after:", supply);
             }
         }
-        remainingSupply = supply;
+        r.remainingSupply = supply;
     }
 
     /// @notice Debug version with per-step logging matching EXP output format
@@ -1633,8 +1641,13 @@ contract SearchParams is Test {
         //   bptSold = (actualSupply - finalSupply) + totalFeeBpt
         //   1. actualSupply - finalSupply: BPT shares genuinely redeemed from the pool
         //   2. totalFeeBpt: extra BPT cost caused by protocol fee minting inflating virtualSupply
-        (uint256 wethOut, uint256 osethOut, uint256 bptSold, uint256 postStep1Supply, uint256 phase1Invariant) =
+        Step1DetailedResult memory s1 =
             _simulateStep1ExtractionDetailed(realWETH, realOSETH, remain, totalBPT);
+        uint256 wethOut = s1.totalWethOut;
+        uint256 osethOut = s1.totalOsethOut;
+        uint256 bptSold = s1.totalBptSold;
+        uint256 postStep1Supply = s1.remainingSupply;
+        uint256 phase1Invariant = s1.lastPostJoinExitInvariant;
         console.log("--- Step 1: Token Extraction ---");
         console.log("WETH extracted:", wethOut);
         console.log("osETH extracted:", osethOut);
@@ -1938,7 +1951,7 @@ contract SearchParams is Test {
         console.log("Minimum Phase 3 BPT buyback:", minBuyback);
 
         // Compare with simulation
-        (,, uint256 bptSold,,) = _simulateStep1ExtractionDetailed(balances[0], balances[2], remain, totalBPT);
+        uint256 bptSold = _simulateStep1ExtractionDetailed(balances[0], balances[2], remain, totalBPT).totalBptSold;
         console.log("Simulation BPT sold (Phase 1):", bptSold);
 
         // Compare with attacker's bptTarget formula
