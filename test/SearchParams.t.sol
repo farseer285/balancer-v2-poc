@@ -1475,6 +1475,12 @@ contract SearchParams is Test {
         uint256 lastPostJoinExitInvariant;
     }
 
+    struct Step1BalState {
+        uint256 bW;
+        uint256 bO;
+        uint256 supply;
+    }
+
     function _simulateStep1ExtractionDetailed(
         uint256 realWETH,
         uint256 realOSETH,
@@ -1484,36 +1490,34 @@ contract SearchParams is Test {
         (uint256[] memory wethAmounts, uint256 wethCount) = _generateStep1Amounts(realWETH, targetRemain, 15);
         (uint256[] memory osethAmounts, uint256 osethCount) = _generateStep1Amounts(realOSETH, targetRemain, 15);
 
-        uint256 bW = realWETH;
-        uint256 bO = realOSETH;
-        uint256 supply = bptSupply;
+        Step1BalState memory s = Step1BalState({bW: realWETH, bO: realOSETH, supply: bptSupply});
 
         // Use fresh invariant from current balances for all steps (matches _simulateStep1Extraction).
 
         uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
         for (uint256 i = 0; i < maxSwaps; i++) {
             if (i < wethCount) {
-                uint256 preInv = _getInvariant(bW, bO);
+                uint256 preInv = _getInvariant(s.bW, s.bO);
                 uint256 bptIn;
                 uint256 postInv;
-                (bW, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 0, wethAmounts[i], preInv);
+                (s.bW, s.supply, bptIn, postInv) = _doSingleExitStep(s.bW, s.bO, s.supply, 0, wethAmounts[i], preInv);
                 r.totalBptSold += bptIn;
                 r.totalWethOut += wethAmounts[i];
                 r.lastPostJoinExitInvariant = postInv;
-                console.log("[SP1] step", i, "WETH supply_after:", supply);
+                console.log("[SP1] step", i, "WETH supply_after:", s.supply);
             }
             if (i < osethCount) {
-                uint256 preInv = _getInvariant(bW, bO);
+                uint256 preInv = _getInvariant(s.bW, s.bO);
                 uint256 bptIn;
                 uint256 postInv;
-                (bO, supply, bptIn, postInv) = _doSingleExitStep(bW, bO, supply, 1, osethAmounts[i], preInv);
+                (s.bO, s.supply, bptIn, postInv) = _doSingleExitStep(s.bW, s.bO, s.supply, 1, osethAmounts[i], preInv);
                 r.totalBptSold += bptIn;
                 r.totalOsethOut += osethAmounts[i];
                 r.lastPostJoinExitInvariant = postInv;
-                console.log("[SP1] step", i, "OSETH supply_after:", supply);
+                console.log("[SP1] step", i, "OSETH supply_after:", s.supply);
             }
         }
-        r.remainingSupply = supply;
+        r.remainingSupply = s.supply;
     }
 
     /// @notice Debug version with per-step logging matching EXP output format
