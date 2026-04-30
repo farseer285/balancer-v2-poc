@@ -1713,7 +1713,7 @@ contract SearchParams is Test {
         console.log("Net osETH (ETH):", netOseth / 1e18);
         console.log("Net BPT (wei):", netBpt);
         console.log("Net BPT (ETH):", netBpt / 1e18);
-        console.log("Total profit (ETH):", netWeth + netOseth);
+        console.log("Total profit (wei):", netWeth + netOseth);
         console.log("Total profit (ETH):", (netWeth + netOseth) / 1e18);
 
         console.log("=== REAL ATTACK COMPARISON ===");
