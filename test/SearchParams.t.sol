@@ -103,7 +103,15 @@ contract SearchParams is Test {
     /// @notice Compute Swap 3 extraction amount using the attacker's actual method
     /// (confirmed by BlockSec analysis):
     /// 1. Truncate WETH balance to top 2 significant digits (e.g. 324816 → 320000)
-    /// 2. If swap fails (Newton-Raphson divergence), retry with 9/10 fallback (up to 2 retries)
+    /// 2. If swap fails, retry with 9/10 fallback (up to 2 retries).
+    ///    The primary failure mode of Attempt 1 is BAL#004 (ZERO_DIVISION), NOT
+    ///    Newton-Raphson divergence (BAL#321/BAL#322).
+    ///    Root cause: _truncateToTop2Digits extracts ~98-99% of balWETH, leaving a
+    ///    tiny remainder. Inside _getTokenBalanceGivenInvariantAndAllOtherBalances,
+    ///    P_D = floor(4 * remainder * balOSETH / D). Since balOSETH=1 (D-crashed)
+    ///    and remainder << D, P_D floors to 0, causing Math.divUp(inv2, 0) to revert.
+    ///    The ×0.9 fallback reduces swapOut3, increasing the remainder ~9×, which
+    ///    raises P_D above 0 and avoids the ZERO_DIVISION.
     /// Returns (swapOut3, newBalWETH, newBalOSETH). Reverts if all 3 attempts fail.
     function _computeSwap3(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256) {
         uint256 swapOut3 = _truncateToTop2Digits(balWETH);
