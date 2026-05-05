@@ -3263,12 +3263,14 @@ contract SearchParams is Test {
 
     /// @notice Validate a single off-chain-tuned `remain` value's future safety window.
     /// Workflow it supports:
-    ///   1. Off-chain optimization at the current head block produced REMAIN = R*.
+    ///   1. Off-chain optimization at head block N produced REMAIN = R*.
     ///   2. We want to know: for how many consecutive future blocks (N, N+1, ..., N+K)
     ///      will Phase 2 cycling with REMAIN = R* still pass all 30 rounds?
     /// Method:
-    ///   - Fork at the current block (done in setUp at 23717396, ts=1762156007).
-    ///   - b=0 baseline: run cycling at the current sf[1].
+    ///   - Re-fork at BLOCK_NUM (overrides setUp()'s vm.warp so block.timestamp = the
+    ///     real on-chain ts of BLOCK_NUM; allows BLOCK_NUM to be parameterized freely).
+    ///   - Refresh rate cache so sf[1] matches what the rate provider returns at that ts.
+    ///   - b=0 baseline: run cycling at this sf[1].
     ///   - Forward scan: for b = 1..LIMIT, vm.warp(baseTs + b*12), refresh sf[1] from
     ///     the rate provider's natural linear extrapolation (same method used by the
     ///     real attack tx and by test_realForkSafeRunDistribution), then run cycling.
@@ -3276,9 +3278,17 @@ contract SearchParams is Test {
     /// Note: amp / swapFee assumed constant in the scan window
     /// (proven by test_diag_ampAndFeeStability for ranges relevant to this pool).
     function test_validateRemainFutureWindow() public {
-        uint256 REMAIN = 67000;
-        uint256 ROUNDS = 30;
-        uint256 LIMIT  = 400;
+        uint256 BLOCK_NUM = 23717396; // change this to any head block you computed REMAIN at
+        uint256 REMAIN    = 67000;
+        uint256 ROUNDS    = 30;
+        uint256 LIMIT     = 400;
+
+        // Re-fork to BLOCK_NUM so block.timestamp = the real on-chain ts of that block
+        // (overrides whatever setUp() warped to). _refreshAtCurrentFork() then updates
+        // the rate cache and re-reads amp / sf / swapFee at this fresh state.
+        vm.createSelectFork("ETH", BLOCK_NUM);
+        swapMath = new SwapMath();
+        _refreshAtCurrentFork();
 
         uint256 baseTs = block.timestamp;
 
@@ -3291,6 +3301,7 @@ contract SearchParams is Test {
             } catch { break; }
         }
         console.log("=== validateRemainFutureWindow ===");
+        console.log("BLOCK_NUM       :", BLOCK_NUM);
         console.log("REMAIN          :", REMAIN);
         console.log("baseTs          :", baseTs);
         console.log("base sf[1]      :", sf[1]);
