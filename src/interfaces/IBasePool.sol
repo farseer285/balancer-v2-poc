@@ -126,6 +126,20 @@ interface IBasePool {
      */
     function updateTokenRateCache(IERC20 token) external;
 
+    /**
+     * @dev Returns the rate cache for `token`: (rate, oldRate, duration, expires).
+     * `rate` is the cached value, `expires` is the unix timestamp at which the cache expires.
+     */
+    function getTokenRateCache(IERC20 token)
+        external
+        view
+        returns (uint256 rate, uint256 oldRate, uint256 duration, uint256 expires);
+
+    /**
+     * @dev Returns the live rate for `token` from its rate provider (un-cached).
+     */
+    function getTokenRate(IERC20 token) external view returns (uint256);
+
     function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision);
 
     function getActualSupply() external view returns (uint256);

