@@ -3339,6 +3339,123 @@ contract SearchParams is Test {
         }
     }
 
+    /// @notice Map the FULL success/failure pattern of REMAIN over [N, N+LIMIT].
+    /// Unlike `test_validateRemainFutureWindow`, this does NOT stop at first failure —
+    /// it scans every block in the range and records pass/fail, so we can detect
+    /// non-monotonic cycling behavior (e.g. fail then succeed again).
+    /// Reports:
+    ///   - First failing block offset
+    ///   - Total #fails / #passes / longest contiguous fail run / longest contiguous
+    ///     pass run after first fail (==> evidence of non-monotonicity)
+    ///   - Per-segment summary [start..end] = PASS|FAIL
+    function test_validateRemainFullScan() public {
+        uint256 BLOCK_NUM = 23717396;
+        uint256 REMAIN    = 67000;
+        uint256 ROUNDS    = 30;
+        uint256 LIMIT     = 400;
+
+        vm.createSelectFork("ETH", BLOCK_NUM);
+        swapMath = new SwapMath();
+        _refreshAtCurrentFork();
+        uint256 baseTs = block.timestamp;
+
+        console.log("=== validateRemainFullScan ===");
+        console.log("BLOCK_NUM       :", BLOCK_NUM);
+        console.log("REMAIN          :", REMAIN);
+        console.log("baseTs          :", baseTs);
+        console.log("base sf[1]      :", sf[1]);
+
+        // Baseline at b=0
+        uint256 trickAmt0 = 1e18 / (sf[1] - 1e18);
+        uint256 bW0 = REMAIN; uint256 bO0 = REMAIN; uint256 base0 = 0;
+        for (uint256 r = 0; r < ROUNDS; r++) {
+            try this.simulateOneRound(bW0, bO0, trickAmt0) returns (uint256 nW, uint256 nO) {
+                bW0 = nW; bO0 = nO; base0++;
+            } catch { break; }
+        }
+        require(base0 == ROUNDS, "baseline does not pass 30 rounds");
+
+        // Full scan: do not break on failure
+        bool[401] memory passes; // index 0 = baseline (always true here)
+        passes[0] = true;
+        uint256 totalPass = 1;
+        uint256 totalFail = 0;
+        uint256 firstFailB = 0; // 0 means "no fail observed"
+
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            try this.tryWarpToTsAndRefreshSf(baseTs + b * 12) {
+                // ok
+            } catch {
+                passes[b] = false;
+                totalFail++;
+                if (firstFailB == 0) firstFailB = b;
+                continue;
+            }
+            uint256 trickAmt = 1e18 / (sf[1] - 1e18);
+            uint256 bW = REMAIN; uint256 bO = REMAIN; uint256 ok = 0;
+            for (uint256 r = 0; r < ROUNDS; r++) {
+                try this.simulateOneRound(bW, bO, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; ok++;
+                } catch { break; }
+            }
+            if (ok == ROUNDS) {
+                passes[b] = true;
+                totalPass++;
+            } else {
+                passes[b] = false;
+                totalFail++;
+                if (firstFailB == 0) firstFailB = b;
+            }
+        }
+
+        // Compress consecutive identical results into [start..end] segments
+        console.log("");
+        console.log("=== Segment map ===");
+        uint256 segStart = 0;
+        bool segPass = passes[0];
+        uint256 segCount = 0;
+        for (uint256 b = 1; b <= LIMIT; b++) {
+            if (passes[b] != segPass) {
+                _logSeg(segStart, b - 1, segPass);
+                segCount++;
+                segStart = b;
+                segPass  = passes[b];
+            }
+        }
+        _logSeg(segStart, LIMIT, segPass); // final segment
+        segCount++;
+
+        // Post-first-fail analysis: any later passes?
+        uint256 postFailPasses = 0;
+        if (firstFailB > 0) {
+            for (uint256 b = firstFailB; b <= LIMIT; b++) {
+                if (passes[b]) postFailPasses++;
+            }
+        }
+
+        console.log("");
+        console.log("=== Summary ===");
+        console.log("first fail at b      :", firstFailB);
+        console.log("total passes (b>=1)  :", totalPass - 1);
+        console.log("total fails  (b>=1)  :", totalFail);
+        console.log("segment count        :", segCount);
+        console.log("passes AFTER firstFail:", postFailPasses);
+        if (postFailPasses == 0) {
+            console.log("CONCLUSION: monotonic - once failing, always failing within LIMIT");
+        } else {
+            console.log("CONCLUSION: NON-MONOTONIC - cycling resumes after firstFail");
+        }
+    }
+
+    /// @dev Helper to print a [start..end] = PASS|FAIL segment line.
+    function _logSeg(uint256 a, uint256 b, bool pass) internal pure {
+        if (pass) {
+            console.log("  PASS  [", a, "..", b);
+        } else {
+            console.log("  FAIL  [", a, "..", b);
+        }
+    }
+
     /// @notice Focused sweep: at a given block, test multiple `remain` values and
     /// measure baseline + fwdSafe + bwdSafe for each. Single fork, multiple inner loops.
     function test_block23501400_remainSweep() public {
