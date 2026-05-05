@@ -16,6 +16,8 @@ contract SearchParams is Test {
     SwapMath internal swapMath;
     IBasePool constant OSETH_BPT = IBasePool(address(0xDACf5Fa19b1f720111609043ac67A9818262850c));
     IVault constant VAULT = IVault(address(0xBA12222222228d8Ba445958a75a0704d566BF2C8));
+    // StakeWise V3 Keeper: drives the 12h rewards epoch that ultimately controls osETH sf[1] drift.
+    address constant STAKEWISE_KEEPER = 0x6B5815467da09DaA7DC83Db21c9239d98Bb487b5;
 
     uint256 internal amp;
     uint256 internal swapFeePercentage;
@@ -2893,6 +2895,21 @@ contract SearchParams is Test {
         _warpToTsAndRefreshSf(absTs);
     }
 
+    /// @notice Read the StakeWise V3 Keeper's last rewards timestamp + delay and
+    /// derive the next update window's open time. Returns (lastTs, delay, nextTs).
+    /// nextTs = lastTs + delay; the keeper accepts the next harvest at nextTs.
+    function _keeperNextUpdate() internal view returns (uint64 lastTs, uint256 delay, uint256 nextTs) {
+        (bool ok1, bytes memory d1) =
+            STAKEWISE_KEEPER.staticcall(abi.encodeWithSignature("lastRewardsTimestamp()"));
+        require(ok1 && d1.length >= 32, "keeper.lastRewardsTimestamp failed");
+        lastTs = uint64(abi.decode(d1, (uint256)));
+        (bool ok2, bytes memory d2) =
+            STAKEWISE_KEEPER.staticcall(abi.encodeWithSignature("rewardsDelay()"));
+        require(ok2 && d2.length >= 32, "keeper.rewardsDelay failed");
+        delay  = abi.decode(d2, (uint256));
+        nextTs = uint256(lastTs) + delay;
+    }
+
     /// @notice Real-fork safe-run distribution.
     /// For each starting block N_i:
     ///   1. `vm.createSelectFork("ETH", N_i)` -- real pool state at that block
@@ -3306,6 +3323,31 @@ contract SearchParams is Test {
         console.log("baseTs          :", baseTs);
         console.log("base sf[1]      :", sf[1]);
         console.log("baseline rounds :", baselineOk);
+
+        // Distance to the next StakeWise Keeper rewards window. Once block.timestamp
+        // crosses keeperNextTs, the keeper can be harvested and the rate provider's
+        // drift slope (or absolute level) may discontinuously change, invalidating
+        // any forward extrapolation of sf[1] beyond that point.
+        (uint64 keeperLastTs, uint256 keeperDelay, uint256 keeperNextTs) = _keeperNextUpdate();
+        console.log("keeper lastTs   :", uint256(keeperLastTs));
+        console.log("keeper delay (s):", keeperDelay);
+        console.log("keeper nextTs   :", keeperNextTs);
+        if (keeperNextTs > baseTs) {
+            uint256 secsUntil = keeperNextTs - baseTs;
+            console.log("keeper window in (sec)   :", secsUntil);
+            console.log("keeper window in (blocks):", secsUntil / 12);
+            // Soft warning: linear sf[1] extrapolation only holds within a single
+            // keeper epoch. If LIMIT extends past the next keeper window, the scan
+            // results beyond that boundary may not match real on-chain behavior.
+            if (secsUntil < LIMIT * 12) {
+                uint256 boundaryB = secsUntil / 12;
+                console.log("WARNING: scan window crosses keeper epoch boundary at b =", boundaryB);
+                console.log("         results for b >", boundaryB);
+            }
+        } else {
+            console.log("keeper window already open; secs since open:", baseTs - keeperNextTs);
+            console.log("WARNING: keeper update may fire at any block; sf[1] extrapolation unreliable");
+        }
         require(baselineOk == ROUNDS, "baseline does not pass 30 rounds");
 
         // Forward scan: b * 12s into the future (one block per step)
