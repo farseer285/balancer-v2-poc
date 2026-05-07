@@ -54,8 +54,8 @@ contract MathHelper {
     //  Steps mirror the disassembly:
     //  1. upscale  adjusted[i] = balances[i] * scalingFactors[i] / 1e18
     //  2. manipulationAmount   = tokenAmountOut * scalingFactors[idxOut] / 1e18
-    //  3. invariant            = _calculateInvariantRatio(...)        @0x0297
-    //  4. newBalInUpscaled     = _updateBalance(...)                  @0x03fa
+    //  3. invariant            = _calculateInvariant(...)             @0x0297
+    //  4. newBalInUpscaled     = _calcInGivenOut(...)                 @0x03fa
     //  5. amountInUpscaled     = newBalInUpscaled - adjusted[idxIn]
     //     rawAmountIn          = (amountInUpscaled + sf[idxIn] - 1) / sf[idxIn]
     //                                                       (i.e. divUp)
@@ -93,12 +93,12 @@ contract MathHelper {
 
         // -------------------- STEP 3 (0x01a2-0x01b3) --------------------
         uint256 invariant =
-            _calculateInvariantRatio(amplificationParameter, adjusted);
+            _calculateInvariant(amplificationParameter, adjusted);
 
         // -------------------- STEP 4 (0x01b4-0x01c3) --------------------
-        // _updateBalance already returns the *upscaled* amountIn (with +1),
+        // _calcInGivenOut already returns the *upscaled* amountIn (with +1),
         // matching Balancer V2 StableMath._calcInGivenOut.
-        uint256 amountInUpscaled = _updateBalance(
+        uint256 amountInUpscaled = _calcInGivenOut(
             amplificationParameter,
             adjusted,
             tokenIndexIn,
@@ -137,7 +137,7 @@ contract MathHelper {
     //                     + (n+1) * D_P )
     //    converge when |Δ| ≤ 1   else revert BAL#321
     // =====================================================================
-    function _calculateInvariantRatio(uint256 amp, uint256[] memory balances)
+    function _calculateInvariant(uint256 amp, uint256[] memory balances)
         internal pure returns (uint256)
     {
         uint256 sum = 0;
@@ -181,7 +181,7 @@ contract MathHelper {
     }
 
     // =====================================================================
-    //  func_03fa  _updateBalance       (== Balancer V2 StableMath._calcInGivenOut
+    //  func_03fa  _calcInGivenOut     (== Balancer V2 StableMath._calcInGivenOut
     //                                    after the indexOut decrement+restore)
     //
     //    balances[indexOut] -= amountOut           (in-place, then restored)
@@ -189,7 +189,7 @@ contract MathHelper {
     //    balances[indexOut] += amountOut           (restore)
     //    return _add(_sub(finalBalIn, balances[indexIn]), 1)   ; +1 rounding
     // =====================================================================
-    function _updateBalance(
+    function _calcInGivenOut(
         uint256          amp,
         uint256[] memory balances,
         uint256          indexIn,
