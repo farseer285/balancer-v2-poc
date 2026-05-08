@@ -2910,6 +2910,144 @@ contract SearchParams is Test {
         nextTs = uint256(lastTs) + delay;
     }
 
+    /// @notice Diagnostic: quantify the sf[1] discontinuity introduced by a real
+    /// StakeWise Keeper rewards update.
+    ///
+    /// Empirically located keeper update on mainnet:
+    ///   - block 23720127: keeper.lastRewardsTimestamp = 1762145543 (old K)
+    ///   - block 23720128: keeper.lastRewardsTimestamp = 1762188935 (new K') ←fired here
+    ///
+    /// Two methods, both observe sf[1] at the SAME block.timestamp = ts(POST):
+    ///   [A] REAL: fork POST_BLOCK directly, updateTokenRateCache.
+    ///       The rate provider's underlying StakeWise state already reflects the
+    ///       keeper update (new base + new avgRewardPerSecond), so we get the
+    ///       true on-chain post-update sf[1].
+    ///   [B] EXTRAPOLATED: fork PRE_BLOCK, vm.warp to ts(POST), updateTokenRateCache.
+    ///       The keeper does NOT run inside the fork, so the rate provider keeps
+    ///       extrapolating with the OLD (pre-K') base + slope. This is exactly the
+    ///       value our test_validateRemainFutureWindow framework would predict if
+    ///       it scanned across the keeper boundary blindly.
+    ///
+    /// Reports DIFF = |sf_real - sf_extrap|, signed by sign of (real - extrap),
+    /// proving the two values are NOT equal and quantifying the jump.
+    function test_diag_keeperUpdateJump() public {
+        uint256 PRE_BLOCK  = 23720127; // last block before keeper fired
+        uint256 POST_BLOCK = 23720128; // block in which keeper fired
+
+        // ── Method A: real post-keeper sf[1] ──
+        vm.createSelectFork("ETH", POST_BLOCK);
+        swapMath = new SwapMath();
+        _refreshAtCurrentFork();
+        uint256 sf_real = sf[1];
+        uint256 ts_real = block.timestamp;
+        (uint64 lastTsA,,) = _keeperNextUpdate();
+
+        // ── Method B: pre-keeper extrapolation, warped to the same ts ──
+        vm.createSelectFork("ETH", PRE_BLOCK);
+        swapMath = new SwapMath();
+        _refreshAtCurrentFork();
+        uint256 sf_pre = sf[1];
+        uint256 ts_pre = block.timestamp;
+        (uint64 lastTsB,,) = _keeperNextUpdate();
+        // Warp the pre-keeper fork to POST's timestamp; keeper state is frozen at
+        // lastTsB inside this fork, so updateTokenRateCache extrapolates with the
+        // OLD slope.
+        _warpToTsAndRefreshSf(ts_real);
+        uint256 sf_extrap = sf[1];
+        (uint64 lastTsB2,,) = _keeperNextUpdate();
+
+        console.log("=== Keeper update discontinuity diagnostic ===");
+        console.log("PRE_BLOCK  :", PRE_BLOCK);
+        console.log("POST_BLOCK :", POST_BLOCK);
+        console.log("");
+        console.log("[A] REAL (fork POST_BLOCK directly)");
+        console.log("    blockTs              :", ts_real);
+        console.log("    keeper.lastTs (post) :", uint256(lastTsA));
+        console.log("    sf[1]                :", sf_real);
+        console.log("");
+        console.log("[B] EXTRAPOLATED (fork PRE_BLOCK + warp to ts_real)");
+        console.log("    PRE blockTs          :", ts_pre);
+        console.log("    PRE sf[1]            :", sf_pre);
+        console.log("    PRE keeper.lastTs    :", uint256(lastTsB));
+        console.log("    after warp to ts     :", ts_real);
+        console.log("    keeper.lastTs (still):", uint256(lastTsB2));
+        console.log("    sf[1] (extrapolated) :", sf_extrap);
+        console.log("");
+        if (sf_real == sf_extrap) {
+            console.log("DIFF                     : 0");
+            console.log("=> Keeper update has NO effect on rate provider output at this ts.");
+            console.log("   sf[1] is a function of (block.timestamp, governance-set");
+            console.log("   avgRewardPerSecond) only, NOT of the per-vault keeper rewards.");
+            console.log("   Linear extrapolation across keeper epochs IS faithful as long");
+            console.log("   as governance does not change avgRewardPerSecond.");
+        } else if (sf_real > sf_extrap) {
+            console.log("DIFF (real - extrap, wei):", sf_real - sf_extrap);
+            console.log("=> Keeper update RAISED sf[1] (rewards exceeded prior projection)");
+        } else {
+            console.log("DIFF (extrap - real, wei):", sf_extrap - sf_real);
+            console.log("=> Keeper update LOWERED sf[1] (rewards fell short of prior projection)");
+        }
+        // Sanity invariants: PRE/POST must straddle a real keeper update, and the
+        // pre-fork's keeper state must remain frozen across vm.warp.
+        require(uint256(lastTsA) != uint256(lastTsB), "PRE/POST must straddle a real keeper update");
+        require(uint256(lastTsB2) == uint256(lastTsB), "fork must keep keeper state frozen across vm.warp");
+
+        // ── Phase 2: future-block divergence ──
+        // The Phase-1 equality at ts_real only proves base(K) and base(K') agree
+        // AT THE TRANSITION POINT. If the slope avgRewardPerSecond changed at K',
+        // sf_real and sf_extrap will diverge linearly with dt = ts(future)-ts_real.
+        // All future blocks below were verified off-chain to still have
+        // keeper.lastRewardsTimestamp == 1762188935 (no second keeper update within
+        // the 11h test window).
+        uint256[5] memory futureBlocks;
+        futureBlocks[0] = 23720128 + 300;   // +~1h
+        futureBlocks[1] = 23720128 + 900;   // +~3h
+        futureBlocks[2] = 23720128 + 1800;  // +~6h
+        futureBlocks[3] = 23720128 + 2700;  // +~9h
+        futureBlocks[4] = 23720128 + 3300;  // +~11h
+
+        console.log("");
+        console.log("=== Phase 2: future-block divergence (real vs extrap) ===");
+        console.log("(each row: same blockTs reached via two paths -- real fork vs PRE+warp)");
+
+        for (uint256 i = 0; i < futureBlocks.length; i++) {
+            uint256 fb = futureBlocks[i];
+
+            // [A] real fork at the future block
+            vm.createSelectFork("ETH", fb);
+            swapMath = new SwapMath();
+            _refreshAtCurrentFork();
+            uint256 sfR = sf[1];
+            uint256 tsF = block.timestamp;
+            (uint64 keeperTsAtFb,,) = _keeperNextUpdate();
+            require(uint256(keeperTsAtFb) == uint256(lastTsA),
+                "future block straddles a 2nd keeper update; pick smaller offset");
+
+            // [B] extrapolated: re-fork PRE_BLOCK and warp to tsF
+            vm.createSelectFork("ETH", PRE_BLOCK);
+            swapMath = new SwapMath();
+            _refreshAtCurrentFork();
+            _warpToTsAndRefreshSf(tsF);
+            uint256 sfE = sf[1];
+
+            console.log("");
+            console.log("future block        :", fb);
+            console.log("  blockTs           :", tsF);
+            console.log("  dt from ts_real(s):", tsF - ts_real);
+            console.log("  sf_real           :", sfR);
+            console.log("  sf_extrap         :", sfE);
+            if (sfR == sfE) {
+                console.log("  DIFF              : 0  (slopes match across keeper epoch)");
+            } else if (sfR > sfE) {
+                console.log("  DIFF (real-extrap):", sfR - sfE);
+                console.log("  => post-K' slope > pre-K' slope (rewards accelerated)");
+            } else {
+                console.log("  DIFF (extrap-real):", sfE - sfR);
+                console.log("  => post-K' slope < pre-K' slope (rewards decelerated)");
+            }
+        }
+    }
+
     /// @notice Real-fork safe-run distribution.
     /// For each starting block N_i:
     ///   1. `vm.createSelectFork("ETH", N_i)` -- real pool state at that block
@@ -3490,12 +3628,14 @@ contract SearchParams is Test {
     }
 
     /// @dev Helper to print a [start..end] = PASS|FAIL segment line.
-    function _logSeg(uint256 a, uint256 b, bool pass) internal pure {
-        if (pass) {
-            console.log("  PASS  [", a, "..", b);
-        } else {
-            console.log("  FAIL  [", a, "..", b);
-        }
+    function _logSeg(uint256 a, uint256 b, bool pass) internal view {
+        console.log(string.concat(
+            pass ? "  PASS  [ " : "  FAIL  [ ",
+            vm.toString(a),
+            " .. ",
+            vm.toString(b),
+            " ]"
+        ));
     }
 
     /// @notice Focused sweep: at a given block, test multiple `remain` values and
