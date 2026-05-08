@@ -2999,12 +2999,13 @@ contract SearchParams is Test {
         // All future blocks below were verified off-chain to still have
         // keeper.lastRewardsTimestamp == 1762188935 (no second keeper update within
         // the 11h test window).
-        uint256[5] memory futureBlocks;
-        futureBlocks[0] = 23720128 + 300;   // +~1h
-        futureBlocks[1] = 23720128 + 900;   // +~3h
-        futureBlocks[2] = 23720128 + 1800;  // +~6h
-        futureBlocks[3] = 23720128 + 2700;  // +~9h
-        futureBlocks[4] = 23720128 + 3300;  // +~11h
+        uint256[6] memory futureBlocks;
+        futureBlocks[0] = 23720128 + 1;   // +~12s
+        futureBlocks[1] = 23720128 + 300;   // +~1h
+        futureBlocks[2] = 23720128 + 900;   // +~3h
+        futureBlocks[3] = 23720128 + 1800;  // +~6h
+        futureBlocks[4] = 23720128 + 2700;  // +~9h
+        futureBlocks[5] = 23720128 + 3300;  // +~11h
 
         console.log("");
         console.log("=== Phase 2: future-block divergence (real vs extrap) ===");
