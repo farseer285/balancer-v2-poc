@@ -16,8 +16,11 @@ contract MathHelper {
     // ---------------------------------------------------------------------
     // Storage layout (matches AUTH CHECK 0x0059-0x00bd: SLOAD slot 0 / 1)
     // ---------------------------------------------------------------------
-    address public admin0; // slot 0
-    address public admin1; // slot 1
+    // `internal` (not `public`): the on-chain dispatcher only contains a
+    // single PUSH4 0x524c9e20 branch, so the original source must NOT have
+    // exposed these slots via auto-generated getters.
+    address internal admin0; // slot 0
+    address internal admin1; // slot 1
 
     // ---------------------------------------------------------------------
     // Constants  (matches PUSH8 0x0de0b6b3a7640000 == 1e18 in the bytecode)
