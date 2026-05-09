@@ -2941,6 +2941,7 @@ contract SearchParams is Test {
         uint256 sf_real = sf[1];
         uint256 ts_real = block.timestamp;
         (uint64 lastTsA,,) = _keeperNextUpdate();
+        require(uint256(lastTsA) == uint256(ts_real), "POST must be the block where the keeper update took place");
 
         // ── Method B: pre-keeper extrapolation, warped to the same ts ──
         vm.createSelectFork("ETH", PRE_BLOCK);
