@@ -17,6 +17,56 @@ pragma solidity ^0.8.20;
  * call against the agent EOA. The contract is therefore not part of the
  * Balancer rescue path; co-deployment is a deployer-side artefact only.
  *
+ * Executability on mainnet (verified, not speculation)
+ * ----------------------------------------------------
+ * As deployed, `open()` cannot be successfully invoked for any non-zero
+ * `amount`, by the BitFinding agent or by anyone else. The blocker is an
+ * unfixable, in-bytecode decimals defect:
+ *
+ *   toBorrow = current * 7200 * 4000 / 10000      // computed in WETH wei (1e18)
+ *   POOL.borrow(USDC, toBorrow, ...)              // consumed as USDC base units (1e6)
+ *
+ * The 1e12 conversion factor between WETH wei and USDC base units is missing,
+ * so for any meaningful `amount` the call requests roughly 1e12x more USDC
+ * than the supplied collateral can support. Aave V3's `validateBorrow`
+ * therefore reverts on the first loop iteration; control flow never reaches
+ * the swap or any subsequent step. Cross-checked in the runtime disassembly:
+ * at offsets 0x092f-0x0953 the immediates 0x1c20 (7200), 0x0fa0 (4000) and
+ * 0x2710 (10000) feed two MULs and one DIV whose result is passed straight
+ * into the calldata for PUSH4 0xa415bcad (Aave.borrow); the runtime contains
+ * no 1e6 / 1e12 / 1e18 / 1e8 constant anywhere (the only decimals-shaped
+ * literal is 0x5af3107a4000 = 1e14, used solely as the per-loop dust break).
+ *
+ * Other preconditions (caller WETH allowance to this contract, caller
+ * `approveDelegation` on the USDC variable-debt token, and the UNISWAP
+ * constant -- which points at the agent EOA, eth_getCode = 0x at deployment
+ * block 23717398 and at latest -- needing an EIP-7702 SetCode delegation to
+ * a router-compatible implementation) are all things an agent could in
+ * principle pre-stage in the same bundle, but they cannot rescue the
+ * decimals defect because that defect lives inside the deployed runtime as
+ * PUSH-immediate constants and is not reachable from outside the contract.
+ *
+ * Net effect: regardless of how the deployer's bundle is constructed, the
+ * contract reverts on its first borrow for any economically meaningful input
+ * and so cannot perform any leverage operation. The on-chain record over the
+ * full deployment-to-latest range (block 23717398 .. 25074465, ~1.36M blocks
+ * / ~190 days) is congruent with this: zero inbound external transactions,
+ * zero inbound internal calls (trace-level sub-calls from any other tx),
+ * zero emitted events, and an unchanged account storage trie root equal to
+ * the empty-trie sentinel keccak256(rlp("")) =
+ * 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421 -- a
+ * cryptographic proof that no SSTORE has ever executed on this contract,
+ * hence `open` (selector 0xd2d23a37) has never appeared as calldata to this
+ * address, successful or reverted. Cross-verified via publicnode archive
+ * eth_getLogs scanned in 28 50000-block chunks (Σ widths == span, all
+ * HTTP 200, 37-byte empty-result bodies), Blockscout's normal-tx /
+ * internal-tx / token-transfer indices (counts 1 / 0 / 0; the single
+ * normal-tx entry is the contract-creation tx itself), and routescan as a
+ * second-source cross-check. The contract is best characterised as the
+ * abandoned-execution half of a BitFinding agent bundle whose execution
+ * leg was never broadcast, and which -- even had it been broadcast --
+ * would not have transacted successfully.
+ *
  * The names of functions / state variables are inferred ("not the original
  * Solidity source"): the on-chain selectors are written as comments next to
  * each public symbol so they can be matched back to the deployed contract.
