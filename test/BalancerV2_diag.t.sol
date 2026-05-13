@@ -129,9 +129,9 @@ import "../StableMath.sol";
 // 5. testDiag_newtonAsymmetry
 //    StableMath has two Newton solvers with VERY different stability:
 //      INVERSE  _getTokenBalanceGivenInvariantAndAllOtherBalances:
-//        Solves a degree-2 polynomial in the unknown balance (S + D/Ann - D)*x
-//        and -D^(N+1)/(Ann*n^n*P_others). Globally convergent (positive root
-//        of a convex quadratic). Converges at every (D, O=1) point we tested.
+//        Solves a degree-2 polynomial in the unknown balance (positive root
+//        of a convex quadratic) and is well-conditioned across the (D, O=1)
+//        line. Used internally by every swap path.
 //      FORWARD  _calculateInvariant:
 //        Iterates D using D_P = D^(N+1)/(n^n * prod). At extreme imbalance
 //        (e.g. O=1, W~1.4M) the cubic-in-D term blows up (D_P >> D),
@@ -146,6 +146,30 @@ import "../StableMath.sol";
 //    Steps A and C alone roughly preserve D (only minor fee creep). This
 //    isolates the leak as a Step-B-only phenomenon: A and C are auxiliary
 //    geometric repositioning, the actual theft happens in Step B's rounding.
+//
+// 7. testDiag_inverseHintAndFeeBreakdown -- Q1: INVERSE hint sensitivity
+//    The earlier "INVERSE is globally convergent" claim has a caveat: the
+//    initialization computes P_D = balances[0] * n, then for j>=1 multiplies
+//    by balances[j] * n and divides by `invariant`. When the starting hint
+//    in balances[tokenIndex] is small relative to D, P_D collapses to 0 by
+//    integer division, and the next line divUp(inv2, Ann * 0) reverts.
+//    Verified: at D=5_000_000, O=1, hint W=374353 gives P_D = 1,497,412 / 5e6
+//    = 0 -> REVERT. Replacing the hint with W=11M gives P_D=8 -> Newton
+//    converges to W=295,655,594. So the iteration body is stable, but the
+//    one-shot init requires a hint of order sqrt(D * O) or larger. This
+//    explains the only "spurious" REVERT in the INVERSE sweep.
+//
+// 8. testDiag_inverseHintAndFeeBreakdown -- Q2: 106-unit gap decomposition
+//    Standalone INVERSE Newton at (D=138956, O_up=1) returns W=1,415,659,
+//    while simSwapGivenOut FIXED Step B settles W_post=1,415,765 -- a
+//    106-unit gap. The gap is fully explained by three sequential round-up
+//    operations inside the swap pipeline that the bare Newton call skips:
+//      (i)  _calcInGivenOut returns finalBalanceIn.sub(balIn).add(1)  -> +1
+//      (ii) inRaw = divUp(inUp, sf[WETH]=1e18)                        -> +0
+//      (iii) inRaw = divUp(inRaw, 1 - feePercentage)                  -> +105
+//    Total: +106. Verified per-step in the test prints. No numerical bug,
+//    purely the contract's "round in favour of the LP" pipeline acting on
+//    top of the Newton solution.
 // =============================================================================
 
 address constant balancer_d = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
@@ -1169,6 +1193,147 @@ contract DiagSim is Test {
         external pure returns (uint256)
     {
         return StableMath._getTokenBalanceGivenInvariantAndAllOtherBalances(amp, bal, inv, idx);
+    }
+
+    // Two follow-up questions that came out of testDiag_newtonAsymmetry:
+    //
+    //   Q1. INVERSE Newton was claimed to be "globally convergent" for the
+    //       quadratic-in-balance polynomial, yet the D=5,000,000 row of the
+    //       sweep REVERTed. Why?
+    //
+    //   Q2. The standalone INVERSE solve at (D=138956, O=1) returned W=1,415,659,
+    //       but simSwapGivenOut's FIXED Step B settles W_post=1,415,765 -- a
+    //       106-unit gap. Is that gap a numerical bug or is it structural
+    //       (the +1 round-up + downscale + fee divUp inside _calcInGivenOut)?
+    //
+    // This test resolves both with direct prints, no inference.
+    //
+    // Findings (verified by the prints below):
+    //
+    //   A1. The revert is NOT a Newton convergence failure. It is a P_D
+    //       underflow during INITIALIZATION of
+    //         _getTokenBalanceGivenInvariantAndAllOtherBalances.
+    //       The function computes, before the loop:
+    //         P_D = balances[0] * n
+    //         for j = 1..n-1: P_D = (P_D * balances[j] * n) / invariant
+    //         c   = invariant^2 / (Ann * P_D) * AMP_PRECISION * balances[idx]
+    //       balances[idx] is the STARTING HINT for the unknown balance and is
+    //       consumed in computing P_D when idx==0. With hint=374353 and the
+    //       OTHER balance fixed at O=1:
+    //         P_D = (374353 * 2 * 1 * 2) / 5_000_000 = 1_497_412 / 5e6 = 0
+    //       integer-division collapse -> divUp(inv2, Ann*0) -> revert.
+    //       Re-running with a hint near the true magnitude (W ~ 11M at D=5e6)
+    //       keeps P_D > 0 and Newton converges in <10 iterations.
+    //       So INVERSE is structurally stable in its iteration step but
+    //       requires a hint large enough that P_D survives the init division.
+    //
+    //   A2. The 106-unit gap is exactly accounted for by three rounding-up
+    //       operations inside the swap pipeline (none of which are present
+    //       in the bare Newton call):
+    //         (i)   _calcInGivenOut returns finalBalanceIn.sub(balIn).add(1)
+    //               -> an unconditional +1 in upscaled space.
+    //         (ii)  inRaw = divUp(inUp, sf[WETH]=1e18)
+    //               -> identity for WETH (sf=1e18), no extra rounding.
+    //         (iii) inRaw = divUp(inRaw, ONE - fee)
+    //               -> grosses the input up by ~1/(1-1e-4); ceils a few units.
+    //       Numerically:
+    //               newW (Newton)           = 1,415,659
+    //               inUp = newW - W_pre + 1 = 1,041,307
+    //               inRaw after fee divUp   = 1,041,412   (fee adds 105)
+    //               W_post = W_pre + inRaw  = 1,415,765   (+106 vs newW)
+    //       So the gap = (+1 from .add(1)) + (+105 from fee divUp), no math bug.
+    function testDiag_inverseHintAndFeeBreakdown() public {
+        IPool(osETH_wETH_d).updateTokenRateCache(0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38);
+        uint256[] memory rawSf = IPool(osETH_wETH_d).getScalingFactors();
+        (uint256 amp,,) = IPool(osETH_wETH_d).getAmplificationParameter();
+        uint256 fee = IPool(osETH_wETH_d).getSwapFeePercentage();
+
+        uint256[] memory sf = new uint256[](2);
+        sf[0] = rawSf[0];
+        sf[1] = rawSf[2];
+
+        // ---- Q1: P_D underflow in INVERSE init at large D ----
+        // n = 2, Ann = amp * 2; we use the same closed form the contract uses.
+        emit log_string("=== Q1: INVERSE revert at D=5,000,000 is a P_D underflow ===");
+        uint256 D_big = 5_000_000;
+        uint256 hint_small = 374_353;     // the hint used in the failing sweep
+        uint256 P_D_small = hint_small * 2;                 // balances[0] * n
+        P_D_small = (P_D_small * 1 * 2) / D_big;            // loop body, balances[1]=1
+        emit log_named_uint("  hint (W slot) = 374353; P_D after init", P_D_small);
+        emit log_string("  P_D = 0 -> next line c = inv2 / (Ann * 0) reverts");
+
+        uint256[] memory pp_small = new uint256[](2);
+        pp_small[0] = hint_small; pp_small[1] = 1;
+        try this.ext_balGivenInv(amp, pp_small, D_big, 0) returns (uint256 W) {
+            emit log_named_uint("  INVERSE(hint=374353)", W);
+        } catch {
+            emit log_string("  INVERSE(hint=374353) REVERT (matches manual P_D=0)");
+        }
+
+        // Same call with a hint near the true W magnitude at D=5e6.
+        // Geometric estimate W ~ (D/2)^(3/2) / sqrt(O) is too crude here; we use
+        // a generous 11_000_000 hint (Newton self-corrects regardless).
+        uint256 hint_big = 11_000_000;
+        uint256 P_D_big = hint_big * 2;
+        P_D_big = (P_D_big * 1 * 2) / D_big;
+        emit log_named_uint("  hint (W slot) = 11000000; P_D after init", P_D_big);
+
+        uint256[] memory pp_big = new uint256[](2);
+        pp_big[0] = hint_big; pp_big[1] = 1;
+        try this.ext_balGivenInv(amp, pp_big, D_big, 0) returns (uint256 W) {
+            emit log_named_uint("  INVERSE(hint=11M) converged W", W);
+        } catch {
+            emit log_string("  INVERSE(hint=11M) REVERT");
+        }
+
+        // ---- Q2: 106-unit gap = +1 round-up + fee divUp ----
+        emit log_string("");
+        emit log_string("=== Q2: standalone Newton W=1415659 vs simSwap W_post=1415765 ===");
+        // Reproduce exactly the FIXED-mode Step B internals:
+        //   pre-state at Step A end (374353, 18); take 17 osETH out with mulUp.
+        uint256 W_pre = 374_353;
+        uint256 O_pre = 18;
+        uint256 outRaw = 17;
+
+        // Curve's pre-image to Newton: balances upscaled, OUT slot decremented by outUp
+        uint256[] memory up = new uint256[](2);
+        up[0] = W_pre.mulDown(sf[0]);
+        up[1] = O_pre.mulDown(sf[1]);
+        uint256 D_pre = StableMath._calculateInvariant(amp, up);
+        emit log_named_uint("  D_pre at (374353,18)", D_pre);
+
+        uint256 outUp_fixed = outRaw.mulUp(sf[1]);                  // FIXED mode = mulUp
+        emit log_named_uint("  outUp (mulUp(17,sf))", outUp_fixed);
+        uint256[] memory bal_for_newton = new uint256[](2);
+        bal_for_newton[0] = up[0];                                  // hint = current upscaled W
+        bal_for_newton[1] = up[1] - outUp_fixed;                    // O after taking out
+        emit log_named_uint("  hint W (= up_W_pre)", bal_for_newton[0]);
+        emit log_named_uint("  O_up after subtracting outUp", bal_for_newton[1]);
+
+        uint256 newW = StableMath._getTokenBalanceGivenInvariantAndAllOtherBalances(
+            amp, bal_for_newton, D_pre, 0
+        );
+        emit log_named_uint("  STANDALONE Newton newW (claim: 1415659)", newW);
+
+        // Now apply each downstream rounding step the contract does:
+        uint256 inUp = newW - up[0] + 1;                             // _calcInGivenOut .add(1)
+        emit log_named_uint("  inUp = newW - up_W_pre + 1", inUp);
+        uint256 inRaw_noFee = inUp.divUp(sf[0]);                     // sf[WETH]=1e18 identity
+        emit log_named_uint("  inRaw before fee = divUp(inUp, sf[W])", inRaw_noFee);
+        uint256 inRaw_withFee = inRaw_noFee.divUp(ONE - fee);        // gross-up by 1/(1-fee)
+        emit log_named_uint("  inRaw after  fee = divUp(., 1-fee)", inRaw_withFee);
+        emit log_named_uint("  fee adjustment delta", inRaw_withFee - inRaw_noFee);
+
+        uint256 W_post_pipeline = W_pre + inRaw_withFee;
+        emit log_named_uint("  W_post = W_pre + inRaw (claim: 1415765)", W_post_pipeline);
+        emit log_named_uint("  total gap vs newW = W_post - newW", W_post_pipeline - newW);
+        emit log_string("  decomposition:  +1 (calcInGivenOut .add(1)) + fee divUp delta");
+
+        // Cross-check against simSwapGivenOut directly
+        uint256[] memory bal_pre = new uint256[](2);
+        bal_pre[0] = W_pre; bal_pre[1] = O_pre;
+        uint256[] memory bal_post = simSwapGivenOut(bal_pre, sf, 0, 1, outRaw, amp, fee, 1);
+        emit log_named_uint("  simSwap FIXED W_post (sanity check)", bal_post[0]);
     }
 
     // Question: does the leak need to be MAXIMIZED, or just need to cross the
