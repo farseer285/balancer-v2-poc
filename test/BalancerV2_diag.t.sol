@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import "forge-std/Test.sol";
-import "../interface.sol";
-import "../StableMath.sol";
+import {Test} from "forge-std/Test.sol";
+import {FixedPoint} from "src/FixedPoint.sol";
+import {StableMath} from "src/StableMath.sol";
 
 // =============================================================================
 // BalancerV2 ComposableStablePool osETH/WETH rounding exploit (Nov 2025, ~$120M)
@@ -300,7 +300,7 @@ contract DiagSim is Test {
     uint256 constant ONE = 1e18;
 
     function setUp() public {
-        vm.createSelectFork("mainnet", 23717397 - 1);
+        vm.createSelectFork("ETH", 23717397 - 1);
         vm.warp(1762156007);
     }
 
