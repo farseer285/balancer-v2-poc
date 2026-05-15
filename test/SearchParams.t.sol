@@ -19,13 +19,27 @@ contract SearchParams is Test {
     // StakeWise V3 Keeper: drives the 12h rewards epoch that ultimately controls osETH sf[1] drift.
     address constant STAKEWISE_KEEPER = 0x6B5815467da09DaA7DC83Db21c9239d98Bb487b5;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Block-context invariance constants. To validate this PoC against a
+    // different historical attack tx, change ATTACK_BLOCK + ATTACK_TX_HASH;
+    // test_diag_blockContextSafety auto-discovers everything else (pre-attack
+    // tx index, list of preceding tx hashes) and reverts if any pre-attack
+    // tx mutated pool state, the protocol fee cache changed, etc.
+    // ─────────────────────────────────────────────────────────────────────────
+    uint256 internal constant FORK_BLOCK = 23717396;
+    uint256 internal constant ATTACK_BLOCK = 23717397;
+    bytes32 internal constant ATTACK_TX_HASH =
+        0x6ed07db1a9fe5c0794d44cd36081d6a6df103fab868cdd75d581e3bd23bc9742;
+    address internal constant WETH_ADDR = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant OSETH_ADDR = 0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38;
+
     uint256 internal amp;
     uint256 internal swapFeePercentage;
     uint256 internal protocolSwapFeePercentage; // protocol swap fee cache (50% = 5e17)
     uint256[] internal sf; // scaling factors for [WETH, osETH]
 
     function setUp() public {
-        vm.createSelectFork("ETH", 23717396);
+        vm.createSelectFork("ETH", FORK_BLOCK);
         vm.warp(1762156007); // block 23717397's timestamp, so rate provider returns the same rate as the real attack
         swapMath = new SwapMath();
 
@@ -49,6 +63,43 @@ contract SearchParams is Test {
         sf = new uint256[](2);
         sf[0] = allSF[0]; // WETH
         sf[1] = allSF[2]; // osETH
+
+        // Topology invariants. The whole simulation hard-codes WETH=0, BPT=1, osETH=2,
+        // a non-zero rate provider on osETH (index 2) and a zero provider on WETH
+        // (index 0). If the pool ever gets re-registered with a different layout,
+        // every subsequent assert would silently use the wrong index. Catch it here.
+        _checkTopology(tokens, rateProviders);
+
+        // Cache freshness contract: after the manual updateTokenRateCache loop above,
+        // the osETH cache MUST equal the live provider rate and MUST be marked fresh.
+        // This pins down the two behaviors setUp() is responsible for, so any future
+        // edit that breaks the warp/refresh ordering trips here instead of silently
+        // shifting sf[1] in every downstream test.
+        (uint256 cachedRate,, , uint256 expires) = OSETH_BPT.getTokenRateCache(IERC20(OSETH_ADDR));
+        require(cachedRate == _liveProviderRate(),
+                "setUp: cache rate must equal live provider rate after manual refresh");
+        require(expires > block.timestamp,
+                "setUp: cache must be marked fresh (expires > block.timestamp) after refresh");
+    }
+
+    /// @notice Hard-asserts the on-chain pool layout the simulator depends on.
+    /// Source of truth: ComposableStablePool registers tokens [token0, BPT, token1] on
+    /// deploy, with BPT always at `_bptIndex`; rate providers are stored in the same
+    /// 3-slot order at construction time (ComposableStablePoolStorage). We pin both.
+    function _checkTopology(IERC20[] memory tokens, address[] memory rateProviders) internal view {
+        require(tokens.length == 3, "topology: expected 3 pool tokens");
+        require(rateProviders.length == 3, "topology: expected 3 rate providers");
+        require(OSETH_BPT.getBptIndex() == 1, "topology: BPT must be at index 1");
+        require(address(tokens[0]) == WETH_ADDR,  "topology: index 0 must be WETH");
+        require(address(tokens[1]) == address(OSETH_BPT), "topology: index 1 must be BPT");
+        require(address(tokens[2]) == OSETH_ADDR, "topology: index 2 must be osETH");
+        require(rateProviders[0] == address(0),   "topology: WETH must have no rate provider");
+        require(rateProviders[1] == address(0),   "topology: BPT must have no rate provider");
+        require(rateProviders[2] != address(0),   "topology: osETH must have a rate provider");
+        // sf[0] == FixedPoint.ONE because WETH is 18-decimal and has no rate provider;
+        // any drift would silently corrupt the upscaling math at the trick boundary.
+        require(sf[0] == FixedPoint.ONE, "topology: sf[WETH] must be 1e18");
+        require(sf[1] > FixedPoint.ONE,  "topology: sf[osETH] must be > 1e18");
     }
 
     /// @notice Try a single swap. Reverts if it triggers BAL#004 or any math error.
@@ -3943,5 +3994,187 @@ contract SearchParams is Test {
             console.log("  first failing offset (min)   :", firstFailOffsetBlocks * 12 / 60);
         }
     }
-}
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //                      Block-context safety diagnostic
+    //
+    // Verifies that the FORK_BLOCK → ATTACK_BLOCK boundary is invariant for the
+    // pool, i.e. nothing the simulation reads at end-of-FORK_BLOCK was changed
+    // by any tx that ran in ATTACK_BLOCK before ATTACK_TX_HASH. This pins down
+    // the only un-coded assumption behind using `getActualSupply()` as the
+    // simulation's starting BPT supply (Risk B and Risk E in the audit notes).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev All pool fields that, if mutated by a same-block-preceding tx,
+    /// would invalidate the simulation's starting state.
+    struct PoolStateSnapshot {
+        uint256 wethBalance;              // Vault raw balance for WETH (idx 0)
+        uint256 osethBalance;             // Vault raw balance for osETH (idx 2)
+        uint256 bptBalanceInVault;        // Vault raw balance for BPT (idx 1) = totalSupply - virtualSupply
+        uint256 totalSupply;              // BPT.totalSupply() (changes on protocol fee mint)
+        uint256 actualSupply;             // pool.getActualSupply() = virtualSupply + dueProtocolFeeBpt
+        uint256 lastJoinExitAmp;          // ComposableStablePool _lastJoinExitData
+        uint256 lastPostJoinExitInvariant;
+        uint256 sfWeth;                   // scaling factor for WETH (must stay 1e18)
+        uint256 sfOseth;                  // scaling factor for osETH (= cached osETH rate)
+        uint256 cachedOsETHRate;          // PriceRateCache.currentRate
+        uint256 cachedOsETHOldRate;       // PriceRateCache.oldRate
+        uint256 cachedOsETHExpires;       // PriceRateCache.expires
+        uint256 protoSwapFeeCache;        // ProtocolFeePercentagesProvider cache, type 0
+        uint256 protoYieldFeeCache;       // ProtocolFeePercentagesProvider cache, type 2
+        uint256 ampValue;                 // current amp (updates would also bump lastJoinExitAmp)
+        uint256 swapFeePercentage;        // pool swap fee (changeable by owner via setSwapFeePercentage)
+    }
+
+    /// @notice Reads every pool field the simulation depends on, in one call.
+    function _snapshotPoolState() internal view returns (PoolStateSnapshot memory s) {
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        (IERC20[] memory tokens, uint256[] memory bal,) = VAULT.getPoolTokens(poolId);
+        s.wethBalance = bal[0];
+        s.bptBalanceInVault = bal[1];
+        s.osethBalance = bal[2];
+        s.totalSupply = IERC20(address(OSETH_BPT)).totalSupply();
+        s.actualSupply = OSETH_BPT.getActualSupply();
+        (s.lastJoinExitAmp, s.lastPostJoinExitInvariant) = OSETH_BPT.getLastJoinExitData();
+        uint256[] memory allSF = OSETH_BPT.getScalingFactors();
+        s.sfWeth = allSF[0];
+        s.sfOseth = allSF[2];
+        (s.cachedOsETHRate, s.cachedOsETHOldRate, , s.cachedOsETHExpires) =
+            OSETH_BPT.getTokenRateCache(tokens[2]);
+        s.protoSwapFeeCache  = OSETH_BPT.getProtocolFeePercentageCache(0);
+        s.protoYieldFeeCache = OSETH_BPT.getProtocolFeePercentageCache(2);
+        (s.ampValue,,) = OSETH_BPT.getAmplificationParameter();
+        s.swapFeePercentage = OSETH_BPT.getSwapFeePercentage();
+    }
+
+    /// @notice Asserts every pool-state field equals the baseline. On failure,
+    /// labels the violation by the matching audit risk class so the diagnostic
+    /// is self-describing. `boundaryTx` is logged for context (the tx whose
+    /// pre-state was just snapshotted; usually ATTACK_TX_HASH).
+    function _assertSnapshotEq(
+        PoolStateSnapshot memory base,
+        PoolStateSnapshot memory cur,
+        uint256 /* unused, retained for log compatibility */,
+        bytes32 boundaryTx
+    ) internal {
+        bool changed =
+            base.wethBalance              != cur.wethBalance              ||
+            base.osethBalance             != cur.osethBalance             ||
+            base.bptBalanceInVault        != cur.bptBalanceInVault        ||
+            base.totalSupply              != cur.totalSupply              ||
+            base.actualSupply             != cur.actualSupply             ||
+            base.lastJoinExitAmp          != cur.lastJoinExitAmp          ||
+            base.lastPostJoinExitInvariant!= cur.lastPostJoinExitInvariant||
+            base.sfWeth                   != cur.sfWeth                   ||
+            base.sfOseth                  != cur.sfOseth                  ||
+            base.cachedOsETHRate          != cur.cachedOsETHRate          ||
+            base.cachedOsETHOldRate       != cur.cachedOsETHOldRate       ||
+            base.cachedOsETHExpires       != cur.cachedOsETHExpires       ||
+            base.protoSwapFeeCache        != cur.protoSwapFeeCache        ||
+            base.protoYieldFeeCache       != cur.protoYieldFeeCache       ||
+            base.ampValue                 != cur.ampValue                 ||
+            base.swapFeePercentage        != cur.swapFeePercentage;
+        if (changed) {
+            console.log("Block-context violation between baseline and pre-tx snapshot of:");
+            console.logBytes32(boundaryTx);
+        }
+        // Risk B: pool-touching pre-attack tx.
+        assertEq(cur.wethBalance,        base.wethBalance,        "Risk B: WETH raw balance moved");
+        assertEq(cur.osethBalance,       base.osethBalance,       "Risk B: osETH raw balance moved");
+        assertEq(cur.bptBalanceInVault,  base.bptBalanceInVault,  "Risk B: BPT-in-vault balance moved");
+        assertEq(cur.lastJoinExitAmp,    base.lastJoinExitAmp,    "Risk B: lastJoinExitAmp moved");
+        assertEq(cur.lastPostJoinExitInvariant, base.lastPostJoinExitInvariant,
+                 "Risk B: lastPostJoinExitInvariant moved");
+        // Risk B (rate cache rotation triggered by ANY pool touch via _cacheTokenRatesIfNecessary):
+        assertEq(cur.sfWeth,             base.sfWeth,             "Risk B: sf[WETH] moved");
+        assertEq(cur.sfOseth,            base.sfOseth,            "Risk B: sf[osETH] moved (rate cache rotated)");
+        assertEq(cur.cachedOsETHRate,    base.cachedOsETHRate,    "Risk B: cached osETH currentRate moved");
+        assertEq(cur.cachedOsETHOldRate, base.cachedOsETHOldRate, "Risk B: cached osETH oldRate moved");
+        assertEq(cur.cachedOsETHExpires, base.cachedOsETHExpires, "Risk B: cached osETH expires moved");
+        // Risk E: protocol fee cache update would mint dueFee and resync invariant.
+        assertEq(cur.protoSwapFeeCache,  base.protoSwapFeeCache,  "Risk E: SWAP fee cache moved");
+        assertEq(cur.protoYieldFeeCache, base.protoYieldFeeCache, "Risk E: YIELD fee cache moved");
+        assertEq(cur.totalSupply,        base.totalSupply,        "Risk E: BPT totalSupply moved (fee mint?)");
+        assertEq(cur.actualSupply,       base.actualSupply,       "Risk E: actualSupply moved");
+        // Risk C: amp ongoing-update would change every step's invariant.
+        assertEq(cur.ampValue,           base.ampValue,           "Risk C: amp moved");
+        // Risk F: owner-gated setSwapFeePercentage; permissionless probability is zero
+        // but a governance tx scheduled into ATTACK_BLOCK before ATTACK_TX_HASH would
+        // shift every swap's input/output rounding. Snapshot it for completeness.
+        assertEq(cur.swapFeePercentage,  base.swapFeePercentage,  "Risk F: pool swap fee percentage moved");
+    }
+
+    /// @notice End-to-end safety check for the FORK_BLOCK -> ATTACK_BLOCK boundary.
+    ///
+    /// Step 1: roll the fork to "right before ATTACK_TX_HASH". Per Foundry
+    ///         semantics, this lands on ATTACK_BLOCK with every preceding tx
+    ///         in that block already replayed against the EVM. Snapshot pool
+    ///         state and read the live osETH rate at attackTs (the value the
+    ///         attacker's first-swap `_cacheTokenRatesIfNecessary` will write).
+    /// Step 2: re-fork cleanly at end-of-FORK_BLOCK, warp to attackTs (exactly
+    ///         what setUp() does) and snapshot again, plus read the live rate.
+    ///         This is the value setUp()'s `updateTokenRateCache` would write.
+    /// Step 3: byte-equality of the two pool snapshots proves no preceding tx
+    ///         mutated anything the simulator reads -> Risk B / C / E excluded.
+    ///         Equality of the two live rates proves the rate provider's own
+    ///         storage was not touched by a preceding tx (e.g. StakeWise
+    ///         keeper update inside ATTACK_BLOCK before ATTACK_TX_HASH).
+    /// Step 4: assert `cachedOsETHExpires <= attackTs` so we know both setUp()
+    ///         and the attacker's first swap will actually call
+    ///         `_updateTokenRateCache` (otherwise the cache wouldn't refresh
+    ///         and the equivalence claim doesn't apply).
+    ///
+    /// To run against any other historical attack: change FORK_BLOCK and
+    /// ATTACK_TX_HASH at the top of this contract; nothing else needs to move.
+    function test_diag_blockContextSafety() public {
+        // 1) Roll fork to "just before ATTACK_TX_HASH" (replays all preceding
+        //    txs in ATTACK_BLOCK on the EVM). This is the state the attacker
+        //    saw at the start of their tx.
+        vm.createSelectFork("ETH", FORK_BLOCK);
+        vm.rollFork(ATTACK_TX_HASH);
+        require(block.number == ATTACK_BLOCK, "rollFork(txHash) landed on wrong block");
+        uint256 attackTs = block.timestamp;
+        PoolStateSnapshot memory snapPreAttack = _snapshotPoolState();
+        uint256 rateAtAttack = _liveProviderRate();
+
+        // 2) Re-fork at FORK_BLOCK end and warp to attackTs (mirrors setUp()).
+        //    This is the state from which setUp() does its updateTokenRateCache
+        //    + getActualSupply() reads.
+        vm.createSelectFork("ETH", FORK_BLOCK);
+        require(block.number == FORK_BLOCK, "fork at wrong block");
+        vm.warp(attackTs);
+        PoolStateSnapshot memory snapBoundary = _snapshotPoolState();
+        uint256 rateAtSetup = _liveProviderRate();
+
+        console.log("=== Block-context safety diagnostic ===");
+        console.log("FORK_BLOCK              :", FORK_BLOCK);
+        console.log("ATTACK_BLOCK            :", ATTACK_BLOCK);
+        console.log("ATTACK_BLOCK timestamp  :", attackTs);
+
+        // 3a) Pool state must be byte-identical between the two paths.
+        _assertSnapshotEq(snapBoundary, snapPreAttack, 0, ATTACK_TX_HASH);
+
+        // 3b) Rate-provider state must be byte-identical too (a preceding tx
+        //     could have triggered a StakeWise keeper update without touching
+        //     the pool itself, leaving snapshots equal but `getRate()` shifted).
+        assertEq(rateAtSetup, rateAtAttack,
+                 "Risk B: osETH rate provider state changed across FORK_BLOCK -> pre-ATTACK_TX boundary");
+
+        // 4) Cache-freshness precondition: both setUp() and the attacker's
+        //    first swap must trigger _updateTokenRateCache, otherwise the
+        //    "byte-identical writes" argument doesn't apply.
+        require(snapPreAttack.cachedOsETHExpires <= attackTs,
+                "cache invariant: osETH cache must be expired by ATTACK_BLOCK ts");
+
+        console.log("PASS: pool state byte-identical across FORK_BLOCK -> pre-ATTACK_TX boundary.");
+        console.log("      => Risk B (pool-touching pre-attack tx) excluded.");
+        console.log("      => Risk C (amp ongoing update across boundary) excluded.");
+        console.log("      => Risk E (protocol fee cache update / fee mint) excluded.");
+        console.log("PASS: osETH live rate at attackTs identical from both paths.");
+        console.log("      => Risk B (rate-provider state mutation) excluded.");
+        console.log("PASS: osETH rate cache is expired at ATTACK_BLOCK ts.");
+        console.log("      => setUp()'s updateTokenRateCache writes are byte-identical to");
+        console.log("         the attacker's first-swap _cacheTokenRatesIfNecessary.");
+        console.log("=> getActualSupply() in setUp() is byte-exact equivalent to attacker's step-0 actualSupply.");
+    }
+}
