@@ -3376,11 +3376,14 @@ contract SearchParams is Test {
     }
 
     /// @notice Helper for test_cyclingIndependentOfPoolState Step 5. See struct comment above.
+    /// Per-round diagnostic logs are retained for visibility on failure; the trailing
+    /// assertEq calls are what actually fails the test (and thus catches a future
+    /// refactor that accidentally introduces fork-specific state into the cycling path).
     function _compareCyclingTrajectories(
         uint256 okA,
         uint256 okB,
         CyclingTrajectories memory traj
-    ) private view {
+    ) private {
         console.log("");
         console.log("=== Trajectory comparison (REMAIN=67000, sf[1] forced to sf1_A) ===");
         console.log("rounds passed at A:", okA);
@@ -3397,23 +3400,32 @@ contract SearchParams is Test {
                 mismatches++;
             }
         }
-        if (okA == okB && mismatches == 0) {
-            console.log("PASS: trajectories byte-identical");
-        } else {
-            console.log("FAIL: trajectories differ");
-        }
+        assertEq(okA, okB, "rounds passed differ between A and B");
+        assertEq(mismatches, 0, "trajectory bytes differ between A and B");
     }
 
-    /// @notice Verify Phase 2 cycling is independent of real pool balances/BPT supply.
+    /// @notice Verify Phase 2 cycling, *given Phase 1 normalizes the pool to
+    /// (REMAIN, REMAIN)*, produces an identical trajectory regardless of pre-Phase-1
+    /// pool balances and is independent of BPT supply.
+    ///
+    /// Strictly, `_onRegularSwap` in ComposableStablePool.sol takes
+    /// `(amp, balances, indexIn, indexOut, amountGiven)` and is `private view` — it
+    /// does NOT read `_totalSupply()` / `getActualSupply()` / `_lastJoinExitData`, so
+    /// non-BPT swaps are unconditionally BPT-supply-independent. They are NOT
+    /// unconditionally balance-independent (the formula uses `balances` directly);
+    /// the simulator just feeds (REMAIN, REMAIN) as the post-Phase-1 starting state,
+    /// which is the actual on-chain invariant the attack establishes.
+    ///
     /// Strategy:
     ///   1. Confirm realWETH / realOSETH / totalBPT differ between two blocks A and B.
-    ///   2. Capture sf[1]_A at block A, run 30-round cycling -> trajectory_A.
-    ///   3. Fork at B (different pool state), force sf[1] := sf[1]_A
-    ///      (amp / swapFee already proven constant by `test_diag_ampAndFeeStability`),
-    ///      run cycling with same REMAIN -> trajectory_B.
-    ///   4. If trajectory_A == trajectory_B byte-for-byte AND a synthetic sf[1] sweep
-    ///      yields identical pass/fail at A and B, cycling is provably independent of
-    ///      real pool balances/BPT supply.
+    ///   2. Capture sf[0]_A, sf[1]_A, amp_A, fee_A at block A, run 30-round cycling
+    ///      from (REMAIN, REMAIN) -> trajectory_A.
+    ///   3. Fork at B (different pool state), assert sf[0] / amp / swapFee equal A's
+    ///      values (closes the formal sufficient-condition set; amp/fee stability
+    ///      across nearby blocks is proven by test_diag_ampAndFeeStability), then
+    ///      force sf[1] := sf[1]_A and run cycling -> trajectory_B.
+    ///   4. assertEq trajectory_A == trajectory_B byte-for-byte AND assertEq a
+    ///      synthetic sf[1] sweep produces identical pass/fail counts on A and B.
     function test_cyclingIndependentOfPoolState() public {
         uint256 BLOCK_A = 23717396;
         uint256 BLOCK_B = 23501400;
@@ -3421,7 +3433,7 @@ contract SearchParams is Test {
         uint256 ROUNDS  = 30;
 
         // ----- Step 1: read pool state at A -----
-        uint256 sf1_A; uint256 ampA; uint256 feeA;
+        uint256 sf0_A; uint256 sf1_A; uint256 ampA; uint256 feeA;
         uint256 wA; uint256 oA; uint256 sA;
         {
             vm.createSelectFork("ETH", BLOCK_A);
@@ -3433,7 +3445,7 @@ contract SearchParams is Test {
             // identical instant and produce identical sf[1].
             vm.warp(1762156007);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
-            sf1_A = sf[1]; ampA = amp; feeA = swapFeePercentage;
+            sf0_A = sf[0]; sf1_A = sf[1]; ampA = amp; feeA = swapFeePercentage;
             (, uint256[] memory bal,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
             wA = bal[0]; oA = bal[2]; sA = OSETH_BPT.getActualSupply();
         }
@@ -3448,6 +3460,11 @@ contract SearchParams is Test {
             wB = bal[0]; oB = bal[2]; sB = OSETH_BPT.getActualSupply();
             require(amp == ampA, "amp differs between A and B");
             require(swapFeePercentage == feeA, "swapFee differs between A and B");
+            // sf[0] is the WETH scaling factor; WETH has no rate provider on this
+            // pool so sf[0] == 1e18 across all blocks. Assert it explicitly to close
+            // the formal sufficient-condition set ((sf[0], sf[1], amp, swapFee) all
+            // equal across forks) that the trajectory-identity proof depends on.
+            require(sf[0] == sf0_A, "sf[0] differs between A and B");
         }
 
         console.log("=== Pool state ===");
@@ -3480,6 +3497,7 @@ contract SearchParams is Test {
             // from the osETH rate provider's 12-second slope.
             vm.warp(1762156007);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
+            require(sf[0] == sf0_A, "A sf[0] inconsistent");
             require(sf[1] == sf1_A, "A sf[1] inconsistent");
             uint256 t = 1e18 / (sf[1] - 1e18);
             traj.bWa[0] = REMAIN; traj.bOa[0] = REMAIN;
@@ -3493,6 +3511,7 @@ contract SearchParams is Test {
             vm.createSelectFork("ETH", BLOCK_B);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
             require(amp == ampA && swapFeePercentage == feeA, "B amp/fee drifted");
+            require(sf[0] == sf0_A, "B sf[0] differs from A");
             sf[1] = sf1_A; // force equality with A
             uint256 t = 1e18 / (sf[1] - 1e18);
             traj.bWb[0] = REMAIN; traj.bOb[0] = REMAIN;
@@ -3547,11 +3566,10 @@ contract SearchParams is Test {
         console.log("fwdSafe B:", fwdB, "fwdFailRounds:", fwdBR);
         console.log("bwdSafe A:", bwdA, "bwdFailRounds:", bwdAR);
         console.log("bwdSafe B:", bwdB, "bwdFailRounds:", bwdBR);
-        if (fwdA == fwdB && bwdA == bwdB && fwdAR == fwdBR && bwdAR == bwdBR) {
-            console.log("PASS: synthetic sweep produced identical safeRun on A and B");
-        } else {
-            console.log("FAIL: sweep numbers differ");
-        }
+        assertEq(fwdA, fwdB, "fwdSafe differs between A and B");
+        assertEq(bwdA, bwdB, "bwdSafe differs between A and B");
+        assertEq(fwdAR, fwdBR, "fwdFailRounds differs between A and B");
+        assertEq(bwdAR, bwdBR, "bwdFailRounds differs between A and B");
     }
 
     /// @notice Validate a single off-chain-tuned `remain` value's future safety window.
