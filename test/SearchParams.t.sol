@@ -3383,7 +3383,7 @@ contract SearchParams is Test {
         uint256 okA,
         uint256 okB,
         CyclingTrajectories memory traj
-    ) private {
+    ) private view {
         console.log("");
         console.log("=== Trajectory comparison (REMAIN=67000, sf[1] forced to sf1_A) ===");
         console.log("rounds passed at A:", okA);
