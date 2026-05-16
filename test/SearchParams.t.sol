@@ -3364,6 +3364,46 @@ contract SearchParams is Test {
         }
     }
 
+    /// @notice Bundle for trajectory comparison; packing the four uint256[31] memory
+    /// arrays into a single struct collapses their stack footprint at the call site
+    /// (one memory pointer instead of four), which is what lets the helper compile
+    /// under via_ir + optimizer without hitting stack-too-deep on its console.logs.
+    struct CyclingTrajectories {
+        uint256[31] bWa;
+        uint256[31] bOa;
+        uint256[31] bWb;
+        uint256[31] bOb;
+    }
+
+    /// @notice Helper for test_cyclingIndependentOfPoolState Step 5. See struct comment above.
+    function _compareCyclingTrajectories(
+        uint256 okA,
+        uint256 okB,
+        CyclingTrajectories memory traj
+    ) private view {
+        console.log("");
+        console.log("=== Trajectory comparison (REMAIN=67000, sf[1] forced to sf1_A) ===");
+        console.log("rounds passed at A:", okA);
+        console.log("rounds passed at B:", okB);
+        uint256 mismatches = 0;
+        uint256 maxR = okA > okB ? okA : okB;
+        for (uint256 r = 0; r <= maxR; r++) {
+            if (traj.bWa[r] != traj.bWb[r] || traj.bOa[r] != traj.bOb[r]) {
+                console.log("MISMATCH at round:", r);
+                console.log("  A.bW :", traj.bWa[r]);
+                console.log("  B.bW :", traj.bWb[r]);
+                console.log("  A.bO :", traj.bOa[r]);
+                console.log("  B.bO :", traj.bOb[r]);
+                mismatches++;
+            }
+        }
+        if (okA == okB && mismatches == 0) {
+            console.log("PASS: trajectories byte-identical");
+        } else {
+            console.log("FAIL: trajectories differ");
+        }
+    }
+
     /// @notice Verify Phase 2 cycling is independent of real pool balances/BPT supply.
     /// Strategy:
     ///   1. Confirm realWETH / realOSETH / totalBPT differ between two blocks A and B.
@@ -3419,61 +3459,40 @@ contract SearchParams is Test {
         require(sA != sB, "totalBPT equal between blocks");
         console.log("OK: realWETH / realOSETH / totalBPT all differ between A and B");
 
-        // ----- Step 3: trajectory at A with natural sf[1]_A -----
-        uint256[31] memory bWa; uint256[31] memory bOa; uint256 okA;
+        // ----- Step 3+4: collect both trajectories into a single struct so that
+        // only one memory pointer occupies the caller's stack (instead of four),
+        // which is what lets Step 6 below compile under via_ir + optimizer.
+        CyclingTrajectories memory traj;
+        uint256 okA;
+        uint256 okB;
         {
             vm.createSelectFork("ETH", BLOCK_A);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
             require(sf[1] == sf1_A, "A sf[1] inconsistent");
             uint256 t = 1e18 / (sf[1] - 1e18);
-            bWa[0] = REMAIN; bOa[0] = REMAIN;
+            traj.bWa[0] = REMAIN; traj.bOa[0] = REMAIN;
             for (uint256 r = 0; r < ROUNDS; r++) {
-                try this.simulateOneRound(bWa[r], bOa[r], t) returns (uint256 nW, uint256 nO) {
-                    bWa[r+1] = nW; bOa[r+1] = nO; okA++;
+                try this.simulateOneRound(traj.bWa[r], traj.bOa[r], t) returns (uint256 nW, uint256 nO) {
+                    traj.bWa[r+1] = nW; traj.bOa[r+1] = nO; okA++;
                 } catch { break; }
             }
         }
-
-        // ----- Step 4: trajectory at B with sf[1] forced to sf1_A -----
-        uint256[31] memory bWb; uint256[31] memory bOb; uint256 okB;
         {
             vm.createSelectFork("ETH", BLOCK_B);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
             require(amp == ampA && swapFeePercentage == feeA, "B amp/fee drifted");
             sf[1] = sf1_A; // force equality with A
             uint256 t = 1e18 / (sf[1] - 1e18);
-            bWb[0] = REMAIN; bOb[0] = REMAIN;
+            traj.bWb[0] = REMAIN; traj.bOb[0] = REMAIN;
             for (uint256 r = 0; r < ROUNDS; r++) {
-                try this.simulateOneRound(bWb[r], bOb[r], t) returns (uint256 nW, uint256 nO) {
-                    bWb[r+1] = nW; bOb[r+1] = nO; okB++;
+                try this.simulateOneRound(traj.bWb[r], traj.bOb[r], t) returns (uint256 nW, uint256 nO) {
+                    traj.bWb[r+1] = nW; traj.bOb[r+1] = nO; okB++;
                 } catch { break; }
             }
         }
 
-        // ----- Step 5: compare trajectories byte-for-byte -----
-        console.log("");
-        console.log("=== Trajectory comparison (REMAIN=67000, sf[1] forced to sf1_A) ===");
-        console.log("rounds passed at A:", okA);
-        console.log("rounds passed at B:", okB);
-        uint256 mismatches = 0;
-        {
-            uint256 maxR = okA > okB ? okA : okB;
-            for (uint256 r = 0; r <= maxR; r++) {
-                if (bWa[r] != bWb[r] || bOa[r] != bOb[r]) {
-                    console.log("MISMATCH at round:", r);
-                    console.log("  A.bW :", bWa[r]);
-                    console.log("  B.bW :", bWb[r]);
-                    console.log("  A.bO :", bOa[r]);
-                    console.log("  B.bO :", bOb[r]);
-                    mismatches++;
-                }
-            }
-        }
-        if (okA == okB && mismatches == 0) {
-            console.log("PASS: trajectories byte-identical");
-        } else {
-            console.log("FAIL: trajectories differ");
-        }
+        // ----- Step 5: compare trajectories byte-for-byte (helper) -----
+        _compareCyclingTrajectories(okA, okB, traj);
 
         // ----- Step 6: synthetic sf[1] sweep — verify pass/fail count is identical
         // for many sf[1] values whether we're on fork A or fork B. Uses a fixed delta
