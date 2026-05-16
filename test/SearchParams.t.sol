@@ -3425,6 +3425,13 @@ contract SearchParams is Test {
         uint256 wA; uint256 oA; uint256 sA;
         {
             vm.createSelectFork("ETH", BLOCK_A);
+            // Foundry's createSelectFork returns the natural ts on a fresh visit but
+            // the persisted-snapshot ts on re-visits to an already-cached (chain,block)
+            // pair (setUp() registered BLOCK_A with a vm.warp to 1762156007). Step 3
+            // re-forks BLOCK_A and lands on the snapshot ts; pin Step 1 to the same
+            // canonical ts so both rate-cache refreshes query the provider at the
+            // identical instant and produce identical sf[1].
+            vm.warp(1762156007);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
             sf1_A = sf[1]; ampA = amp; feeA = swapFeePercentage;
             (, uint256[] memory bal,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
@@ -3467,6 +3474,11 @@ contract SearchParams is Test {
         uint256 okB;
         {
             vm.createSelectFork("ETH", BLOCK_A);
+            // Pin to the same canonical ts as Step 1 (see note there). Without this
+            // explicit warp, Foundry would land Step 1 on BLOCK_A's natural ts and
+            // Step 3 on setUp()'s warped ts, producing an ~1e10 wei sf[1] drift
+            // from the osETH rate provider's 12-second slope.
+            vm.warp(1762156007);
             swapMath = new SwapMath(); _refreshAtCurrentFork();
             require(sf[1] == sf1_A, "A sf[1] inconsistent");
             uint256 t = 1e18 / (sf[1] - 1e18);
