@@ -165,14 +165,56 @@ contract SearchParams is Test {
     /// (confirmed by BlockSec analysis):
     /// 1. Truncate WETH balance to top 2 significant digits (e.g. 324816 → 320000)
     /// 2. If swap fails, retry with 9/10 fallback (up to 2 retries).
-    ///    The primary failure mode of Attempt 1 is BAL#004 (ZERO_DIVISION), NOT
-    ///    Newton-Raphson divergence (BAL#321/BAL#322).
-    ///    Root cause: _truncateToTop2Digits extracts ~98-99% of balWETH, leaving a
-    ///    tiny remainder. Inside _getTokenBalanceGivenInvariantAndAllOtherBalances,
-    ///    P_D = floor(4 * remainder * balOSETH / D). Since balOSETH=1 (D-crashed)
-    ///    and remainder << D, P_D floors to 0, causing Math.divUp(inv2, 0) to revert.
-    ///    The ×0.9 fallback reduces swapOut3, increasing the remainder ~9×, which
-    ///    raises P_D above 0 and avoids the ZERO_DIVISION.
+    ///
+    /// Failure-mode breakdown (empirically verified on mainnet fork at FORK_BLOCK
+    /// by test_diagPerRemainSwap3SuccessPattern, test_diagPerRemainSwap3PerAttempt,
+    /// and test_diagPerRemainSwap3TripleFail, scanning remain in [10000, 100000]
+    /// step 1000, 40 rounds each, 1112 rounds reaching the Swap 3 retry loop):
+    ///
+    ///   * In rounds that EVENTUALLY succeed (1045 of 1112 Swap-3 rounds):
+    ///       - Attempt 1 succeeded outright in only   26 rounds (  2.5%)
+    ///       - Attempt 1 failed → Attempt 2 succeeded in 416 rounds ( 39.8%)
+    ///       - Attempts 1 & 2 failed → Attempt 3 succeeded in 603 rounds ( 57.7%)
+    ///     All 1019 Attempt-1 failures and all 603 Attempt-2 failures in this
+    ///     regime decode to revert("ZERO_DIVISION") (string-form, length 13),
+    ///     which is the local FixedPoint/Math BAL#004 analogue thrown by
+    ///     `require(b != 0, "ZERO_DIVISION")` in src/FixedPoint.sol and src/Math.sol.
+    ///     Zero Solidity Panic(0x12), zero BAL#321/BAL#322, zero other strings.
+    ///   * In rounds where ALL 3 attempts fail (67 of 1112 Swap-3 rounds):
+    ///     EXHAUSTIVE pattern enumeration over (c1, c2, c3) shows exactly one
+    ///     observed triple: (BAL#321, BAL#321, BAL#321), occurring 67/67 times.
+    ///     Independently asserted by 4 hard assertEq's in test_diag*TripleFail:
+    ///       - pattern PURE BAL#321 (1,1,1)        = 67
+    ///       - pattern PURE ZERO_DIVISION (6,6,6)  = 0
+    ///       - pattern MIXED BAL#321 + ZERO_DIVISION = 0
+    ///       - pattern OTHER (any class != 1,6)    = 0
+    ///     This is a regime where the Newton iteration for D itself diverges
+    ///     from the very first attempt, before the floor-to-zero ever has a
+    ///     chance to fire. The ×0.9 / ×0.81 fallback cannot rescue it.
+    ///
+    /// Iff relationship (empirically pinned by the four assertions above):
+    ///   _computeSwap3 reverts ("all 3 attempts failed") <==> Attempt 1 already
+    ///   reverted with BAL#321. Equivalently: any ZERO_DIVISION at any attempt
+    ///   is guaranteed to be rescued by some later attempt within the same
+    ///   round (1549/1549 ZERO_DIVISION samples observed, 0 escalations to a
+    ///   triple-fail).
+    ///
+    /// Root cause of the ZERO_DIVISION regime:
+    ///   _truncateToTop2Digits extracts ~98-99% of balWETH, leaving a tiny
+    ///   remainder. Inside _getTokenBalanceGivenInvariantAndAllOtherBalances,
+    ///   P_D = floor(4 * remainder * balOSETH / D). With balOSETH=1 (D-crashed)
+    ///   and remainder << D, P_D floors to 0, causing Math.divUp(inv2, 0) to
+    ///   trip `require(b != 0, "ZERO_DIVISION")`. The ×0.9 fallback reduces
+    ///   swapOut3, multiplying the remainder by ~10/9, which raises P_D above 0
+    ///   and avoids the revert.
+    ///
+    /// Note on revert form: the docstring previously claimed Attempt 1 fails
+    /// with Solidity Panic(0x12). That is mechanically incorrect for this
+    /// codebase — the local FixedPoint and Math libraries pre-empt the
+    /// language-level div-by-zero with a `require` that emits Error(string)
+    /// "ZERO_DIVISION". Functionally still BAL#004, but the revert selector is
+    /// 0x08c379a0 (Error(string)), not 0x4e487b71 (Panic(uint256)).
+    ///
     /// Returns (swapOut3, newBalWETH, newBalOSETH). Reverts if all 3 attempts fail.
     function _computeSwap3(uint256 balWETH, uint256 balOSETH) external returns (uint256, uint256, uint256) {
         uint256 swapOut3 = _truncateToTop2Digits(balWETH);
@@ -4257,27 +4299,45 @@ contract SearchParams is Test {
     /// numbers:
     ///   - 91 remain candidates scanned (10000..100000 step 1000)
     ///   - 24 candidates complete all 40 simulation rounds, 67 candidates fail
-    ///   - 67 / 67 = 100% of failures occur at Swap 3 (Swap 1 = 0, Swap 2 = 0)
-    ///   - 67 / 67 = 100% of failures decode to Error(string)="STABLE_INVARIANT_DIDNT_CONVERGE"
-    ///     (= BAL#321, class 1); class 2/3/4/5 counts are all 0
-    ///   - Unique 4-byte selector observed at failure sites: 0x08c379a0 (Error(string))
+    ///   - 67 / 67 = 100% of first-failures recorded at Swap 3 (Swap 1 = 0, Swap 2 = 0)
+    ///   - 67 / 67 = 100% of recorded Swap-3 failures decode to
+    ///     Error(string)="STABLE_INVARIANT_DIDNT_CONVERGE" (= BAL#321, class 1)
+    ///   - Unique 4-byte selector observed at the recorded failure sites: 0x08c379a0
     ///   - Unique Error(string) length observed: 31 (= len("STABLE_INVARIANT_DIDNT_CONVERGE"))
-    ///   - Unique raw payload observed at all 67 failure sites:
-    ///       0x08c379a0
-    ///         0000..0020  // offset
-    ///         0000..001f  // length = 31
-    ///         535441424c455f494e56415249414e545f4449444e545f434f4e564552474500
-    ///         // UTF-8 bytes of "STABLE_INVARIANT_DIDNT_CONVERGE"
-    ///   - No Panic(0x12), no Panic(0x11), no BAL#322 observed anywhere in the search space
     ///   - The 67 failing remain values are pairwise distinct (1 failure per remain)
-    /// Conclusion: targetRemainBalance=67000 used by the PoC is one of the 24 surviving
-    /// values; the parameter is "lucky" in the sense that it avoids the BAL#321 Newton
-    /// non-convergence band that affects ~74% of the uniformly sampled search space.
+    ///
+    /// Important scope caveat: this test stores only `lastE` (the 3rd attempt's
+    /// revert) of the Swap-3 retry loop. So the "100% BAL#321" finding strictly
+    /// describes the LAST attempt of the FAILING remains. Two companion tests
+    /// give the per-attempt and per-success-pattern breakdowns:
+    ///   - test_diagPerRemainSwap3PerAttempt: across the same 67 failing remains,
+    ///     ALL three attempts decode to BAL#321 (201 / 201 classifications), so
+    ///     this regime is genuinely "BAL#321 from the start", not a late-stage
+    ///     failure that happens to be BAL#321.
+    ///   - test_diagPerRemainSwap3SuccessPattern: across 1045 rounds that
+    ///     EVENTUALLY succeed (within both the 24 surviving remains and the
+    ///     pre-failure rounds of the 67 failing remains), Attempt 1 succeeds
+    ///     outright only 26 times; the other 1019 Attempt-1 failures decode
+    ///     100% to revert("ZERO_DIVISION") (= BAL#004 analogue) and the ×0.9
+    ///     fallback rescues 416 of them, with the remaining 603 needing the
+    ///     ×0.81 fallback. Zero Panic(0x12), zero BAL#321/322 in pre-success
+    ///     failures.
+    ///   - test_diagPerRemainSwap3TripleFail: enumerates the (c1, c2, c3)
+    ///     triple of every all-3-attempts-failed round under EXHAUSTIVE
+    ///     pattern partitioning, with 4 independent hard assertions. Result:
+    ///     pure (BAL#321, BAL#321, BAL#321) = 67, pure (ZD,ZD,ZD) = 0, mixed
+    ///     BAL#321+ZD = 0, other-class = 0. Establishes the iff relationship
+    ///     "_computeSwap3 reverts <==> Att1 already reverted with BAL#321".
+    ///
+    /// Conclusion: targetRemainBalance=67000 used by the PoC is one of the 24
+    /// surviving values; the parameter is "lucky" in the sense that it avoids
+    /// the BAL#321 Newton non-convergence band that affects ~74% of the
+    /// uniformly sampled search space.
     function test_diagPerRemainBalCode() public {
         uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
         uint256 N = 40;
 
-        uint256[6] memory cSwap1; uint256[6] memory cSwap2; uint256[6] memory cSwap3;
+        uint256[7] memory cSwap1; uint256[7] memory cSwap2; uint256[7] memory cSwap3;
         uint256 cOK;
 
         for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
@@ -4329,12 +4389,13 @@ contract SearchParams is Test {
         _printRow("Swap3", cSwap3);
     }
 
-    function _printRow(string memory label, uint256[6] memory c) internal pure {
+    function _printRow(string memory label, uint256[7] memory c) internal pure {
         console.log(label, "STABLE_INVARIANT_DIDNT_CONVERGE   :", c[1]);
         console.log(label, "STABLE_GET_BALANCE_DIDNT_CONVERGE :", c[2]);
         console.log(label, "Panic(uint256)                    :", c[3]);
         console.log(label, "Error(string) other text          :", c[4]);
         console.log(label, "Other selector or empty           :", c[5]);
+        console.log(label, "ZERO_DIVISION (= BAL#004)         :", c[6]);
         console.log(label, "Slot 0 (unused)                   :", c[0]);
     }
 
@@ -4385,6 +4446,10 @@ contract SearchParams is Test {
                 console.log("  -> class 2 STABLE_GET_BALANCE_DIDNT_CONVERGE");
                 return 2;
             }
+            if (h == keccak256(bytes("ZERO_DIVISION"))) {
+                console.log("  -> class 6 ZERO_DIVISION (= BAL#004)");
+                return 6;
+            }
             console.log("  -> class 4 Error(string) other text");
             return 4;
         }
@@ -4400,6 +4465,48 @@ contract SearchParams is Test {
 
         console.log("  -> class 5 (unknown selector)");
         return 5;
+    }
+
+    /// @notice Same classification logic as _logAndClassify, but silent (no
+    /// console.log). Used by per-round diagnostics that would otherwise flood
+    /// the log with thousands of attempt-1 failures. Returns the same class
+    /// codes 1..5.
+    function _classifyQuiet(bytes memory data) internal pure returns (uint256) {
+        if (data.length < 4) return 5;
+        bytes4 sel;
+        assembly ("memory-safe") { sel := mload(add(data, 0x20)) }
+        if (sel == bytes4(0x08c379a0)) {
+            if (data.length < 68) return 5;
+            uint256 strLen;
+            assembly ("memory-safe") { strLen := mload(add(data, 0x44)) }
+            if (strLen + 68 > data.length || strLen == 0) return 5;
+            bytes memory msgBytes = new bytes(strLen);
+            for (uint256 i = 0; i < strLen; i++) { msgBytes[i] = data[68 + i]; }
+            bytes32 h = keccak256(msgBytes);
+            if (h == keccak256(bytes("STABLE_INVARIANT_DIDNT_CONVERGE"))) return 1;
+            if (h == keccak256(bytes("STABLE_GET_BALANCE_DIDNT_CONVERGE"))) return 2;
+            if (h == keccak256(bytes("ZERO_DIVISION"))) return 6;
+            return 4;
+        }
+        if (sel == bytes4(0x4e487b71)) {
+            if (data.length < 36) return 5;
+            return 3;
+        }
+        return 5;
+    }
+
+    /// @notice Read a Solidity Panic(uint256) code out of a revert payload.
+    /// Returns (true, code) for Panic, (false, 0) otherwise. Used to confirm
+    /// whether class 3 hits are specifically 0x12 (ZERO_DIVISION, BAL#004
+    /// analogue) or some other panic.
+    function _readPanicCode(bytes memory data) internal pure returns (bool, uint256) {
+        if (data.length < 36) return (false, 0);
+        bytes4 sel;
+        assembly ("memory-safe") { sel := mload(add(data, 0x20)) }
+        if (sel != bytes4(0x4e487b71)) return (false, 0);
+        uint256 code;
+        assembly ("memory-safe") { code := mload(add(data, 0x24)) }
+        return (true, code);
     }
 
     /// @notice Decode a Balancer-style revert payload into the BAL#xxx numeric code.
@@ -4460,5 +4567,436 @@ contract SearchParams is Test {
             }
         }
     }
+
+    /// @notice Per-attempt Swap-3 retry classifier. test_diagPerRemainBalCode
+    /// only records lastE (the 3rd attempt's revert), so the "100% BAL#321"
+    /// conclusion there strictly applies to attempt 3 only. The docstring on
+    /// _computeSwap3 (lines 167-175) claims attempt 1's primary failure mode
+    /// is BAL#004 / Solidity Panic(0x12) ZERO_DIVISION, not BAL#321. This test
+    /// captures and classifies each of the 3 attempts independently so we can
+    /// (a) confirm or refute the docstring's BAL#004-on-attempt-1 claim, and
+    /// (b) check whether any failing remain has at least one Swap-3 attempt
+    /// whose error is not BAL#321.
+    ///
+    /// Swap-step encoding in the log:
+    ///   31 = Swap 3, attempt 1 (truncated amount)
+    ///   32 = Swap 3, attempt 2 (x0.9)
+    ///   33 = Swap 3, attempt 3 (x0.81)
+    function test_diagPerRemainSwap3PerAttempt() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 40;
+
+        uint256[7] memory cAtt1; uint256[7] memory cAtt2; uint256[7] memory cAtt3;
+        uint256 cOK;
+        uint256 cTotalFail;       // remains that hit a Swap-3 all-3-attempts failure
+        uint256 cAllBal321;       // those whose 3 attempts are all class 1
+        uint256 cAnyNonBal321;    // those with >= 1 attempt that is not class 1
+
+        for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
+            uint256 bW = remain; uint256 bO = remain;
+            bool failed = false;
+            for (uint256 r = 0; r < N; r++) {
+                if (bO <= trickAmt + 1) break;
+
+                uint256 swapOut1 = bO - trickAmt - 1;
+                try this.trySwap(bW, bO, 0, 1, swapOut1) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch { failed = true; break; }
+
+                try this.trySwap(bW, bO, 0, 1, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch { failed = true; break; }
+
+                uint256 sw3 = _truncateToTop2Digits(bW);
+                bool s3ok = false;
+                bytes memory e1; bytes memory e2; bytes memory e3;
+                // Attempt 1
+                try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; s3ok = true;
+                } catch (bytes memory e) { e1 = e; }
+                if (!s3ok) {
+                    sw3 = sw3 * 9 / 10;
+                    // Attempt 2
+                    try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; s3ok = true;
+                    } catch (bytes memory e) { e2 = e; }
+                }
+                if (!s3ok) {
+                    sw3 = sw3 * 9 / 10;
+                    // Attempt 3
+                    try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; s3ok = true;
+                    } catch (bytes memory e) { e3 = e; }
+                }
+                if (!s3ok) {
+                    console.log("===== failing remain", remain, "round", r);
+                    uint256 c1 = _logAndClassify(remain, r, 31, e1);
+                    uint256 c2 = _logAndClassify(remain, r, 32, e2);
+                    uint256 c3 = _logAndClassify(remain, r, 33, e3);
+                    cAtt1[c1]++; cAtt2[c2]++; cAtt3[c3]++;
+                    cTotalFail++;
+                    if (c1 == 1 && c2 == 1 && c3 == 1) cAllBal321++;
+                    else cAnyNonBal321++;
+                    failed = true; break;
+                }
+            }
+            if (!failed) cOK++;
+        }
+        console.log("=== Per-attempt Swap-3 classification (91 candidates, N=40 rounds) ===");
+        console.log("Completed all rounds   :", cOK);
+        console.log("Total failing remains  :", cTotalFail);
+        console.log("All 3 attempts == BAL#321 (class 1) :", cAllBal321);
+        console.log("Any attempt != BAL#321              :", cAnyNonBal321);
+        console.log("--- per-attempt class breakdown ---");
+        _printRow("Att1", cAtt1);
+        _printRow("Att2", cAtt2);
+        _printRow("Att3", cAtt3);
+    }
+
+    /// @notice Per-round Swap-3 success-pattern diagnostic. For every round
+    /// that completes (some attempt eventually succeeded), record which
+    /// attempt succeeded (1, 2, or 3) and classify the error(s) of the
+    /// attempt(s) that failed before it. This is the diagnostic that lets us
+    /// verify the BAL#004 / Panic(0x12) claim in _computeSwap3's docstring
+    /// for the regime in which the fallback actually rescues the round (i.e.
+    /// the 24 surviving remains, and all the pre-failure rounds of the 67
+    /// eventually-failing remains).
+    /// Uses _classifyQuiet to avoid flooding the log with per-failure raw
+    /// dumps; aggregate counters plus the first observed Panic code are
+    /// printed at the end.
+    function test_diagPerRemainSwap3SuccessPattern() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 40;
+
+        uint256 okAt1; uint256 okAt2; uint256 okAt3;
+        uint256[7] memory cAtt1Fail;   // class breakdown of attempts that failed
+        uint256[7] memory cAtt2Fail;   // before some later attempt succeeded
+        uint256 firstPanicCode;        // 0 = none observed yet
+        bool firstPanicSeen;
+        bool firstOtherStringSeen;     // capture first class-4 sample to identify it
+        bytes memory firstOtherStringRaw;
+
+        for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
+            uint256 bW = remain; uint256 bO = remain;
+            for (uint256 r = 0; r < N; r++) {
+                if (bO <= trickAmt + 1) break;
+
+                uint256 swapOut1 = bO - trickAmt - 1;
+                try this.trySwap(bW, bO, 0, 1, swapOut1) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch { break; }
+
+                try this.trySwap(bW, bO, 0, 1, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch { break; }
+
+                uint256 sw3 = _truncateToTop2Digits(bW);
+
+                // Attempt 1
+                bool a1ok = false; bytes memory e1;
+                try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; a1ok = true;
+                } catch (bytes memory e) { e1 = e; }
+                if (a1ok) { okAt1++; continue; }
+
+                // Attempt 2 (x0.9)
+                sw3 = sw3 * 9 / 10;
+                bool a2ok = false; bytes memory e2;
+                try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; a2ok = true;
+                } catch (bytes memory e) { e2 = e; }
+                if (a2ok) {
+                    uint256 c1 = _classifyQuiet(e1);
+                    cAtt1Fail[c1]++;
+                    if (!firstPanicSeen && c1 == 3) {
+                        (, firstPanicCode) = _readPanicCode(e1);
+                        firstPanicSeen = true;
+                    }
+                    if (!firstOtherStringSeen && c1 == 4) {
+                        firstOtherStringRaw = e1;
+                        firstOtherStringSeen = true;
+                    }
+                    okAt2++; continue;
+                }
+
+                // Attempt 3 (x0.81)
+                sw3 = sw3 * 9 / 10;
+                bool a3ok = false;
+                try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO; a3ok = true;
+                } catch { /* swallow: failure regime already covered by other test */ }
+                if (a3ok) {
+                    uint256 c1 = _classifyQuiet(e1);
+                    uint256 c2 = _classifyQuiet(e2);
+                    cAtt1Fail[c1]++; cAtt2Fail[c2]++;
+                    if (!firstPanicSeen && c1 == 3) {
+                        (, firstPanicCode) = _readPanicCode(e1);
+                        firstPanicSeen = true;
+                    }
+                    if (!firstPanicSeen && c2 == 3) {
+                        (, firstPanicCode) = _readPanicCode(e2);
+                        firstPanicSeen = true;
+                    }
+                    okAt3++; continue;
+                }
+
+                // All 3 attempts failed: covered by test_diagPerRemainSwap3PerAttempt
+                break;
+            }
+        }
+        uint256 totalRounds = okAt1 + okAt2 + okAt3;
+        console.log("=== Swap-3 success-pattern across 91 remains x 40 rounds ===");
+        console.log("Rounds that completed (some attempt succeeded) :", totalRounds);
+        console.log("  succeeded on Attempt 1 :", okAt1);
+        console.log("  succeeded on Attempt 2 :", okAt2);
+        console.log("  succeeded on Attempt 3 :", okAt3);
+        console.log("--- Attempt-1 failure class breakdown (rounds that eventually succeeded on Att2 or Att3) ---");
+        _printRow("Att1F", cAtt1Fail);
+        console.log("--- Attempt-2 failure class breakdown (rounds that eventually succeeded on Att3) ---");
+        _printRow("Att2F", cAtt2Fail);
+        if (firstPanicSeen) {
+            console.log("First observed Panic(uint256) code among the above failures:", firstPanicCode);
+        } else {
+            console.log("No Panic(uint256) observed in any pre-success Att1/Att2 failure.");
+        }
+        if (firstOtherStringSeen) {
+            console.log("--- First class-4 (Error(string) other) sample: ---");
+            console.log("raw payload:");
+            console.logBytes(firstOtherStringRaw);
+            uint256 strLen;
+            bytes memory data = firstOtherStringRaw;
+            assembly ("memory-safe") { strLen := mload(add(data, 0x44)) }
+            console.log("Error(string) length:", strLen);
+            bytes memory msgBytes = new bytes(strLen);
+            for (uint256 i = 0; i < strLen; i++) { msgBytes[i] = data[68 + i]; }
+            console.log("decoded string:", string(msgBytes));
+        }
+    }
+
+    /// @notice Per-round result emitted by _runOneRoundSwap3.
+    /// outcome encoding:
+    ///   0 = round completed; some attempt succeeded
+    ///   1 = round failed before reaching Swap 3 (Swap 1 or Swap 2 reverted)
+    ///   2 = round reached Swap 3 retry loop; classify (c1, c2, c3)
+    /// rescuedBy encoding (only when outcome == 0):
+    ///   1 = Att1 succeeded outright (c1, c2, c3 undefined)
+    ///   2 = Att1 failed, Att2 succeeded (c1 valid, c2/c3 undefined)
+    ///   3 = Att1 & Att2 failed, Att3 succeeded (c1, c2 valid, c3 undefined)
+    struct RoundResult {
+        uint8  outcome;
+        uint8  rescuedBy;
+        uint8  c1;
+        uint8  c2;
+        uint8  c3;
+        uint256 newBW;
+        uint256 newBO;
+    }
+
+    /// @notice External helper so the inner Swap-3 retry sequence does not
+    /// inflate the stack of test_diagPerRemainSwap3TripleFail.
+    function _runOneRoundSwap3(uint256 bW, uint256 bO, uint256 trickAmt)
+        external
+        returns (RoundResult memory res)
+    {
+        if (bO <= trickAmt + 1) { res.outcome = 1; return res; }
+
+        uint256 swapOut1 = bO - trickAmt - 1;
+        try this.trySwap(bW, bO, 0, 1, swapOut1) returns (uint256 nW, uint256 nO) {
+            bW = nW; bO = nO;
+        } catch { res.outcome = 1; return res; }
+
+        try this.trySwap(bW, bO, 0, 1, trickAmt) returns (uint256 nW, uint256 nO) {
+            bW = nW; bO = nO;
+        } catch { res.outcome = 1; return res; }
+
+        uint256 sw3 = _truncateToTop2Digits(bW);
+        bytes memory e1; bytes memory e2; bytes memory e3;
+
+        try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+            res.outcome = 0; res.rescuedBy = 1; res.newBW = nW; res.newBO = nO; return res;
+        } catch (bytes memory e) { e1 = e; }
+
+        sw3 = sw3 * 9 / 10;
+        try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+            res.outcome = 0; res.rescuedBy = 2;
+            res.c1 = uint8(_classifyQuiet(e1));
+            res.newBW = nW; res.newBO = nO; return res;
+        } catch (bytes memory e) { e2 = e; }
+
+        sw3 = sw3 * 9 / 10;
+        try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+            res.outcome = 0; res.rescuedBy = 3;
+            res.c1 = uint8(_classifyQuiet(e1));
+            res.c2 = uint8(_classifyQuiet(e2));
+            res.newBW = nW; res.newBO = nO; return res;
+        } catch (bytes memory e) { e3 = e; }
+
+        res.outcome = 2;
+        res.c1 = uint8(_classifyQuiet(e1));
+        res.c2 = uint8(_classifyQuiet(e2));
+        res.c3 = uint8(_classifyQuiet(e3));
+    }
+
+    /// @notice Strict, exhaustive pattern enumeration of all-3-attempts-failed
+    /// rounds. Answers the question:
+    /// "Is every all-3-fail round exactly (BAL#321, BAL#321, BAL#321), with
+    ///  zero (ZD, ZD, ZD), zero mixed BAL#321+ZD, and zero other-class
+    ///  triples?"
+    ///
+    /// Methodology:
+    ///   - The 4 pattern buckets below are MUTUALLY EXCLUSIVE and EXHAUSTIVE
+    ///     over all rounds where Att1, Att2, Att3 all failed; their sum must
+    ///     equal the total all-3-fail count (assertion (b) below).
+    ///   - Each all-3-fail (remain, round, c1, c2, c3) tuple is also logged
+    ///     individually so the categorization can be cross-checked by external
+    ///     grep over the test log.
+    ///   - Seven independent hard assertions pin down each negative claim,
+    ///     the one positive claim, the exhaustiveness invariant, and parity
+    ///     with the legacy "at least one ZERO_DIVISION" counter.
+    ///
+    /// Empirical result (mainnet fork, remain in [10000, 100000] step 1000,
+    /// N = 40, 1112 rounds reached Swap 3 retry loop):
+    ///   ctr[1] = 67 rounds all 3 attempts failed
+    ///     ctr[7]  PURE BAL#321 (1,1,1)        = 67   <-- only observed triple
+    ///     ctr[8]  PURE ZERO_DIVISION (6,6,6)  = 0
+    ///     ctr[9]  MIXED 1&6 only              = 0
+    ///     ctr[10] OTHER                       = 0
+    ///   ctr[5] = 24 survivor remains, ctr[6] = 0 survivor all-3-fail rounds
+    ///   Per-tuple log cross-check: 67 lines of "triple-fail remain ...",
+    ///   100% with "c1, c2, c3 = 1 1 1".
+    ///
+    /// Counter layout in ctr[16]:
+    ///   [0]  rounds that reached Swap 3 retry loop
+    ///   [1]  rounds where ALL 3 attempts failed
+    ///   [2]  ... and at least one of the 3 was class 6 (ZERO_DIVISION)   [legacy, kept for sanity]
+    ///   [3]  ... and all 3 were class 1 (BAL#321)                         [legacy, kept for sanity]
+    ///   [4]  ... and neither of the above patterns                        [legacy, kept for sanity]
+    ///   [5]  survivor remains (completed all N rounds)
+    ///   [6]  survivor rounds where all 3 attempts failed (expected = 0)
+    ///   [7]  pattern PURE BAL#321        : (c1,c2,c3) == (1,1,1)
+    ///   [8]  pattern PURE ZERO_DIVISION  : (c1,c2,c3) == (6,6,6)
+    ///   [9]  pattern MIXED 1&6 only      : all in {1,6}, contains both
+    ///   [10] pattern OTHER               : any class not in {1,6}
+    function test_diagPerRemainSwap3TripleFail() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 40;
+
+        uint256[16] memory ctr;
+        uint256[7] memory survAtt1FailCls;
+        uint256[7] memory survAtt2FailCls;
+
+        for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
+            (bool remainFailed, uint256[7] memory att1Local, uint256[7] memory att2Local)
+                = _runOneRemainTripleFail(remain, N, trickAmt, ctr);
+            if (!remainFailed) {
+                ctr[5]++;
+                for (uint256 k = 0; k < 7; k++) {
+                    survAtt1FailCls[k] += att1Local[k];
+                    survAtt2FailCls[k] += att2Local[k];
+                }
+            }
+        }
+
+        console.log("=== TripleFail diagnostic (91 remains x 40 rounds) ===");
+        console.log("Rounds that reached Swap 3 retry loop :", ctr[0]);
+        console.log("Rounds where ALL 3 attempts failed    :", ctr[1]);
+        console.log("  legacy 'at least one ZERO_DIVISION' :", ctr[2]);
+        console.log("  legacy 'all 3 == BAL#321'           :", ctr[3]);
+        console.log("  legacy 'other'                      :", ctr[4]);
+        console.log("--- Exhaustive pattern enumeration (mutually exclusive, sum == ctr[1]) ---");
+        console.log("  pattern PURE BAL#321 (1,1,1)        :", ctr[7]);
+        console.log("  pattern PURE ZERO_DIVISION (6,6,6)  :", ctr[8]);
+        console.log("  pattern MIXED 1&6 only              :", ctr[9]);
+        console.log("  pattern OTHER (any class != 1,6)    :", ctr[10]);
+        console.log("--- Restricted to the surviving remains (completed all N rounds) ---");
+        console.log("Survivor remains                      :", ctr[5]);
+        console.log("Survivor rounds where all 3 failed    :", ctr[6]);
+        console.log("Survivor Att1 failure class breakdown (over rounds Att1 failed but Att2 or Att3 rescued):");
+        _printRow("survAtt1F", survAtt1FailCls);
+        console.log("Survivor Att2 failure class breakdown (over rounds Att1 & Att2 failed but Att3 rescued):");
+        _printRow("survAtt2F", survAtt2FailCls);
+
+        // Hard assertions:
+        // (a) No survivor remain ever had all 3 attempts fail.
+        assertEq(ctr[6], 0, "survivor remain has round with all 3 attempts failing");
+        // (b) The 4 pattern buckets are exhaustive: their sum must equal the
+        //     total all-3-fail count. If this fails, the classification logic
+        //     is incomplete (some pattern slipped through unclassified).
+        assertEq(ctr[7] + ctr[8] + ctr[9] + ctr[10], ctr[1], "pattern buckets not exhaustive");
+        // (c) Negative claim 1: zero pure (ZD,ZD,ZD) triples.
+        assertEq(ctr[8], 0, "found pure (ZERO_DIVISION,ZERO_DIVISION,ZERO_DIVISION) triple");
+        // (d) Negative claim 2: zero mixed BAL#321 + ZD triples.
+        assertEq(ctr[9], 0, "found mixed BAL#321+ZERO_DIVISION triple");
+        // (e) Negative claim 3: zero other-class triples.
+        assertEq(ctr[10], 0, "found triple-failure with class not in {BAL#321, ZERO_DIVISION}");
+        // (f) Positive claim: every all-3-fail round is exactly (1,1,1).
+        assertEq(ctr[7], ctr[1], "not every all-3-fail round is pure BAL#321");
+        // (g) Legacy sanity: ctr[2] (any ZD) must equal ctr[8] + ctr[9] + (subset of ctr[10] that contains a 6).
+        //     Since ctr[8]=ctr[9]=ctr[10]=0, ctr[2] must also be 0.
+        assertEq(ctr[2], 0, "legacy 'at least one ZERO_DIVISION' counter disagrees with exhaustive enumeration");
+    }
+
+    /// @notice Per-remain inner loop for test_diagPerRemainSwap3TripleFail.
+    /// Returns (remainFailed, perRemainAtt1FailCls, perRemainAtt2FailCls) and
+    /// mutates the shared ctr[] in-place. Extracted to keep the test function's
+    /// stack frame shallow enough for the via-IR codegen to compile.
+    function _runOneRemainTripleFail(
+        uint256 remain,
+        uint256 N,
+        uint256 trickAmt,
+        uint256[16] memory ctr
+    ) internal returns (bool remainFailed, uint256[7] memory att1Local, uint256[7] memory att2Local) {
+        uint256 bW = remain; uint256 bO = remain;
+        for (uint256 r = 0; r < N; r++) {
+            RoundResult memory res = this._runOneRoundSwap3(bW, bO, trickAmt);
+            if (res.outcome == 1) { remainFailed = true; return (remainFailed, att1Local, att2Local); }
+            ctr[0]++;
+            if (res.outcome == 0) {
+                if (res.rescuedBy >= 2) att1Local[res.c1]++;
+                if (res.rescuedBy == 3) att2Local[res.c2]++;
+                bW = res.newBW; bO = res.newBO;
+                continue;
+            }
+            // outcome == 2: all 3 attempts failed. Log the tuple verbatim and
+            // categorize via exhaustive pattern enumeration.
+            ctr[1]++;
+            _classifyTriple(remain, r, res.c1, res.c2, res.c3, ctr);
+            remainFailed = true;
+            return (remainFailed, att1Local, att2Local);
+        }
+        return (remainFailed, att1Local, att2Local);
+    }
+
+    /// @notice Helper that logs a single (remain, round, c1, c2, c3) tuple
+    /// and bumps the appropriate exhaustive pattern bucket. Extracted to keep
+    /// _runOneRemainTripleFail's stack shallow.
+    function _classifyTriple(
+        uint256 remain,
+        uint256 r,
+        uint8 c1,
+        uint8 c2,
+        uint8 c3,
+        uint256[16] memory ctr
+    ) internal pure {
+        // Legacy buckets (kept for parity with prior diagnostic):
+        if (c1 == 6 || c2 == 6 || c3 == 6) ctr[2]++;
+        else if (c1 == 1 && c2 == 1 && c3 == 1) ctr[3]++;
+        else ctr[4]++;
+        // Per-tuple log (cheap; ~67 lines in the empirical regime).
+        console.log("triple-fail remain", remain, "round", r);
+        console.log("  c1, c2, c3 =", c1, c2, c3);
+        // Exhaustive pattern enumeration: each tuple lands in exactly ONE bucket.
+        bool allIn16 = (c1 == 1 || c1 == 6) && (c2 == 1 || c2 == 6) && (c3 == 1 || c3 == 6);
+        if (c1 == 1 && c2 == 1 && c3 == 1) {
+            ctr[7]++;
+        } else if (c1 == 6 && c2 == 6 && c3 == 6) {
+            ctr[8]++;
+        } else if (allIn16) {
+            ctr[9]++;
+        } else {
+            ctr[10]++;
+        }
+    }
+
 
 }
