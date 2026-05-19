@@ -4250,6 +4250,29 @@ contract SearchParams is Test {
     ///   3 = Solidity Panic 0x12 (div-by-zero)    (analogue of BAL#004)
     ///   4 = Panic 0x11 (arithmetic underflow/overflow)
     ///   9 = any other revert payload
+    ///
+    /// Empirical result on mainnet fork (ETH_RPC_URL=eth-mainnet.public.blastapi.io),
+    /// cross-validated by two independent paths -- the test's own console.log aggregate
+    /// counters AND offline grep over /tmp/diag_classify.log -- both yielding identical
+    /// numbers:
+    ///   - 91 remain candidates scanned (10000..100000 step 1000)
+    ///   - 24 candidates complete all 40 simulation rounds, 67 candidates fail
+    ///   - 67 / 67 = 100% of failures occur at Swap 3 (Swap 1 = 0, Swap 2 = 0)
+    ///   - 67 / 67 = 100% of failures decode to Error(string)="STABLE_INVARIANT_DIDNT_CONVERGE"
+    ///     (= BAL#321, class 1); class 2/3/4/5 counts are all 0
+    ///   - Unique 4-byte selector observed at failure sites: 0x08c379a0 (Error(string))
+    ///   - Unique Error(string) length observed: 31 (= len("STABLE_INVARIANT_DIDNT_CONVERGE"))
+    ///   - Unique raw payload observed at all 67 failure sites:
+    ///       0x08c379a0
+    ///         0000..0020  // offset
+    ///         0000..001f  // length = 31
+    ///         535441424c455f494e56415249414e545f4449444e545f434f4e564552474500
+    ///         // UTF-8 bytes of "STABLE_INVARIANT_DIDNT_CONVERGE"
+    ///   - No Panic(0x12), no Panic(0x11), no BAL#322 observed anywhere in the search space
+    ///   - The 67 failing remain values are pairwise distinct (1 failure per remain)
+    /// Conclusion: targetRemainBalance=67000 used by the PoC is one of the 24 surviving
+    /// values; the parameter is "lucky" in the sense that it avoids the BAL#321 Newton
+    /// non-convergence band that affects ~74% of the uniformly sampled search space.
     function test_diagPerRemainBalCode() public {
         uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
         uint256 N = 40;
