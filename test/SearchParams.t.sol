@@ -4237,4 +4237,205 @@ contract SearchParams is Test {
         console.log("         the attacker's first-swap _cacheTokenRatesIfNecessary.");
         console.log("=> getActualSupply() in setUp() is byte-exact equivalent to attacker's step-0 actualSupply.");
     }
+
+    /// @notice Diagnostic: scan the same remain range as test_searchRemainBalance
+    /// (10000..100000 step 1000), reproduce the Swap1+Swap2+Swap3(x3 retry) pipeline,
+    /// and classify each first-failing swap by its revert reason. The local
+    /// src/StableMath.sol uses string-form reverts (revert("STABLE_INVARIANT_DIDNT_CONVERGE"))
+    /// which are functionally equivalent to BAL#321 emitted by the official _revert path.
+    /// Solidity 0.8+ division by zero shows up as Panic(0x12), the analogue of BAL#004.
+    /// Class codes:
+    ///   1 = STABLE_INVARIANT_DIDNT_CONVERGE      (= BAL#321, _calculateInvariant)
+    ///   2 = STABLE_GET_BALANCE_DIDNT_CONVERGE    (= BAL#322, _getTokenBalanceGivenInvariantAndAllOtherBalances)
+    ///   3 = Solidity Panic 0x12 (div-by-zero)    (analogue of BAL#004)
+    ///   4 = Panic 0x11 (arithmetic underflow/overflow)
+    ///   9 = any other revert payload
+    function test_diagPerRemainBalCode() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 40;
+
+        uint256[6] memory cSwap1; uint256[6] memory cSwap2; uint256[6] memory cSwap3;
+        uint256 cOK;
+
+        for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
+            uint256 bW = remain; uint256 bO = remain;
+            bool failed = false;
+            for (uint256 r = 0; r < N; r++) {
+                if (bO <= trickAmt + 1) break;
+
+                uint256 swapOut1 = bO - trickAmt - 1;
+                try this.trySwap(bW, bO, 0, 1, swapOut1) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch (bytes memory e) {
+                    uint256 cls = _logAndClassify(remain, r, 1, e);
+                    cSwap1[cls]++;
+                    failed = true; break;
+                }
+
+                try this.trySwap(bW, bO, 0, 1, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch (bytes memory e) {
+                    uint256 cls = _logAndClassify(remain, r, 2, e);
+                    cSwap2[cls]++;
+                    failed = true; break;
+                }
+
+                uint256 sw3 = _truncateToTop2Digits(bW);
+                bool s3ok = false; bytes memory lastE;
+                for (uint256 a = 0; a < 3; a++) {
+                    try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; s3ok = true; break;
+                    } catch (bytes memory e) {
+                        lastE = e;
+                    }
+                    sw3 = sw3 * 9 / 10;
+                }
+                if (!s3ok) {
+                    uint256 cls = _logAndClassify(remain, r, 3, lastE);
+                    cSwap3[cls]++;
+                    failed = true; break;
+                }
+            }
+            if (!failed) cOK++;
+        }
+        console.log("=== Aggregate over 91 remain candidates (10000..100000 step 1000) ===");
+        console.log("Completed all", N, "rounds:", cOK);
+        console.log("--- First-failure breakdown by swap and class (derived from runtime keccak256) ---");
+        _printRow("Swap1", cSwap1);
+        _printRow("Swap2", cSwap2);
+        _printRow("Swap3", cSwap3);
+    }
+
+    function _printRow(string memory label, uint256[6] memory c) internal pure {
+        console.log(label, "STABLE_INVARIANT_DIDNT_CONVERGE   :", c[1]);
+        console.log(label, "STABLE_GET_BALANCE_DIDNT_CONVERGE :", c[2]);
+        console.log(label, "Panic(uint256)                    :", c[3]);
+        console.log(label, "Error(string) other text          :", c[4]);
+        console.log(label, "Other selector or empty           :", c[5]);
+        console.log(label, "Slot 0 (unused)                   :", c[0]);
+    }
+
+    /// @notice Decode a revert payload strictly per ABI: read the 4-byte selector,
+    /// then for Error(string) read the 32-byte length field and copy exactly that
+    /// many bytes; for Panic(uint256) read the 32-byte code field. No byte position
+    /// is assumed beyond what the Solidity ABI mandates. Classification uses
+    /// keccak256 comparison against keccak256(bytes("...")) literals at runtime --
+    /// no hardcoded byte32 constants. Logs the raw payload, decoded string (if any),
+    /// and panic code (if any) so every classification can be visually verified.
+    /// Returns: 1 = STABLE_INVARIANT_DIDNT_CONVERGE, 2 = STABLE_GET_BALANCE_DIDNT_CONVERGE,
+    /// 3 = Panic(uint256), 4 = Error(string) other, 5 = other selector / malformed.
+    function _logAndClassify(uint256 remain, uint256 round, uint256 swapStep, bytes memory data)
+        internal pure returns (uint256)
+    {
+        console.log("remain", remain, "round", round);
+        console.log("  swap", swapStep);
+        console.log("  raw len", data.length);
+        console.logBytes(data);
+
+        if (data.length < 4) {
+            console.log("  -> class 5 (payload < 4 bytes)");
+            return 5;
+        }
+        bytes4 sel;
+        assembly ("memory-safe") { sel := mload(add(data, 0x20)) }
+        console.logBytes4(sel);
+
+        // Error(string): selector + offset + length + utf8 bytes (right-padded)
+        if (sel == bytes4(0x08c379a0)) {
+            if (data.length < 68) { console.log("  -> class 5 (Error too short)"); return 5; }
+            uint256 strLen;
+            assembly ("memory-safe") { strLen := mload(add(data, 0x44)) }
+            console.log("  Error(string) length", strLen);
+            if (strLen + 68 > data.length || strLen == 0) {
+                console.log("  -> class 5 (Error length out of bounds)");
+                return 5;
+            }
+            bytes memory msgBytes = new bytes(strLen);
+            for (uint256 i = 0; i < strLen; i++) { msgBytes[i] = data[68 + i]; }
+            console.log("  decoded string:", string(msgBytes));
+            bytes32 h = keccak256(msgBytes);
+            if (h == keccak256(bytes("STABLE_INVARIANT_DIDNT_CONVERGE"))) {
+                console.log("  -> class 1 STABLE_INVARIANT_DIDNT_CONVERGE");
+                return 1;
+            }
+            if (h == keccak256(bytes("STABLE_GET_BALANCE_DIDNT_CONVERGE"))) {
+                console.log("  -> class 2 STABLE_GET_BALANCE_DIDNT_CONVERGE");
+                return 2;
+            }
+            console.log("  -> class 4 Error(string) other text");
+            return 4;
+        }
+
+        // Panic(uint256): selector + uint256 code
+        if (sel == bytes4(0x4e487b71)) {
+            if (data.length < 36) { console.log("  -> class 5 (Panic too short)"); return 5; }
+            uint256 code;
+            assembly ("memory-safe") { code := mload(add(data, 0x24)) }
+            console.log("  Panic code", code);
+            return 3;
+        }
+
+        console.log("  -> class 5 (unknown selector)");
+        return 5;
+    }
+
+    /// @notice Decode a Balancer-style revert payload into the BAL#xxx numeric code.
+    /// Format per BalancerErrors._revert: 4-byte Error(string) selector + 32-byte offset
+    /// + 32-byte length (=7) + 32-byte string slot where bytes [68..74] are "BAL#xxx".
+    /// Returns 0 if the payload is not a recognizable BAL# string.
+    function _parseBalCode(bytes memory data) internal pure returns (uint256) {
+        if (data.length < 100) return 0;
+        if (data[68] != bytes1(0x42) || data[69] != bytes1(0x41)
+            || data[70] != bytes1(0x4c) || data[71] != bytes1(0x23)) return 0;
+        uint256 h = uint256(uint8(data[72])) - 0x30;
+        uint256 t = uint256(uint8(data[73])) - 0x30;
+        uint256 u = uint256(uint8(data[74])) - 0x30;
+        return h * 100 + t * 10 + u;
+    }
+
+    /// @notice Same scan as test_diagPerRemainBalCode but dumps the raw revert bytes
+    /// so non-BAL#xxx payloads (Panic 0x4e487b71, custom errors, empty reverts) can be
+    /// classified directly from the selector / length.
+    function test_diagPerRemainRawRevert() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 40;
+        for (uint256 remain = 10000; remain <= 100000; remain += 1000) {
+            uint256 bW = remain; uint256 bO = remain;
+            for (uint256 r = 0; r < N; r++) {
+                if (bO <= trickAmt + 1) break;
+                uint256 swapOut1 = bO - trickAmt - 1;
+                try this.trySwap(bW, bO, 0, 1, swapOut1) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch (bytes memory e) {
+                    console.log("remain", remain, "round", r);
+                    console.log("  Swap1 len", e.length);
+                    console.logBytes(e);
+                    break;
+                }
+                try this.trySwap(bW, bO, 0, 1, trickAmt) returns (uint256 nW, uint256 nO) {
+                    bW = nW; bO = nO;
+                } catch (bytes memory e) {
+                    console.log("remain", remain, "round", r);
+                    console.log("  Swap2 len", e.length);
+                    console.logBytes(e);
+                    break;
+                }
+                uint256 sw3 = _truncateToTop2Digits(bW);
+                bool s3ok = false; bytes memory lastE;
+                for (uint256 a = 0; a < 3; a++) {
+                    try this.trySwap(bW, bO, 1, 0, sw3) returns (uint256 nW, uint256 nO) {
+                        bW = nW; bO = nO; s3ok = true; break;
+                    } catch (bytes memory e) { lastE = e; }
+                    sw3 = sw3 * 9 / 10;
+                }
+                if (!s3ok) {
+                    console.log("remain", remain, "round", r);
+                    console.log("  Swap3 len", lastE.length);
+                    console.logBytes(lastE);
+                    break;
+                }
+            }
+        }
+    }
+
 }
