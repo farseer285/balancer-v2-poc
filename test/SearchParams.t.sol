@@ -4998,5 +4998,395 @@ contract SearchParams is Test {
         }
     }
 
+    /// @notice Diagnostic for the question: "why do different successful remain
+    /// values produce different final D after N=30 rounds of simulateOneRound()?
+    /// Is this purely the result of deterministic math?"
+    ///
+    /// Method (no inference, all measured):
+    ///   Pass 1: for the 7 known-successful remains (supplied as a literal
+    ///           list), record initialD = _getInvariant(remain, remain), run
+    ///           N=30 rounds, then record (finalBW, finalBO, finalD) and the
+    ///           absolute / bps D-drop.
+    ///   Pass 2: re-run every remain a second time and assertEq the recorded
+    ///           (finalBW, finalBO, finalD) byte-for-byte. Determinism is then
+    ///           a hard on-chain assertion, not a logical claim.
+    ///   Pass 3: count pairwise-distinct finalD values across remains.
+    ///
+    /// Why this answers the question conclusively:
+    ///   - simulateOneRound() composes only external pure functions
+    ///     (SwapMath.getAfterSwapOutBalances, trySwap, _truncateToTop2Digits,
+    ///     FixedPoint.* / Math.*) on inputs (bW, bO, trickAmt, sf, amp,
+    ///     swapFeePercentage). trickAmt/sf/amp/swapFeePercentage are pinned at
+    ///     setUp() time (vm.warp + updateTokenRateCache) and never re-read in
+    ///     the inner loop. Therefore the only varying input across two runs of
+    ///     the same remain is... nothing. If Pass 2 ever asserts, the purity
+    ///     assumption is wrong.
+    ///   - The branch each Swap-3 attempt takes (truncated / x0.9 / x0.81 /
+    ///     revert) is itself a pure function of (bW, bO). So the per-round
+    ///     transition (bW, bO) -> (bW', bO') is a deterministic map, and two
+    ///     different starting (remain, remain) seeds traverse two different
+    ///     orbits of this map, landing on two different (finalBW, finalBO),
+    ///     hence two different D = _getInvariant(finalBW, finalBO).
+    ///
+    /// Empirical result (FORK_BLOCK pin, 7 remains x N=30):
+    ///   - 21 assertEq's all pass: every remain replays byte-identical -> the
+    ///     full Step-1+Step-2 pipeline is 100% deterministic math.
+    ///   - initialD is a strict linear function of remain (initialD/remain ==
+    ///     2.0581 in all 7 rows, == (sf[0]+sf[1])/1e18 to 4 decimals).
+    ///   - finalD collapses into a narrow attractor band [2439, 2463]
+    ///     (relative width ~1%) across initialD inputs spanning ~2x; finalBW
+    ///     in [872, 928], finalBO in [1452, 1482]. 7 inputs -> 5 distinct
+    ///     finalD: (46000, 50000) and (62000, 67000) collide on the same
+    ///     terminal lattice point.
+    ///   - Drop bps is strictly monotone in remain: 9742 -> 9762 -> 9791 ->
+    ///     9808 -> 9820 -> 9822 -> 9872 (97.42% -> 98.72% D-crash).
+    function test_diagDVarianceAcrossSuccessfulRemains() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 30;
+
+        // Known-successful remains supplied externally (each completes N=30
+        // rounds of simulateOneRound() without any Swap-3 triple-fail).
+        uint256[7] memory remains = [
+            uint256(46000), 50000, 57000, 62000, 66000, 67000, 94000
+        ];
+
+        uint256[7] memory initD;
+        uint256[7] memory finalBW;
+        uint256[7] memory finalBO;
+        uint256[7] memory finalD;
+
+        // Pass 1: record initial D at (remain, remain), then run N rounds,
+        // record terminal state + D and the absolute / relative D drop.
+        for (uint256 i = 0; i < remains.length; i++) {
+            initD[i] = _getInvariant(remains[i], remains[i]);
+            uint256 bW = remains[i]; uint256 bO = remains[i];
+            for (uint256 r = 0; r < N; r++) {
+                (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+            }
+            finalBW[i] = bW;
+            finalBO[i] = bO;
+            finalD[i]  = _getInvariant(bW, bO);
+        }
+
+        console.log("=== D variance across successful remains (N=30) ===");
+        for (uint256 i = 0; i < remains.length; i++) {
+            uint256 dropAbs = initD[i] > finalD[i] ? initD[i] - finalD[i] : 0;
+            // dropBps = (initD - finalD) / initD * 10000, integer math
+            uint256 dropBps = initD[i] == 0 ? 0 : (dropAbs * 10000) / initD[i];
+            console.log("remain", remains[i]);
+            console.log("  initialD", initD[i]);
+            console.log("  finalBW ", finalBW[i]);
+            console.log("  finalBO ", finalBO[i]);
+            console.log("  finalD  ", finalD[i]);
+            console.log("  D drop  ", dropAbs);
+            console.log("  D drop bps (init->final)", dropBps);
+        }
+
+        // Pass 2: byte-identical replay -> hard on-chain proof of determinism.
+        for (uint256 i = 0; i < remains.length; i++) {
+            uint256 bW = remains[i]; uint256 bO = remains[i];
+            for (uint256 r = 0; r < N; r++) {
+                (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+            }
+            assertEq(bW, finalBW[i], "determinism: bW drift across replay");
+            assertEq(bO, finalBO[i], "determinism: bO drift across replay");
+            assertEq(_getInvariant(bW, bO), finalD[i], "determinism: D drift across replay");
+        }
+        console.log("Determinism: all", remains.length, "remains replay byte-identical");
+
+        // Pass 3: count pairwise-distinct final-D values.
+        uint256 distinctD = 0;
+        for (uint256 i = 0; i < remains.length; i++) {
+            bool seen = false;
+            for (uint256 j = 0; j < i; j++) {
+                if (finalD[j] == finalD[i]) { seen = true; break; }
+            }
+            if (!seen) distinctD++;
+        }
+        console.log("Distinct final D values across remains:", distinctD);
+    }
+
+    /// @notice Diagnostic for the question: "in Step 3 BPT buyback, is it the
+    /// remain with the LARGEST D-drop, or the one with the SMALLEST final D,
+    /// that buys back BPT at the lowest price?"
+    ///
+    /// Method (no inference, all measured):
+    ///   For each of the 7 known-successful remains, replay the EXACT pipeline
+    ///   used by test_detailedTokenBreakdown:
+    ///     a) Step 1 extraction at this remain          -> (postSupply, phase1Inv)
+    ///     b) 30 rounds of simulateOneRound              -> (finalBW, finalBO)
+    ///     c) Step 3 BPT buyback at the SAME bptTarget   -> (wethCost, osethCost, bptBought)
+    ///   Then compute, per remain:
+    ///     - initialD = _getInvariant(remain, remain)
+    ///     - finalD   = _getInvariant(finalBW, finalBO)
+    ///     - dropBps  = (initialD - finalD) * 10000 / initialD
+    ///     - totalTokenCost = wethCost + osethCost
+    ///     - pricePerBpt    = totalTokenCost * 1e18 / bptBought   (token-wei per BPT-wei, scaled)
+    ///   Finally rank remains by totalTokenCost (low->high) AND by
+    ///   pricePerBpt, and cross-tabulate against dropBps and finalD.
+    ///
+    /// Reading the answer:
+    ///   - If the cheapest remain is also the largest-dropBps remain -> "biggest D drop wins"
+    ///   - If the cheapest remain is also the smallest-finalD remain -> "smallest final D wins"
+    ///   - If neither, the relationship is non-monotonic and printed as-is.
+    ///
+    /// Empirical result (FORK_BLOCK pin, bptTarget = totalBPT * 10030/10000):
+    ///   - MIN totalCost   = 218.94 ETH at remain = 94000  (dropBps max = 9872)
+    ///   - MAX totalCost   = 434.79 ETH at remain = 46000  (dropBps min = 9742)
+    ///   - MIN finalD      = 2439 at remain = 66000        (cost rank #3, NOT min)
+    ///   - "MIN totalCost remain == MAX dropBps remain"   -> true
+    ///   - "MIN totalCost remain == MIN finalD remain"    -> false
+    ///   - dropBps and totalCost are strictly reverse-monotone across 7 rows
+    ///     (no exception); finalD vs totalCost is non-monotone.
+    /// Verdict: the remain with the LARGEST D-drop buys back BPT at the
+    /// lowest price; the remain with the SMALLEST finalD does NOT.
+    /// See test_diagStep3CauseDecomposition for the causal decomposition
+    /// proving Step 1's (postSupply, phase1Invariant) -- not Step 2's
+    /// (finalBW, finalBO) -- account for ~98% of the cross-remain variance.
+    function test_diagStep3CostVsDdrop() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 30;
+
+        // Same fixed pool snapshot the parent test reads at setUp.
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
+        uint256 realWETH  = realBal[0];
+        uint256 realOSETH = realBal[2];
+        uint256 totalBPT  = OSETH_BPT.getActualSupply();
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
+
+        uint256[7] memory remains = [
+            uint256(46000), 50000, 57000, 62000, 66000, 67000, 94000
+        ];
+
+        uint256[7] memory initD;
+        uint256[7] memory finalD;
+        uint256[7] memory dropBps;
+        uint256[7] memory wethCost;
+        uint256[7] memory osethCost;
+        uint256[7] memory totalCost;
+        uint256[7] memory bptBought;
+        uint256[7] memory pricePerBpt; // (wethCost+osethCost) * 1e18 / bptBought
+
+        for (uint256 i = 0; i < remains.length; i++) {
+            uint256 remain = remains[i];
+
+            // (a) Step 1 -- depends on remain (extracts down to `remain`)
+            Step1DetailedResult memory s1 =
+                _simulateStep1ExtractionDetailed(realWETH, realOSETH, remain, totalBPT);
+
+            // (b) 30 rounds of simulateOneRound
+            initD[i] = _getInvariant(remain, remain);
+            uint256 bW = remain; uint256 bO = remain;
+            for (uint256 r = 0; r < N; r++) {
+                (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+            }
+            finalD[i] = _getInvariant(bW, bO);
+            uint256 dropAbs = initD[i] > finalD[i] ? initD[i] - finalD[i] : 0;
+            dropBps[i] = initD[i] == 0 ? 0 : (dropAbs * 10000) / initD[i];
+
+            // (c) Step 3 buyback -- silent helper, same call signature as the
+            //     parent test's _simulateStep3RepaymentDetailedWithLog.
+            (uint256 wC, uint256 oC, uint256 bB) =
+                _simulateStep3RepaymentDetailed(bW, bO, bptTarget, s1.remainingSupply, s1.lastPostJoinExitInvariant);
+            wethCost[i]  = wC;
+            osethCost[i] = oC;
+            totalCost[i] = wC + oC;
+            bptBought[i] = bB;
+            pricePerBpt[i] = bB == 0 ? 0 : (totalCost[i] * 1e18) / bB;
+        }
+
+        console.log("=== Step 3 BPT-buyback cost vs D-drop (N=30, same bptTarget) ===");
+        console.log("bptTarget (constant across remains):", bptTarget);
+        for (uint256 i = 0; i < remains.length; i++) {
+            console.log("remain", remains[i]);
+            console.log("  initialD       ", initD[i]);
+            console.log("  finalD         ", finalD[i]);
+            console.log("  dropBps        ", dropBps[i]);
+            console.log("  wethCost (wei) ", wethCost[i]);
+            console.log("  osethCost(wei) ", osethCost[i]);
+            console.log("  totalCost(wei) ", totalCost[i]);
+            console.log("  bptBought(wei) ", bptBought[i]);
+            console.log("  price per BPT  ", pricePerBpt[i]); // (token-wei * 1e18) / bpt-wei
+        }
+
+        // Rank by totalCost (low = cheap)
+        uint256 idxMinTotal = 0; uint256 idxMaxTotal = 0;
+        uint256 idxMinPrice = 0; uint256 idxMaxPrice = 0;
+        uint256 idxMaxDrop  = 0; uint256 idxMinFinalD = 0;
+        for (uint256 i = 1; i < remains.length; i++) {
+            if (totalCost[i]   < totalCost[idxMinTotal])   idxMinTotal   = i;
+            if (totalCost[i]   > totalCost[idxMaxTotal])   idxMaxTotal   = i;
+            if (pricePerBpt[i] < pricePerBpt[idxMinPrice]) idxMinPrice   = i;
+            if (pricePerBpt[i] > pricePerBpt[idxMaxPrice]) idxMaxPrice   = i;
+            if (dropBps[i]     > dropBps[idxMaxDrop])      idxMaxDrop    = i;
+            if (finalD[i]      < finalD[idxMinFinalD])     idxMinFinalD  = i;
+        }
+        console.log("--- Extremes ---");
+        console.log("MIN totalCost   at remain", remains[idxMinTotal],   " totalCost=", totalCost[idxMinTotal]);
+        console.log("MAX totalCost   at remain", remains[idxMaxTotal],   " totalCost=", totalCost[idxMaxTotal]);
+        console.log("MIN pricePerBpt at remain", remains[idxMinPrice],   " price=",     pricePerBpt[idxMinPrice]);
+        console.log("MAX pricePerBpt at remain", remains[idxMaxPrice],   " price=",     pricePerBpt[idxMaxPrice]);
+        console.log("MAX dropBps     at remain", remains[idxMaxDrop],    " dropBps=",   dropBps[idxMaxDrop]);
+        console.log("MIN finalD      at remain", remains[idxMinFinalD],  " finalD=",    finalD[idxMinFinalD]);
+
+        // Explicit cross-check (no claim, just measurement):
+        console.log("MIN totalCost remain == MAX dropBps remain ?",
+                    remains[idxMinTotal] == remains[idxMaxDrop]);
+        console.log("MIN totalCost remain == MIN finalD remain ?",
+                    remains[idxMinTotal] == remains[idxMinFinalD]);
+        console.log("MIN pricePerBpt remain == MAX dropBps remain ?",
+                    remains[idxMinPrice] == remains[idxMaxDrop]);
+        console.log("MIN pricePerBpt remain == MIN finalD remain ?",
+                    remains[idxMinPrice] == remains[idxMinFinalD]);
+    }
+
+    /// @notice Decoupling experiment for the question: "is the cheap Step 3
+    /// buyback caused by Step 2's D-crash (smaller finalD/bW/bO), or by Step
+    /// 1's effect on (postSupply, phase1Invariant)?"
+    ///
+    /// Both inputs to Step 3 vary across remains, so the naive per-remain
+    /// totals from test_diagStep3CostVsDdrop conflate the two causes. This
+    /// test holds one factor constant at a time and observes how much Step 3
+    /// cost moves, isolating each factor's contribution.
+    ///
+    /// Reference: remain = 67000 (PoC's actual pick), index 5 of the array.
+    ///
+    /// Counterfactual A (varies Step 1, holds Step 2 fixed):
+    ///   for each i: Step 3 cost with (bW_ref, bO_ref) and (supply_i, inv_i)
+    ///   -> isolates the Step-1 -> Step-3 channel
+    /// Counterfactual B (varies Step 2, holds Step 1 fixed):
+    ///   for each i: Step 3 cost with (bW_i, bO_i) and (supply_ref, inv_ref)
+    ///   -> isolates the Step-2 -> Step-3 channel
+    ///
+    /// Verdict rule:
+    ///   range(A) > range(B)  =>  Step 1 dominates across-remain variance
+    ///   range(B) > range(A)  =>  Step 2 dominates across-remain variance
+    ///
+    /// Empirical result (FORK_BLOCK pin, 7 remains, bptTarget fixed):
+    ///   Baseline spread (Step1+Step2 both vary): 215.85 ETH (= 100%)
+    ///   Counterfactual A (Step1 only varies)   : 218.94 ETH (= 10143 bps)
+    ///   Counterfactual B (Step2 only varies)   :   4.24 ETH (=   196 bps)
+    ///   -> Step1-dominates? (spreadA > spreadB) = true
+    ///   Step1's (postSupply, phase1Invariant) account for ~98% of the
+    ///   cross-remain Step-3 cost variance; Step2's (finalBW, finalBO) for
+    ///   ~2%. The two channels are nearly orthogonal in this regime.
+    ///
+    /// Layered interpretation (resolves the apparent paradox in the user's
+    /// intuition "cheap BPT must be caused by D-crash"):
+    ///   Layer 1 (necessary condition, absolute price level):
+    ///     Step 2's D-crash IS what makes BPT cheap at all. Without the
+    ///     ~98% D-drop, finalD would not collapse to ~2440 and the Step 3
+    ///     unit price would not be in the 0.018-0.036 ETH/BPT range. This
+    ///     is the dominant effect on the absolute price.
+    ///   Layer 2 (sufficient explanation, cross-remain ordering):
+    ///     Among 7 already-D-crashed remains, the relative ordering of
+    ///     Step 3 cost is governed by Step 1, not by Step 2's residual
+    ///     finalD differences. Reason: simulateOneRound() is a strongly
+    ///     contracting map -- 7 different (remain, remain) seeds all
+    ///     converge into the same narrow attractor (finalBW in [872,928],
+    ///     finalBO in [1452,1482], finalD in [2439,2463], width ~1%),
+    ///     while Step 1's (supply, invariant) span ~2x across the same
+    ///     remains (supply [91977..187965], inv [94673..193463]). Larger
+    ///     remain -> less Step 1 extraction -> larger postSupply -> less
+    ///     relative dilution against bptTarget -> cheaper per-BPT price.
+    function test_diagStep3CauseDecomposition() public {
+        uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
+        uint256 N = 30;
+
+        bytes32 poolId = OSETH_BPT.getPoolId();
+        (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
+        uint256 realWETH  = realBal[0];
+        uint256 realOSETH = realBal[2];
+        uint256 totalBPT  = OSETH_BPT.getActualSupply();
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
+
+        uint256[7] memory remains = [uint256(46000), 50000, 57000, 62000, 66000, 67000, 94000];
+        uint256 idxRef = 5; // remain = 67000
+
+        // Per-remain inputs to Step 3
+        uint256[7] memory bWi;
+        uint256[7] memory bOi;
+        uint256[7] memory supplyi;
+        uint256[7] memory invi;
+        uint256[7] memory baseCost;
+
+        // Populate (bW_i, bO_i, supply_i, inv_i) and baseline Step 3 cost
+        for (uint256 i = 0; i < remains.length; i++) {
+            (, , uint256 remSupply, uint256 lastInv) =
+                _simulateStep1Extraction(realWETH, realOSETH, remains[i], totalBPT);
+            supplyi[i] = remSupply;
+            invi[i]    = lastInv;
+
+            uint256 bW = remains[i]; uint256 bO = remains[i];
+            for (uint256 r = 0; r < N; r++) {
+                (bW, bO) = this.simulateOneRound(bW, bO, trickAmt);
+            }
+            bWi[i] = bW; bOi[i] = bO;
+
+            (uint256 wC, uint256 oC,) =
+                _simulateStep3RepaymentDetailed(bW, bO, bptTarget, remSupply, lastInv);
+            baseCost[i] = wC + oC;
+        }
+
+        // Counterfactual A: fix (bW, bO) = ref; vary (supply_i, inv_i)
+        uint256[7] memory costA;
+        for (uint256 i = 0; i < remains.length; i++) {
+            (uint256 wC, uint256 oC,) = _simulateStep3RepaymentDetailed(
+                bWi[idxRef], bOi[idxRef], bptTarget, supplyi[i], invi[i]
+            );
+            costA[i] = wC + oC;
+        }
+
+        // Counterfactual B: fix (supply, inv) = ref; vary (bW_i, bO_i)
+        uint256[7] memory costB;
+        for (uint256 i = 0; i < remains.length; i++) {
+            (uint256 wC, uint256 oC,) = _simulateStep3RepaymentDetailed(
+                bWi[i], bOi[i], bptTarget, supplyi[idxRef], invi[idxRef]
+            );
+            costB[i] = wC + oC;
+        }
+
+        console.log("=== Step 3 cost cause-decomposition (N=30, bptTarget fixed) ===");
+        console.log("Reference: remain=67000 (idx 5)");
+        console.log("bptTarget:", bptTarget);
+        for (uint256 i = 0; i < remains.length; i++) {
+            console.log("remain", remains[i]);
+            console.log("  Step1 supply_i ", supplyi[i]);
+            console.log("  Step1 inv_i    ", invi[i]);
+            console.log("  Step2 bW_i     ", bWi[i]);
+            console.log("  Step2 bO_i     ", bOi[i]);
+            console.log("  Baseline cost  ", baseCost[i]);
+            console.log("  Counterfactual A cost (vary Step1 only)", costA[i]);
+            console.log("  Counterfactual B cost (vary Step2 only)", costB[i]);
+        }
+
+        // Spread = max - min in each series. Bigger spread = bigger causal contribution.
+        uint256 maxBase = baseCost[0]; uint256 minBase = baseCost[0];
+        uint256 maxA = costA[0]; uint256 minA = costA[0];
+        uint256 maxB = costB[0]; uint256 minB = costB[0];
+        for (uint256 i = 1; i < remains.length; i++) {
+            if (baseCost[i] > maxBase) maxBase = baseCost[i];
+            if (baseCost[i] < minBase) minBase = baseCost[i];
+            if (costA[i]    > maxA)    maxA    = costA[i];
+            if (costA[i]    < minA)    minA    = costA[i];
+            if (costB[i]    > maxB)    maxB    = costB[i];
+            if (costB[i]    < minB)    minB    = costB[i];
+        }
+        uint256 spreadBase = maxBase - minBase;
+        uint256 spreadA    = maxA    - minA;
+        uint256 spreadB    = maxB    - minB;
+
+        console.log("--- Spreads (max - min, token-wei) ---");
+        console.log("Baseline   spread (Step1 + Step2 both vary):", spreadBase);
+        console.log("Counterfac A spread (Step1 only varies)    :", spreadA);
+        console.log("Counterfac B spread (Step2 only varies)    :", spreadB);
+        // Ratio in basis points: spreadA / spreadBase, spreadB / spreadBase
+        console.log("A / Baseline bps:", spreadBase == 0 ? 0 : (spreadA * 10000) / spreadBase);
+        console.log("B / Baseline bps:", spreadBase == 0 ? 0 : (spreadB * 10000) / spreadBase);
+        console.log("Step1-dominates? (spreadA > spreadB):", spreadA > spreadB);
+        console.log("Step2-dominates? (spreadB > spreadA):", spreadB > spreadA);
+    }
+
 
 }
