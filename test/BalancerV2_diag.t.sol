@@ -55,9 +55,11 @@ import {StableMath} from "src/StableMath.sol";
 //            i.e. UNDERPAYS by 415,920 W. Vault settles to (999845, 1)
 //            which has measured D = 112,405, a -26,551 LOSS per cycle.
 //   Step C : osETH -> WETH (recycle), DOES NOT return the pool to (67000,67000).
-//            The mulDown defect does not fire on this leg (see finding #11),
-//            so D moves only by fee/round drift (+692 in the toy cycle, vs the
-//            -26,551 stolen in Step B). The exact (W, O) end-state depends on
+//            The mulDown defect is STRUCTURALLY inert on this leg because
+//            sf[WETH] = 1e18, so mulDown(outAmt, sf) == mulUp(outAmt, sf)
+//            (no truncation possible). D moves only by fee/round drift
+//            (+692 in the toy cycle, vs the -26,551 stolen in Step B).
+//            The exact (W, O) end-state depends on
 //            the recycle out-amount the attacker chooses; in the real PoC the
 //            Helper.swapGivenOut budgets it precisely so that after many cycles
 //            the pool's (W, O) drifts back into the trading band, while the
@@ -289,14 +291,29 @@ import {StableMath} from "src/StableMath.sol";
 // testDiag_counterfactualParallel, testDiag_counterfactualPerRoundIsolated
 // and testDiag_isolatedDEffectStepC below.
 //
-// 14. WETH 67000 -> 889 (net pool W loss = 66,111) IS the bug.
-//     Per-round counterfactual (BUGGY vs FIXED, both worlds reset to the
-//     actual round-start state each round) shows the per-round
-//     counter_W_end - actual_W_end (= W the pool was under-collected by)
-//     sums to ~66,111 across 30 rounds. The attacker does NOT "drain" WETH
-//     each round; the bug lets him pay slightly LESS W in Steps A+B than
-//     the fair price, and the cumulative shortage IS the 66,111 W loss.
-//     This is the user-payable counterpart of the per-cycle D drop.
+// 14. WETH 67000 -> 889 (net pool W loss = 66,111) is the NET RESIDUAL
+//     of the bug's per-cycle subsidy minus the attacker's strategy
+//     deficit, NOT the direct sum of any per-round leak. Two cleanly
+//     separable quantities (corrected by finding 19):
+//       (a) Bug's per-cycle subsidy (FIXED-vs-BUGGY inW delta, summed
+//           across 30 rounds, same pre-state per round):
+//             Sum dA + Sum dB = 31,913 + 1,588,748 = 1,620,661 W
+//           This is the W the attacker pays LESS in Steps A+B because
+//           of the mulDown rounding, measured per-round-isolated.
+//       (b) Attacker's strategy deficit against a fair (fixed) curve:
+//           the trim + 9/10 fallback extraction schedule would, if the
+//           bug were removed, overshoot the curve and leave the
+//           attacker ~1,554,550 W short (3,595,717 ext - 5,150,267 ins,
+//           per probe extrapolation; trajectory is NOT physically
+//           reachable, see finding 19 caveat).
+//       (c) Visible pool W loss = (a) - (b) = 1,620,661 - 1,554,550
+//                                            ~= 66,111 W.
+//     The attacker does NOT "drain" WETH each round; the bug under-
+//     charges him by ~1.62M W cumulatively, of which ~1.55M is
+//     absorbed by the coarse extraction strategy and ~66,111 surfaces
+//     as the visible pool W shortfall. See finding 19 for the W-flow
+//     conservation identity and finding 20 for the strategy-
+//     faithfulness check.
 //
 // 15. OSETH 67000 -> 1472 (net pool O loss = 65,528) is NOT a bug effect
 //     compounded over 30 rounds. ~94% of the O loss happens in ROUND 0
@@ -648,7 +665,12 @@ contract DiagSim is Test {
         emit log_string("=== FIXED (mulUp) Step B from same Step A end ===");
         uint256[] memory bal = new uint256[](2);
         bal[0] = 67000; bal[1] = 67000;
-        bal = simSwapGivenOut(bal, sf, 0, 1, 67000 - 17 - 1, amp, fee, 0); // Step A (buggy mode is fine here, A doesn't trip the leak)
+        // Step A in BUGGY mode (matches real on-chain math). The mulDown
+        // defect IS present here too, but in this one-cycle toy with outA
+        // = 66982 the upscaled-output gap happens to be 0 (per-amount
+        // coincidence, NOT a structural exemption -- see finding 12 note
+        // and finding 19's 30-round cumulative dA = 31,913 W).
+        bal = simSwapGivenOut(bal, sf, 0, 1, 67000 - 17 - 1, amp, fee, 0);
         emit log_named_uint("after Step A: W", bal[0]);
         emit log_named_uint("after Step A: O", bal[1]);
         emit log_named_uint("after Step A: D", invUp(bal, sf, amp));
@@ -2104,13 +2126,29 @@ contract DiagSim is Test {
     // earlier mis-statement in finding 14): for every round, replay Step
     // A and Step B in BOTH modes from the SAME actual pre-state and
     // record the inW difference (FIXED - BUGGY). The observation is:
-    //   Sum dA (Step A residual, gap=0)  =     31,913 W  (small, fee drift)
-    //   Sum dB (Step B underpayment)     =  1,588,748 W  (the actual bug)
+    //   Sum dA (Step A bug impact, low curve sensitivity)
+    //                                    =     31,913 W
+    //   Sum dB (Step B bug impact, near-wall sensitivity)
+    //                                    =  1,588,748 W
     //   Sum dA + dB                      =  1,620,661 W
     //   Pool net W loss (67000 - 889)    =     66,111 W
-    // i.e. the per-step Step-B underpayment is ~24x LARGER than the
-    // pool's net W loss. The two are NOT equal and the previous
-    // hypothesis "pool loss = Sum Step-B underpayment" is REFUTED.
+    // Both dA and dB come from the SAME defective line in simSwapGivenOut:
+    //   outUp = (mode==0 ? mulDown : mulUp)(outAmt, sf[idxOut])
+    // (the on-chain mirror is BaseGeneralPool._swapGivenOut /
+    // src/SwapMath.sol L165). The 0/1-wei truncation on outUp is binary
+    // and per-amount; what differs ~50x between Step A and Step B is the
+    // curve-slope amplification at the _calcInGivenOut call site:
+    //   Step A: balances upscaled ~ (374k, 19+) -- still off-wall, 1-wei
+    //           outUp delta propagates linearly -> per-round dA in
+    //           hundreds to ~8k W (cumulative 31,913 W over 30 rounds).
+    //   Step B: balances upscaled ~ (1M, 19) and ends with O_up = 1 -- AT
+    //           the curve wall, slope d inW / d outUp is nearly vertical
+    //           -> per-round dB up to ~415k W (cumulative 1,588,748 W).
+    // So the per-step Step-B underpayment is ~24x LARGER than the pool's
+    // net W loss and ~50x LARGER than Step A's same-bug contribution.
+    // The previous hypothesis "pool loss = Sum Step-B underpayment" is
+    // REFUTED; so is the earlier framing of Step A as "fee drift" -- it
+    // is the same mulDown bug, just diluted by being far from the wall.
     //
     // Correct relationship (W-flow conservation in the actual world):
     //   W_final  = 67000 + Sum (inA_buggy + inB_buggy) - Sum ext
@@ -2220,8 +2258,8 @@ contract DiagSim is Test {
         console.log("Sum inA (BUGGY, W deposited via Step A):", sumInABuggy);
         console.log("Sum inB (BUGGY, W deposited via Step B):", sumInBBuggy);
         console.log("Sum ext (W withdrawn via Step C):", sumExt);
-        console.log("Sum dA (Step A residual, gap=0 fee drift):"); console.logInt(sumDeltaA);
-        console.log("Sum dB (Step B underpayment, the actual bug):"); console.logInt(sumDeltaB);
+        console.log("Sum dA (Step A bug impact, off-wall sensitivity):"); console.logInt(sumDeltaA);
+        console.log("Sum dB (Step B bug impact, near-wall sensitivity):"); console.logInt(sumDeltaB);
         int256 sumDelta = sumDeltaA + sumDeltaB;
         console.log("Sum dA + dB (per-step bug attribution):"); console.logInt(sumDelta);
         console.log("");
@@ -2229,6 +2267,8 @@ contract DiagSim is Test {
         console.log("CONCLUSION:   pool_net_W_loss (66,111) and sum_dB (~1.59M)");
         console.log("              are NOT equal; the bug under-charges Step B");
         console.log("              by ~24x the visible net pool loss per cycle.");
+        console.log("              dA and dB come from the SAME mulDown(outAmt,sf)");
+        console.log("              defect; dB is ~50x dA due to curve-wall slope.");
 
         // Hard invariant: W-flow conservation (no fee residual involved,
         // since simSwapGivenOut credits inB/inA into bal[0] exactly).
@@ -2237,13 +2277,14 @@ contract DiagSim is Test {
             int256(bal[0]),
             "W-flow conservation broken"
         );
-        // Step A doesn't fire the gap=1 trigger; its FIXED-vs-BUGGY delta
-        // is only fee-pipeline divUp drift. Bound: |sumDeltaA| < 5% of
-        // |sumDeltaB|. The exploit's per-cycle bug value lives almost
-        // entirely in sumDeltaB.
+        // Step A fires the SAME mulDown(outAmt, sf) defect as Step B, but
+        // its _calcInGivenOut call site sits far from the bO_up=1 curve
+        // wall, so the 0/1-wei outUp truncation is amplified only
+        // linearly. Bound: |sumDeltaA| < 5% of |sumDeltaB|. Per-cycle
+        // bug value lives almost entirely in sumDeltaB (near-wall).
         uint256 absA = sumDeltaA >= 0 ? uint256(sumDeltaA) : uint256(-sumDeltaA);
         uint256 absB = sumDeltaB >= 0 ? uint256(sumDeltaB) : uint256(-sumDeltaB);
-        assertLt(absA * 20, absB, "Step A delta >5% of Step B delta -- unexpected");
+        assertLt(absA * 20, absB, "Step A bug impact >5% of Step B -- curve geometry shifted?");
         // Step B underpayment must be much larger than the visible pool W
         // loss -- this is the whole point of finding 19.
         uint256 absLoss = poolNetWLoss >= 0 ? uint256(poolNetWLoss) : uint256(-poolNetWLoss);
