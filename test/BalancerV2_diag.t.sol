@@ -342,6 +342,36 @@ import {StableMath} from "src/StableMath.sol";
 //     attacker by ~415,920 upscaled W per cycle"; the D drop, the
 //     reshaping of the (W, O) state, and the Step C behaviour all follow
 //     mechanically.
+//
+// 18. Counter-side Step C, under the ATTACKER'S OWN algorithm (trim+x9/10),
+//     extracts FAR more W per round and charges FAR more O than the
+//     "forced ext=891,000" comparison in finding 17 suggests
+//     (testDiag_counterStepC_sameRetryAlgo). At Counter pre-Step-C
+//     state (W=1,453,904, O=1):
+//       trim(1,453,904) = 1,400,000 -> Attempt 1 in FIXED mode SUCCEEDS
+//       (no x9/10 retry needed)
+//       Step C end: (W=53,904, O=86,603), inO = 86,602
+//     Three Step-C scenarios on the same Round-0 state:
+//       (a) Actual  (W=999,845,   O=1) ext=891,000   -> inO=5,183
+//       (b) Counter (W=1,453,904, O=1) ext=891,000   -> inO=    11   (forced)
+//       (c) Counter (W=1,453,904, O=1) ext=1,400,000 -> inO=86,602  (own algo)
+//     Per-W exchange rate (O paid per W extracted):
+//       (a) 5,183  / 891,000   ~= 0.00582  O/W
+//       (c) 86,602 / 1,400,000 ~= 0.0619   O/W      (~10.6x of (a))
+//     i.e. even when Counter picks its OWN locally-optimal extraction,
+//     the buggy world still buys W ~10x cheaper than the fixed world
+//     would. The bug's value to the attacker isn't just "underpay in
+//     Step B" -- it pushes the post-A-B state into a curve region where
+//     subsequent Step C O->W swaps are also priced in the attacker's
+//     favour, because bal_W is artificially low and the (W, O) ratio
+//     is much closer to symmetric.
+//     Round-0 pool O balance comparison:
+//       Actual  : 67,000 -> 5,184 (loses 61,816 O)
+//       Counter (own algo): 67,000 -> 86,603 (GAINS 19,603 O)
+//     So in the fixed world the pool's Round-0 osETH balance INCREASES,
+//     not decreases. This is independent reinforcement of finding 15:
+//     osETH "loss" is not caused by the rounding bug -- removing the
+//     bug actually flips the sign of the round-0 O delta.
 // =============================================================================
 
 address constant balancer_d = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
@@ -1944,12 +1974,86 @@ contract DiagSim is Test {
         }
     }
 
+    // Finding 17 (counter-side variant): in the original side-by-side table
+    // the Actual world's Step C extract = 891,000 was produced by the
+    // attacker's trim(bW=999845)=990,000 followed by the ×9/10 retry loop
+    // (990,000 reverted -> 891,000 succeeded). The comparison's "Counter
+    // inO = 11" used the SAME ext=891,000 even though Counter's bal_W is
+    // 1,453,904, which is NOT what the attacker's algorithm would have
+    // chosen had he run it against the FIXED-world state. This test runs
+    // the same trim + ×9/10 retry loop against Counter's pre-Step-C state
+    // (W=1,453,904, O=1) in FIXED mode, so we see the inO the attacker
+    // would actually have collected if he had targeted Counter's W.
+    function testDiag_counterStepC_sameRetryAlgo() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+
+        // Reconstruct Counter (FIXED) Round-0 pre-Step-C state from the
+        // canonical (67000, 67000) start by running Step A and Step B in
+        // mode=1, instead of hardcoding (1453904, 1). This pins the test
+        // against any sf / amp / fee drift: if the upstream params ever
+        // change the asserts below fail loudly rather than silently
+        // computing against a stale snapshot.
+        uint256[] memory bal0 = new uint256[](2);
+        bal0[0] = 67000;
+        bal0[1] = 67000;
+        bal0 = simSwapGivenOut(bal0, sf, 0, 1, bal0[1] - 17 - 1, amp, fee, 1); // Step A
+        bal0 = simSwapGivenOut(bal0, sf, 0, 1, 17, amp, fee, 1);               // Step B
+        assertEq(bal0[0], 1453904, "Counter Step A+B W drifted vs snapshot");
+        assertEq(bal0[1], 1,       "Counter Step A+B O drifted vs snapshot");
+
+        console.log("=== COUNTER STEP-C UNDER ATTACKER'S OWN ALGORITHM ===");
+        console.log("Counter pre-Step-C: W=", bal0[0], " O=", bal0[1]);
+        uint256 want = trim(bal0[0]);
+        console.log("trim(bW) initial extract attempt =", want);
+
+        // Same retry loop as _computeSwap3 in SearchParams.t.sol: at most
+        // 3 attempts (initial trim then two x9/10 fallbacks), matching the
+        // on-chain attacker's contract exactly. runScenarioTrick uses 5
+        // but that is a diag-side relaxation; here we mirror the attacker.
+        bool ok = false;
+        uint256 successWant = 0;
+        uint256[] memory balAfter;
+        for (uint256 j = 0; j < 3; j++) {
+            console.log("  try", j, " ext =", want);
+            try this.ext_simSwap(bal0, sf, 1, 0, want, amp, fee, 1) returns (uint256[] memory nb) {
+                ok = true;
+                successWant = want;
+                balAfter = nb;
+                console.log("  -> OK"); break;
+            } catch { console.log("  -> REVERT, retry x 9/10"); want = want * 9 / 10; }
+        }
+        if (!ok) { console.log("Step C failed all 3 retries"); return; }
+
+        uint256 extracted = successWant;
+        uint256 inO = balAfter[1] - bal0[1]; // raw O input the pool received
+        uint256 wEnd = balAfter[0];
+        uint256 oEnd = balAfter[1];
+
+        console.log("");
+        console.log("RESULT (Counter / FIXED world, attacker's own algorithm):");
+        console.log("  extract W =", extracted);
+        console.log("  inO required =", inO);
+        console.log("  Step C end: W=", wEnd, " O=", oEnd);
+        console.log("");
+        console.log("vs. original side-by-side (forced ext=891,000):");
+        console.log("  Counter inO with ext=891,000 = 11   (W_end=562,904)");
+        console.log("  Actual  inO with ext=891,000 = 5,183 (W_end=108,845)");
+    }
+
     // Finding 17: ISOLATE THE D EFFECT. Both worlds enter Step C with
     // identical balances (999845, 1) and extract 891000 W; only the invariant
     // D parameter passed to _calcInGivenOut differs. Confirms the user-correct
     // relationship "holding bal_W equal, smaller D yields smaller inO".
     // In the real exploit this is overshadowed by the bal_W gap between the
     // two worlds (999845 vs 1453904), not negated by it.
+    //
+    // Caveat: this test calls _calcInGivenOut directly and applies only the
+    // single divUp(sf[1]) downscale -- it does NOT apply the LP fee markup
+    // (divUp(., 1 - fee)) that simSwapGivenOut adds. As a result inO_A
+    // printed here is 5,181 while testDiag_perRoundTrace's full-pipeline
+    // Round-0 actual inO is 5,183 (delta = +2 from fee divUp). The ~2-unit
+    // gap is fee accounting, NOT a D effect; the D effect is the
+    // 5,181 vs 34,580 spread reported below.
     function testDiag_isolatedDEffectStepC() public {
         (uint256[] memory sf, uint256 amp,) = _phase2Params();
 
