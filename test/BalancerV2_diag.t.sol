@@ -2099,4 +2099,236 @@ contract DiagSim is Test {
             console.log("=> D has no effect on inO at this precision.");
         }
     }
+
+    // Finding 19 (direct per-step bug attribution and correction of an
+    // earlier mis-statement in finding 14): for every round, replay Step
+    // A and Step B in BOTH modes from the SAME actual pre-state and
+    // record the inW difference (FIXED - BUGGY). The observation is:
+    //   Sum dA (Step A residual, gap=0)  =     31,913 W  (small, fee drift)
+    //   Sum dB (Step B underpayment)     =  1,588,748 W  (the actual bug)
+    //   Sum dA + dB                      =  1,620,661 W
+    //   Pool net W loss (67000 - 889)    =     66,111 W
+    // i.e. the per-step Step-B underpayment is ~24x LARGER than the
+    // pool's net W loss. The two are NOT equal and the previous
+    // hypothesis "pool loss = Sum Step-B underpayment" is REFUTED.
+    //
+    // Correct relationship (W-flow conservation in the actual world):
+    //   W_final  = 67000 + Sum (inA_buggy + inB_buggy) - Sum ext
+    //   889      = 67000 + S_buggy                     - 3,595,717
+    //   S_buggy  = Sum (inA_buggy + inB_buggy)          = 3,529,606 W
+    //                                                    (= 1,119,942 + 2,409,664)
+    //   attacker net W gain = Sum ext - S_buggy          =    66,111 W
+    // The 66,111 is the SMALL NET of two huge opposing flows (~3.53M W
+    // in, ~3.60M W out). The bug's per-cycle value to the attacker is
+    // much bigger than this net: it shifts every Step B's inW by ~-dB[r],
+    // and across 30 rounds the cumulative per-round-probe shift is 1.62M
+    // W.
+    //
+    // Counterfactual "+1,554,550 fixed-world pool gain": one can write
+    //   "if Step A+B ran in FIXED mode with the same ext schedule, the
+    //    pool would have ended with 889 + 1,620,661 = 1,621,550 W and
+    //    the attacker would have LOST 1,554,550 W"
+    // This arithmetic IS internally consistent (it is the per-round
+    // probe sum extended to a hypothetical full run), BUT the underlying
+    // trajectory is NOT physically reachable: testDiag_counterfactual
+    // PerRoundIsolated already shows the FIXED world reverts in Step C
+    // at rounds 1 and 3 when forced to follow the actual world's ext
+    // schedule (the post-A+B state in FIXED mode is more W-heavy, so
+    // the curve wall sits at a different swapOut3, and the actual ext
+    // overshoots it). A continuous fixed-mode 30-round run with this
+    // ext schedule therefore cannot complete. The "+1.55M loss" figure
+    // is a per-round probe extrapolation, not a real alternative
+    // history, and should be read as "magnitude of the bug's per-round
+    // marginal contribution, summed over 30 rounds", not as a simulated
+    // outcome.
+    //
+    // What "drives" the visible 66,111: the attacker's trim+9/10
+    // fallback in _computeSwap3 is a coarse greedy strategy ("take ~99%
+    // of bW, retry at 90% / 81% on revert"). It is NOT precision-tuned;
+    // SearchParams.t.sol L221-225 lists four neighbouring parameter
+    // sets whose total profit differs by ~1.3%, confirming the attack
+    // is insensitive to strategy details. The 66,111 emerges as the
+    // residual after the bug's ~1.62M per-cycle subsidy covers the
+    // ~1.55M deficit that this coarse strategy would otherwise produce
+    // against a fair (fixed) curve. As long as bug_subsidy > strategy
+    // deficit, the sign of the pool's net loss is locked in; the exact
+    // magnitude (60k / 66k / 80k) is the residual under this particular
+    // ext schedule. Faithfulness of this ext schedule to the on-chain
+    // _computeSwap3 is verified by testDiag_verifyExtScheduleMatches
+    // ComputeSwap3 (finding 20): 0 mismatches across all 30 rounds.
+    function testDiag_perRoundStepBUnderpayment() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000; bal[1] = 67000;
+        uint256[30] memory ext = _phase2ExtractAmounts();
+
+        int256 sumDeltaA;
+        int256 sumDeltaB;
+        uint256 sumInABuggy;
+        uint256 sumInBBuggy;
+        uint256 sumExt;
+
+        console.log("=== PER-ROUND STEP-A / STEP-B UNDERPAYMENT (FIXED - BUGGY) ===");
+        console.log("dA[r] = inW(Step A FIXED) - inW(Step A BUGGY), same pre-state");
+        console.log("dB[r] = inW(Step B FIXED) - inW(Step B BUGGY), same pre-state");
+
+        for (uint256 r = 0; r < 30; r++) {
+            // --- Step A probe at the round's actual pre-state ---
+            uint256 outA = bal[1] - 17 - 1;
+            uint256[] memory pA0 = _copy(bal);
+            uint256[] memory pA1 = _copy(bal);
+            pA0 = simSwapGivenOut(pA0, sf, 0, 1, outA, amp, fee, 0);
+            pA1 = simSwapGivenOut(pA1, sf, 0, 1, outA, amp, fee, 1);
+            int256 dA = int256(pA1[0]) - int256(pA0[0]);
+            sumDeltaA += dA;
+
+            // Advance bal through Step A in BUGGY mode, record inA paid
+            uint256 wPre = bal[0];
+            bal = simSwapGivenOut(bal, sf, 0, 1, outA, amp, fee, 0);
+            sumInABuggy += bal[0] - wPre;
+
+            // --- Step B probe at the round's actual post-Step-A state ---
+            uint256[] memory pB0 = _copy(bal);
+            uint256[] memory pB1 = _copy(bal);
+            pB0 = simSwapGivenOut(pB0, sf, 0, 1, 17, amp, fee, 0);
+            pB1 = simSwapGivenOut(pB1, sf, 0, 1, 17, amp, fee, 1);
+            int256 dB = int256(pB1[0]) - int256(pB0[0]);
+            sumDeltaB += dB;
+
+            // Advance bal through Step B (BUGGY), record inB paid
+            wPre = bal[0];
+            bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);
+            sumInBBuggy += bal[0] - wPre;
+
+            // Step C in BUGGY mode, ext is an OUT amount (subtracts from W)
+            bal = simSwapGivenOut(bal, sf, 1, 0, ext[r], amp, fee, 0);
+            sumExt += ext[r];
+
+            if (r < 5 || r == 29) {
+                console.log("--- Round", r);
+                console.log("  dA ="); console.logInt(dA);
+                console.log("  dB ="); console.logInt(dB);
+            }
+        }
+
+        console.log("");
+        console.log("=== SUMMARY ===");
+        console.log("Actual world exit W (BUGGY 30 rounds):", bal[0]);
+        int256 poolNetWLoss = int256(67000) - int256(bal[0]);
+        console.log("Pool net W loss (= 67000 - exit W):"); console.logInt(poolNetWLoss);
+        console.log("Sum inA (BUGGY, W deposited via Step A):", sumInABuggy);
+        console.log("Sum inB (BUGGY, W deposited via Step B):", sumInBBuggy);
+        console.log("Sum ext (W withdrawn via Step C):", sumExt);
+        console.log("Sum dA (Step A residual, gap=0 fee drift):"); console.logInt(sumDeltaA);
+        console.log("Sum dB (Step B underpayment, the actual bug):"); console.logInt(sumDeltaB);
+        int256 sumDelta = sumDeltaA + sumDeltaB;
+        console.log("Sum dA + dB (per-step bug attribution):"); console.logInt(sumDelta);
+        console.log("");
+        console.log("CONSERVATION: 67000 + sumInA + sumInB - sumExt == exit W");
+        console.log("CONCLUSION:   pool_net_W_loss (66,111) and sum_dB (~1.59M)");
+        console.log("              are NOT equal; the bug under-charges Step B");
+        console.log("              by ~24x the visible net pool loss per cycle.");
+
+        // Hard invariant: W-flow conservation (no fee residual involved,
+        // since simSwapGivenOut credits inB/inA into bal[0] exactly).
+        assertEq(
+            int256(67000) + int256(sumInABuggy) + int256(sumInBBuggy) - int256(sumExt),
+            int256(bal[0]),
+            "W-flow conservation broken"
+        );
+        // Step A doesn't fire the gap=1 trigger; its FIXED-vs-BUGGY delta
+        // is only fee-pipeline divUp drift. Bound: |sumDeltaA| < 5% of
+        // |sumDeltaB|. The exploit's per-cycle bug value lives almost
+        // entirely in sumDeltaB.
+        uint256 absA = sumDeltaA >= 0 ? uint256(sumDeltaA) : uint256(-sumDeltaA);
+        uint256 absB = sumDeltaB >= 0 ? uint256(sumDeltaB) : uint256(-sumDeltaB);
+        assertLt(absA * 20, absB, "Step A delta >5% of Step B delta -- unexpected");
+        // Step B underpayment must be much larger than the visible pool W
+        // loss -- this is the whole point of finding 19.
+        uint256 absLoss = poolNetWLoss >= 0 ? uint256(poolNetWLoss) : uint256(-poolNetWLoss);
+        assertGt(absB, absLoss * 10, "sum dB should dwarf pool W loss");
+    }
+
+    // ------------------------------------------------------------------
+    // Mirror of SearchParams._truncateToTop2Digits (kept here to avoid
+    // pulling in the whole SearchParams contract for an offline check).
+    function _trimTop2(uint256 x) internal pure returns (uint256) {
+        if (x < 100) return x;
+        uint256 power = 1;
+        uint256 temp = x;
+        while (temp >= 100) {
+            temp /= 10;
+            power *= 10;
+        }
+        return temp * power;
+    }
+
+    // Mirror of SearchParams._computeSwap3 in BUGGY (mode=0) mode: try
+    // swapOut3 = trim(bW), then trim(bW)*9/10, then trim(bW)*9/10*9/10.
+    // Returns 0 if all three attempts revert.
+    function _dynamicSwapOut3Buggy(
+        uint256[] memory bal, uint256[] memory sf,
+        uint256 amp, uint256 fee
+    ) internal view returns (uint256) {
+        uint256 want = _trimTop2(bal[0]);
+        for (uint256 j = 0; j < 3; j++) {
+            try this.ext_simSwap(bal, sf, 1, 0, want, amp, fee, 0) returns (uint256[] memory) {
+                return want;
+            } catch { want = want * 9 / 10; }
+        }
+        return 0;
+    }
+
+    // Finding 20 (faithfulness check for the hardcoded ext schedule):
+    // the per-round W/O/D figures used by testDiag_perRoundTrace,
+    // testDiag_counterfactualParallel, testDiag_counterfactualPerRound
+    // Isolated and testDiag_perRoundStepBUnderpayment all consume the
+    // hardcoded ext[] array from _phase2ExtractAmounts. That array was
+    // extracted from a prior on-chain replay. This test re-derives ext
+    // dynamically by running, at each round's actual BUGGY pre-Step-C
+    // state, the same trim(bW) + (x9/10 x2) fallback ladder used by
+    // SearchParams._computeSwap3, and asserts ext[r] is identical for
+    // every r in 0..29. Result: 0 mismatches across 30 rounds. So:
+    //   - the hardcoded ext schedule is the unique output of
+    //     simulateOneRound under buggy on-chain math at this start state
+    //     (67000, 67000) and these (sf, amp, fee);
+    //   - all numeric conclusions downstream (Sum ext=3,595,717,
+    //     Sum inA+B=3,529,606, pool W loss=66,111, exit W=889) are
+    //     faithful reproductions of what simulateOneRound would compute.
+    function testDiag_verifyExtScheduleMatchesComputeSwap3() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+        uint256[30] memory hardcoded = _phase2ExtractAmounts();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000; bal[1] = 67000;
+
+        uint256 mismatches;
+        for (uint256 r = 0; r < 30; r++) {
+            uint256 outA = bal[1] - 17 - 1;
+            bal = simSwapGivenOut(bal, sf, 0, 1, outA, amp, fee, 0);
+            bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);
+
+            uint256 dynamicExt = _dynamicSwapOut3Buggy(bal, sf, amp, fee);
+            uint256 hardExt    = hardcoded[r];
+
+            if (dynamicExt != hardExt) {
+                mismatches++;
+                console.log("Round", r);
+                console.log("  pre-C W =", bal[0]);
+                console.log("  pre-C O =", bal[1]);
+                console.log("  trim(W) =", _trimTop2(bal[0]));
+                console.log("  dynamic _computeSwap3 ext =", dynamicExt);
+                console.log("  hardcoded _phase2ExtractAmounts =", hardExt);
+            }
+
+            // Advance the real run using the HARDCODED ext (same as
+            // testDiag_perRoundStepBUnderpayment) so the per-round
+            // pre-states stay aligned across both tests.
+            bal = simSwapGivenOut(bal, sf, 1, 0, hardExt, amp, fee, 0);
+        }
+
+        console.log("Mismatches between dynamic and hardcoded ext:", mismatches);
+        assertEq(mismatches, 0, "hardcoded ext schedule diverges from _computeSwap3");
+    }
 }
