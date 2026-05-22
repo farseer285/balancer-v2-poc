@@ -2225,6 +2225,7 @@ contract DiagSim is Test {
             uint256 wPre = bal[0];
             bal = simSwapGivenOut(bal, sf, 0, 1, outA, amp, fee, 0);
             sumInABuggy += bal[0] - wPre;
+            assertEq(pA0[0], bal[0], "Step A: bW should be equal");
 
             // --- Step B probe at the round's actual post-Step-A state ---
             uint256[] memory pB0 = _copy(bal);
@@ -2238,6 +2239,7 @@ contract DiagSim is Test {
             wPre = bal[0];
             bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);
             sumInBBuggy += bal[0] - wPre;
+            assertEq(pB0[0], bal[0], "Step B: bW should be equal");
 
             // Step C in BUGGY mode, ext is an OUT amount (subtracts from W)
             bal = simSwapGivenOut(bal, sf, 1, 0, ext[r], amp, fee, 0);
