@@ -291,29 +291,44 @@ import {StableMath} from "src/StableMath.sol";
 // testDiag_counterfactualParallel, testDiag_counterfactualPerRoundIsolated
 // and testDiag_isolatedDEffectStepC below.
 //
-// 14. WETH 67000 -> 889 (net pool W loss = 66,111) is the NET RESIDUAL
-//     of the bug's per-cycle subsidy minus the attacker's strategy
-//     deficit, NOT the direct sum of any per-round leak. Two cleanly
-//     separable quantities (corrected by finding 19):
-//       (a) Bug's per-cycle subsidy (FIXED-vs-BUGGY inW delta, summed
-//           across 30 rounds, same pre-state per round):
+// 14. WETH 67000 -> 889 (net pool W loss = 66,111) and the BUGGY-world
+//     attacker net W gain of 66,111 are both direct readouts of one
+//     single quantity, the W-flow conservation identity in the actual
+//     trajectory (finding 19):
+//       attacker net W gain = Sum ext - (Sum inA_buggy + Sum inB_buggy)
+//                           = 3,595,717 - 3,529,606 = 66,111 W
+//     This number is a small residual of two ~3.5M opposing flows; it
+//     is NOT a per-round leak summation and it depends heavily on the
+//     attacker's hardcoded ext schedule. Two related but independently
+//     measured quantities (no causal arithmetic between them):
+//       (a) Bug's per-cycle marginal subsidy in this trajectory
+//           (FIXED-vs-BUGGY inW probe at every BUGGY pre-state, summed
+//           across 30 rounds):
 //             Sum dA + Sum dB = 31,913 + 1,588,748 = 1,620,661 W
-//           This is the W the attacker pays LESS in Steps A+B because
-//           of the mulDown rounding, measured per-round-isolated.
-//       (b) Attacker's strategy deficit against a fair (fixed) curve:
-//           the trim + 9/10 fallback extraction schedule would, if the
-//           bug were removed, overshoot the curve and leave the
-//           attacker ~1,554,550 W short (3,595,717 ext - 5,150,267 ins,
-//           per probe extrapolation; trajectory is NOT physically
-//           reachable, see finding 19 caveat).
-//       (c) Visible pool W loss = (a) - (b) = 1,620,661 - 1,554,550
-//                                            ~= 66,111 W.
-//     The attacker does NOT "drain" WETH each round; the bug under-
-//     charges him by ~1.62M W cumulatively, of which ~1.55M is
-//     absorbed by the coarse extraction strategy and ~66,111 surfaces
-//     as the visible pool W shortfall. See finding 19 for the W-flow
-//     conservation identity and finding 20 for the strategy-
-//     faithfulness check.
+//           This is how much LESS W the attacker pays in Steps A+B at
+//           each BUGGY pre-state under mulDown vs mulUp. It measures
+//           the bug's local magnitude on this trajectory; it does NOT
+//           equal the net visible pool W loss.
+//       (b) Phase-2 profitability of this strategy template under
+//           fair (FIXED) math, measured by re-running _computeSwap3
+//           adaptively in mulUp mode from round 0
+//           (testDiag_fullFixedWorldAdaptiveExt, finding 21):
+//             rounds completed = 1, then ext ladder exhausted
+//             attacker net W   = -1,450,120 (LOSS)
+//           So the mulDown bug is STRICTLY NECESSARY for this
+//           extraction template (trim(bW) + 9/10 fallback over 30
+//           rounds) to be profitable in Phase 2 -- not merely an
+//           amplifier. Removing the bug both collapses the trajectory
+//           (only 1 ext round survives before Newton-divergent
+//           post-states block every ext rung) and flips the sign of
+//           Phase-2 W flow.
+//     Together: (a) quantifies the bug's local magnitude, (b)
+//     answers the strict counterfactual question, and the 66,111
+//     visible pool W loss is the BUGGY-world residual that surfaces
+//     because the bug enables the trajectory in the first place.
+//     See finding 19 for the W-flow identity and per-round attribution,
+//     finding 20 for ext-schedule faithfulness, finding 21 for the
+//     true-FIXED-world adaptive-ext result.
 //
 // 15. OSETH 67000 -> 1472 (net pool O loss = 65,528) is NOT a bug effect
 //     compounded over 30 rounds. ~94% of the O loss happens in ROUND 0
@@ -2162,38 +2177,50 @@ contract DiagSim is Test {
     // and across 30 rounds the cumulative per-round-probe shift is 1.62M
     // W.
     //
-    // Counterfactual "+1,554,550 fixed-world pool gain": one can write
-    //   "if Step A+B ran in FIXED mode with the same ext schedule, the
-    //    pool would have ended with 889 + 1,620,661 = 1,621,550 W and
-    //    the attacker would have LOST 1,554,550 W"
-    // This arithmetic IS internally consistent (it is the per-round
-    // probe sum extended to a hypothetical full run), BUT the underlying
-    // trajectory is NOT physically reachable: testDiag_counterfactual
-    // PerRoundIsolated already shows the FIXED world reverts in Step C
-    // at rounds 1 and 3 when forced to follow the actual world's ext
-    // schedule (the post-A+B state in FIXED mode is more W-heavy, so
-    // the curve wall sits at a different swapOut3, and the actual ext
-    // overshoots it). A continuous fixed-mode 30-round run with this
-    // ext schedule therefore cannot complete. The "+1.55M loss" figure
-    // is a per-round probe extrapolation, not a real alternative
-    // history, and should be read as "magnitude of the bug's per-round
-    // marginal contribution, summed over 30 rounds", not as a simulated
-    // outcome.
+    // Two cautions on how NOT to read these numbers:
+    //
+    // (i) "Sum dA + Sum dB ~= 1.62M" is NOT in a definitional or
+    //     causal arithmetic relationship with the 66,111 net pool W
+    //     loss. The 66,111 is a direct readout of the BUGGY-world
+    //     W-flow identity above and does not require any FIXED probe
+    //     to compute. The earlier framing "66,111 = bug_subsidy
+    //     1.62M - strategy_deficit 1.55M" was circular: the 1.55M
+    //     "strategy deficit" was itself derived as
+    //     "Sum ext - (Sum inA_buggy + Sum inB_buggy + Sum dA + Sum
+    //     dB)" -- i.e. (1.62M - 66,111) by construction -- so feeding
+    //     it back to recover 66,111 added no new information. The
+    //     correct standalone reading: 66,111 is the BUGGY trajectory's
+    //     pool W residual; 1.62M is an INDEPENDENT measurement of the
+    //     bug's per-round marginal magnitude on the same trajectory.
+    //
+    // (ii) The "fixed-world same-ext alternative history" is not
+    //      physically reachable. testDiag_counterfactualParallel
+    //      already shows the FIXED world reverts in Step C at round 1
+    //      when forced to follow the actual ext schedule (the post-A+B
+    //      state in FIXED mode is more W-heavy, the curve wall sits at
+    //      a different swapOut3, the actual ext overshoots it). The
+    //      strict counterfactual -- "what if the attacker re-ran
+    //      _computeSwap3 under FIXED math and adapted ext each round?"
+    //      -- is answered by finding 21
+    //      (testDiag_fullFixedWorldAdaptiveExt): under fair math the
+    //      attack template completes only 1 round before the trim+9/10
+    //      ext ladder exhausts on a Newton-divergent post-state, and
+    //      Phase-2 attacker net W flips to a LOSS of ~1,450,120 W.
+    //      Therefore the mulDown bug is strictly necessary -- not
+    //      merely an amplifier -- for this strategy template to net a
+    //      positive Phase-2 W flow.
     //
     // What "drives" the visible 66,111: the attacker's trim+9/10
-    // fallback in _computeSwap3 is a coarse greedy strategy ("take ~99%
-    // of bW, retry at 90% / 81% on revert"). It is NOT precision-tuned;
-    // SearchParams.t.sol L221-225 lists four neighbouring parameter
-    // sets whose total profit differs by ~1.3%, confirming the attack
-    // is insensitive to strategy details. The 66,111 emerges as the
-    // residual after the bug's ~1.62M per-cycle subsidy covers the
-    // ~1.55M deficit that this coarse strategy would otherwise produce
-    // against a fair (fixed) curve. As long as bug_subsidy > strategy
-    // deficit, the sign of the pool's net loss is locked in; the exact
-    // magnitude (60k / 66k / 80k) is the residual under this particular
-    // ext schedule. Faithfulness of this ext schedule to the on-chain
-    // _computeSwap3 is verified by testDiag_verifyExtScheduleMatches
-    // ComputeSwap3 (finding 20): 0 mismatches across all 30 rounds.
+    // fallback in _computeSwap3 is a coarse greedy strategy ("take
+    // ~99% of bW, retry at 90% / 81% on revert"). It is NOT
+    // precision-tuned; SearchParams.t.sol L221-225 lists four
+    // neighbouring parameter sets whose total profit differs by ~1.3%,
+    // confirming the attack is insensitive to strategy details under
+    // BUGGY math. The 66,111 is the residual of this coarse schedule
+    // running on a trajectory only the bug enables. Faithfulness of
+    // this ext schedule to the on-chain _computeSwap3 is verified by
+    // testDiag_verifyExtScheduleMatchesComputeSwap3 (finding 20): 0
+    // mismatches across all 30 rounds.
     function testDiag_perRoundStepBUnderpayment() public {
         (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
 
@@ -2373,5 +2400,129 @@ contract DiagSim is Test {
 
         console.log("Mismatches between dynamic and hardcoded ext:", mismatches);
         assertEq(mismatches, 0, "hardcoded ext schedule diverges from _computeSwap3");
+    }
+
+    // Mirror of SearchParams._computeSwap3 but evaluated under FIXED math
+    // (mode=1, mulUp on OUT amount). Same trim(bW) -> *9/10 -> *9/10 ladder.
+    // Returns 0 if all three rungs revert under FIXED math.
+    function _dynamicSwapOut3Fixed(
+        uint256[] memory bal, uint256[] memory sf,
+        uint256 amp, uint256 fee
+    ) internal view returns (uint256) {
+        uint256 want = _trimTop2(bal[0]);
+        for (uint256 j = 0; j < 3; j++) {
+            try this.ext_simSwap(bal, sf, 1, 0, want, amp, fee, 1) returns (uint256[] memory) {
+                return want;
+            } catch { want = want * 9 / 10; }
+        }
+        return 0;
+    }
+
+    // Finding 21: "True FIXED world" simulation with adaptive ext.
+    //
+    // Background: finding 14 / 19 established that under hardcoded ext[]
+    // (= the BUGGY trajectory's own _computeSwap3 outputs), FIXED math is
+    // physically unreachable -- testDiag_counterfactualParallel reverts at
+    // Round 1 Step C because the bug-subsidised pre-state cannot accept
+    // the same ext withdrawal once mulUp is restored. That left an open
+    // question: is the bug a NECESSARY condition for any Phase-2 profit,
+    // or only an amplifier for this particular ext schedule?
+    //
+    // This test answers that by letting the attacker RE-RUN the same
+    // trim(bW)+9/10 _computeSwap3 strategy in FIXED mode from round 0:
+    // every round, Steps A and B execute with mulUp, then Step C is sized
+    // by _dynamicSwapOut3Fixed against the actual FIXED post-B state.
+    // The trajectory is therefore self-consistent (no BUGGY pre-state
+    // contamination) and corresponds to "World B" in the methodology
+    // grid: attacker keeps the same strategy template, the pool runs
+    // fair math.
+    //
+    // Reported quantities (all from this single FIXED-world run):
+    //   roundsCompleted   : how many A->B->C cycles finished before
+    //                       _dynamicSwapOut3Fixed returns 0 or Step A/B
+    //                       reverts.
+    //   sumInA, sumInB    : cumulative WETH the attacker pays.
+    //   sumExt            : cumulative WETH the attacker withdraws.
+    //   netProfit         : sumExt - (sumInA + sumInB), the attacker's
+    //                       Phase-2 W net under FIXED math + adaptive ext.
+    //   final (W, O), D   : terminal pool state in the FIXED world.
+    //
+    // Decision rule for the strict version of "is bug necessary for
+    // Phase-2 profit?":
+    //   * netProfit > 0  => bug is NOT necessary, it is only an amplifier;
+    //                       attackers could still profit on fair math.
+    //   * netProfit <= 0 => bug is necessary for THIS strategy template;
+    //                       fair math turns Phase 2 into a loss for the
+    //                       attacker even with full ext adaptivity.
+    function testDiag_fullFixedWorldAdaptiveExt() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000;
+        bal[1] = 67000;
+
+        uint256 sumInA;
+        uint256 sumInB;
+        uint256 sumExt;
+        uint256 roundsCompleted;
+        uint256 stopReason; // 0 = ran all 30, 1 = Step A revert,
+                            // 2 = Step B revert, 3 = ext ladder exhausted
+
+        for (uint256 r = 0; r < 30; r++) {
+            // Step A guard: need bO >= trickAmt + 2 to request bO-18 out.
+            if (bal[1] < 19) { stopReason = 1; break; }
+            uint256 outA = bal[1] - 17 - 1;
+
+            uint256 wBefore = bal[0];
+            (bool okA, uint256[] memory afterA) =
+                _safeSimRound(bal, sf, 0, 1, outA, amp, fee, 1);
+            if (!okA) { stopReason = 1; break; }
+            bal = afterA;
+            sumInA += bal[0] - wBefore;
+
+            wBefore = bal[0];
+            (bool okB, uint256[] memory afterB) =
+                _safeSimRound(bal, sf, 0, 1, 17, amp, fee, 1);
+            if (!okB) { stopReason = 2; break; }
+            bal = afterB;
+            sumInB += bal[0] - wBefore;
+
+            uint256 ext = _dynamicSwapOut3Fixed(bal, sf, amp, fee);
+            if (ext == 0) { stopReason = 3; break; }
+
+            (bool okC, uint256[] memory afterC) =
+                _safeSimRound(bal, sf, 1, 0, ext, amp, fee, 1);
+            if (!okC) { stopReason = 3; break; }
+            bal = afterC;
+            sumExt += ext;
+
+            roundsCompleted = r + 1;
+        }
+
+        (bool okD, uint256 finalD) = _safeInvRound(bal, sf, amp);
+
+        console.log("=== True FIXED world, adaptive _computeSwap3 ===");
+        console.log("rounds completed         :", roundsCompleted);
+        console.log("stop reason (0/1/2/3)    :", stopReason);
+        console.log("final W                  :", bal[0]);
+        console.log("final O                  :", bal[1]);
+        if (okD) {
+            console.log("final D                  :", finalD);
+        } else {
+            console.log("final D                  : DID_NOT_CONVERGE");
+        }
+        console.log("Sum inA (FIXED)          :", sumInA);
+        console.log("Sum inB (FIXED)          :", sumInB);
+        console.log("Sum ext (FIXED)          :", sumExt);
+        uint256 sumIn = sumInA + sumInB;
+        console.log("Sum inA+inB (FIXED)      :", sumIn);
+        if (sumExt >= sumIn) {
+            console.log("Net W profit (FIXED)     :", sumExt - sumIn);
+            console.log("=> Bug is NOT necessary for Phase-2 profit (amplifier only)");
+        } else {
+            console.log("Net W loss (FIXED)       :", sumIn - sumExt);
+            console.log("=> Bug IS necessary: this strategy template loses on fair math");
+        }
+        console.log("(Reference) BUGGY net W profit was 66,111 over 30 rounds.");
     }
 }
