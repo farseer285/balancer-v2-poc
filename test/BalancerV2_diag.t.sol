@@ -2525,4 +2525,53 @@ contract DiagSim is Test {
         }
         console.log("(Reference) BUGGY net W profit was 66,111 over 30 rounds.");
     }
+
+    // Per-round dW = (inA_buggy + inB_buggy) - ext across all 30 rounds
+    // of the actual BUGGY trajectory. Demonstrates that dW is mixed-sign
+    // round-by-round and that the cumulative sum lands on -66,111
+    // (matching the pool W loss = 67000 - 889).
+    function testDiag_perRoundDW() public {
+        (uint256[] memory sf, uint256 amp, uint256 fee) = _phase2Params();
+        uint256[30] memory ext = _phase2ExtractAmounts();
+
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000;
+        bal[1] = 67000;
+
+        int256 cumDW;
+        console.log("r | inA | inB | inA+inB | ext | dW = (inA+inB)-ext | cum dW");
+        for (uint256 r = 0; r < 30; r++) {
+            uint256 wBefore;
+
+            wBefore = bal[0];
+            bal = simSwapGivenOut(bal, sf, 0, 1, bal[1] - 17 - 1, amp, fee, 0);
+            uint256 inA = bal[0] - wBefore;
+
+            wBefore = bal[0];
+            bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);
+            uint256 inB = bal[0] - wBefore;
+
+            uint256 inAB = inA + inB;
+            uint256 extR = ext[r];
+            int256 dW = int256(inAB) - int256(extR);
+            cumDW += dW;
+
+            bal = simSwapGivenOut(bal, sf, 1, 0, extR, amp, fee, 0);
+
+            console.log("r=", r);
+            console.log("  inA      :", inA);
+            console.log("  inB      :", inB);
+            console.log("  inA+inB  :", inAB);
+            console.log("  ext      :", extR);
+            console.log("  dW       :", dW);
+            console.log("  cum dW   :", cumDW);
+        }
+
+        console.log("");
+        console.log("Final W            :", bal[0]);
+        console.log("Final O            :", bal[1]);
+        console.log("67000 + cum dW   ==:", int256(67000) + cumDW);
+        assertEq(bal[0], 889, "exit W must be 889");
+        assertEq(cumDW, int256(-66111), "cumulative dW must equal -66,111");
+    }
 }
