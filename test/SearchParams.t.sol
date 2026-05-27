@@ -489,6 +489,20 @@ contract SearchParams is Test {
         internal pure returns (uint256[] memory amounts, uint256 count)
     {
         amounts = new uint256[](maxLength);
+
+        // 1e9 or above -> ZERO_DIVISION -> revert
+        // max(1e8 + 3 * n) <= 1e22, n = 4, max = 1e20  (MAX PROFIT: 4814 WETH + 6747 osETH)
+        // max(1e7 + 3 * n) <= 1e22, n = 5, max = 1e22
+        // max(1e6 + 3 * n) <= 1e22, n = 5, max = 1e21  (Second-highest profit: 4828 WETH + 6733 osETH)
+        // max(1e5 + 3 * n) <= 1e22, n = 5, max = 1e20
+        // max(1e4 + 3 * n) <= 1e22, n = 6, max = 1e22
+        // max(1e3 + 3 * n) <= 1e22, n = 6, max = 1e21
+        // max(1e2 + 3 * n) <= 1e22, n = 6, max = 1e20
+        // max(1e1 + 3 * n) <= 1e22, n = 7, max = 1e22
+
+        // 10000x only works with 1e1, otherwise ZERO_DIVISION -> revert
+        // max(1e1 + 4 * n) <= 1e22, n = 5, max = 1e21
+
         uint256 accumulated = 10000;
         uint256 nowValue = 10000;
         amounts[0] = 10000;
