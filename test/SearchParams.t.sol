@@ -496,7 +496,7 @@ contract SearchParams is Test {
         // max(1e7 + 3 * n) <= 1e22, n = 5,  max = 1e22  (6th: 4921 WETH + 6593 osETH = 46020869 USD)
         // max(1e6 + 3 * n) <= 1e22, n = 5,  max = 1e21  (2nd: 4828 WETH + 6733 osETH = 46231230 USD)
         // max(1e5 + 3 * n) <= 1e22, n = 5,  max = 1e20  (3rd: 4807 WETH + 6745 osETH = 46198671 USD)
-        // max(1e4 + 3 * n) <= 1e22, n = 6,  max = 1e22  (7th: 4623 WETH + 6851 osETH = 45916891 USD)
+        // max(1e4 + 3 * n) <= 1e22, n = 6,  max = 1e22  (7th: 4623 WETH + 6851 osETH = 45916891 USD)  *REAL PROFIT*
         // max(1e3 + 3 * n) <= 1e22, n = 6,  max = 1e21  (4th: 4782 WETH + 6751 osETH = 46126088 USD)
         // max(1e2 + 3 * n) <= 1e22, n = 6,  max = 1e20  (5th: 4797 WETH + 6730 osETH = 46098611 USD)
         // max(1e1 + 3 * n) <= 1e22, n = 7,  max = 1e22  (8th: 4921 WETH + 6535 osETH = 45784113 USD)
