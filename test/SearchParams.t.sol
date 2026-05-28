@@ -491,14 +491,14 @@ contract SearchParams is Test {
         amounts = new uint256[](maxLength);
 
         // 1e9 or above -> ZERO_DIVISION -> revert
-        // max(1e8 + 3 * n) <= 1e22, n = 4, max = 1e20  (MAX PROFIT: 4814 WETH + 6747 osETH)
-        // max(1e7 + 3 * n) <= 1e22, n = 5, max = 1e22
-        // max(1e6 + 3 * n) <= 1e22, n = 5, max = 1e21  (Second-highest profit: 4828 WETH + 6733 osETH)
-        // max(1e5 + 3 * n) <= 1e22, n = 5, max = 1e20
-        // max(1e4 + 3 * n) <= 1e22, n = 6, max = 1e22
-        // max(1e3 + 3 * n) <= 1e22, n = 6, max = 1e21
-        // max(1e2 + 3 * n) <= 1e22, n = 6, max = 1e20
-        // max(1e1 + 3 * n) <= 1e22, n = 7, max = 1e22
+        // max(1e8 + 3 * n) <= 1e22, n = 4, max = 1e20  (1st: 4814 WETH + 6747 osETH)  *MAX PROFIT*
+        // max(1e7 + 3 * n) <= 1e22, n = 5, max = 1e22  (6th: 4921 WETH + 6593 osETH)
+        // max(1e6 + 3 * n) <= 1e22, n = 5, max = 1e21  (2nd: 4828 WETH + 6733 osETH)
+        // max(1e5 + 3 * n) <= 1e22, n = 5, max = 1e20  (3rd: 4807 WETH + 6745 osETH)
+        // max(1e4 + 3 * n) <= 1e22, n = 6, max = 1e22  (7th: 4623 WETH + 6851 osETH)
+        // max(1e3 + 3 * n) <= 1e22, n = 6, max = 1e21  (4th: 4782 WETH + 6751 osETH)
+        // max(1e2 + 3 * n) <= 1e22, n = 6, max = 1e20  (5th: 4797 WETH + 6730 osETH)
+        // max(1e1 + 3 * n) <= 1e22, n = 7, max = 1e22  (8th: 4921 WETH + 6535 osETH)
 
         // 10000x only works with 1e1, otherwise ZERO_DIVISION -> revert
         // max(1e1 + 4 * n) <= 1e22, n = 5, max = 1e21
