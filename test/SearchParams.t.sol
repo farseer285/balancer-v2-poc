@@ -510,6 +510,15 @@ contract SearchParams is Test {
         // max(1e2 + 2 * n) <= 1e22, n = 10, max = 1e22  (7th: 4662 WETH + 6838 osETH = 46015262 USD)
         // max(1e1 + 2 * n) <= 1e22, n = 10, max = 1e21  (8th: 4769 WETH + 6731 osETH = 45993969 USD)
 
+        // max(1e8 + 1 * n) <= 1e22, n = 14, max = 1e22  (2nd: 4719 WETH + 6818 osETH = 46154953 USD)
+        // max(1e7 + 1 * n) <= 1e22, n = 15, max = 1e22  (1st: 4887 WETH + 6659 osETH = 46158259 USD)
+        // max(1e6 + 1 * n) <= 1e22, n = 16, max = 1e22  (3rd: 4718 WETH + 6818 osETH = 46151070 USD)
+        // max(1e5 + 1 * n) <= 1e22, n = 17, max = 1e22  (4th: 4885 WETH + 6652 osETH = 46121919 USD)
+        // max(1e4 + 1 * n) <= 1e22, n = 18, max = 1e22  (5th: 4689 WETH + 6813 osETH = 46018053 USD)
+        // max(1e3 + 1 * n) <= 1e22, n = 19, max = 1e22  (6th: 4877 WETH + 6607 osETH = 45907165 USD)
+        // max(1e2 + 1 * n) <= 1e22, n = 20, max = 1e22  (7th: 4640 WETH + 6805 osETH = 45795130 USD)
+        // max(1e2 + 1 * n) <= 1e22, n = 21, max = 1e22  (8th: 4869 WETH + 6562 osETH = 45692411 USD)
+
         // 10000x only works with 1e1, otherwise ZERO_DIVISION -> revert
         // max(1e1 + 4 * n) <= 1e22, n = 5, max = 1e21
 
