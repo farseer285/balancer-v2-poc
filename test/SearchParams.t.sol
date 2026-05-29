@@ -522,6 +522,11 @@ contract SearchParams is Test {
         // 10000x(1e4) only works with 1e1, otherwise ZERO_DIVISION -> revert
         // max(1e1 + 1e4 * n) <= 1e22, n = 5, max = 1e21
 
+        // max(1e4 + 1e3 * n) <= 1e22, n = 6, max = 1e22
+        // Optimized to change amount[0] from '1e4' to '1e8' and swap order: WETH (1e8) -> osETH -> *osETH* -> *WETH* -> *osETH* -> WETH -> osETH -> WETH
+        // TODO: Further optimization could be dynamically set step size instead of using static '1e3'.
+        // 4721 WETH + 6835 osETH = 46232113 USD (Delta PnL: +$315,222 (46,232,113 - 45,916,891))
+
         uint256 accumulated = 10000;
         uint256 nowValue = 10000;
         amounts[0] = 10000;
