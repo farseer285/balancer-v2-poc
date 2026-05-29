@@ -517,7 +517,7 @@ contract SearchParams is Test {
         // max(1e4 + 1e1 * n) <= 1e22, n = 18, max = 1e22  (5th: 4689 WETH + 6813 osETH = 46018053 USD)
         // max(1e3 + 1e1 * n) <= 1e22, n = 19, max = 1e22  (6th: 4877 WETH + 6607 osETH = 45907165 USD)
         // max(1e2 + 1e1 * n) <= 1e22, n = 20, max = 1e22  (7th: 4640 WETH + 6805 osETH = 45795130 USD)
-        // max(1e2 + 1e1 * n) <= 1e22, n = 21, max = 1e22  (8th: 4869 WETH + 6562 osETH = 45692411 USD)
+        // max(1e1 + 1e1 * n) <= 1e22, n = 21, max = 1e22  (8th: 4869 WETH + 6562 osETH = 45692411 USD)
 
         // 10000x(1e4) only works with 1e1, otherwise ZERO_DIVISION -> revert
         // max(1e1 + 1e4 * n) <= 1e22, n = 5, max = 1e21
