@@ -527,15 +527,13 @@ contract SearchParams is Test {
         // Further optimization could be dynamically set step size in each swap instead of using static '1e3'.
         // 4721 WETH + 6835 osETH = 46232113 USD (Delta PnL: +$315,222 (46,232,113 - 45,916,891))
 
-        uint256 accumulated = 10000;
-        uint256 nowValue = 10000;
-        amounts[0] = 10000;
+        uint256 nowValue = 1e4;
+        amounts[0] = 1e4;
         count = 1;
 
         for (uint256 i = 1; i < maxLength; i++) {
-            if (totalTarget > accumulated + 1000 * nowValue) {
-                accumulated += 1000 * nowValue;
-                nowValue = nowValue * 1000;
+            if (totalTarget > 1e3 * nowValue) {
+                nowValue = nowValue * 1e3;
                 amounts[i] = nowValue;
                 count++;
             } else {
