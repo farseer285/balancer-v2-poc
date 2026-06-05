@@ -8,6 +8,7 @@ amp = 200000
 _AMP_PRECISION = 1000
 invariant = 145787508
 bO = 155167  # Balance of the other token
+# old balance: bW = 1630
 
 # 1. Directly calculate C using the pure formula (perfectly eliminating the old balance 1630 and its caused P_D truncation)
 D3 = invariant * invariant * invariant
