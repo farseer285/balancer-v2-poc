@@ -496,11 +496,32 @@ contract SearchParams is Test {
     /// harder per round -> sustains a higher remain -> higher profit, until 30 rounds can no longer
     /// collapse the (now huge) pool. (Grid-limited: finer step / higher remain may shift it slightly.)
     ///
-    /// Env: WSWEEP_LO/HI = remain range, WSWEEP_STRIDE = remain step, KMAX = max k.
+    /// TOP-10 combos with profit > (17,67000)=11474.72 ETH  (49 found in k=1..300,
+    /// remain [50000,250000] step 1000; sorted by profit -- every trickAmt is a t_k):
+    ///        k    t_k   remain   profit(ETH)
+    ///        5     86   240000    11659.27   <- best
+    ///        3     51   167000    11624.66
+    ///        2     34   143000    11619.90
+    ///        6    103   182000    11615.73
+    ///        6    103   171000    11609.37
+    ///        7    120   174000    11608.69
+    ///       14    240   175000    11598.25
+    ///        4     68   135000    11590.81
+    ///       11    189   163000    11589.19
+    ///       10    172   163000    11587.85
+    /// Notable -- rank #19: (k=1, t_1=17, remain=94000) = 11555.00 ETH. Even the ORIGINAL trickAmt
+    /// 17, at remain=94000 instead of 67000, beats (17,67000): 67000 is the ROBUST choice (wide
+    /// attractor band), not the profit max -- true for 17 itself too, not only for larger t_k.
+    /// Same t_k also recurs at several remains (e.g. t_103 @ 182000/171000/117000/116000); profit
+    /// is non-monotonic in both k and remain (chaotic (t_k, remain) pairing).
+    ///
+    /// Env: WSWEEP_LO/HI = remain range, WSWEEP_STRIDE = remain step, KMIN/KMAX = k range,
+    /// THRESHOLD = list every combo whose profit exceeds it (default (17,67000) = 11474.72 ETH).
     function test_searchTkProfit() public {
         uint256 loR = vm.envOr("WSWEEP_LO", uint256(50000));
         uint256 hiR = vm.envOr("WSWEEP_HI", uint256(250000));
         uint256 stepR = vm.envOr("WSWEEP_STRIDE", uint256(1000));
+        uint256 kMin = vm.envOr("KMIN", uint256(1));
         uint256 kMax = vm.envOr("KMAX", uint256(100));
         uint256 N = 30;
         uint256 delta = sf[1] - FixedPoint.ONE;
@@ -511,14 +532,20 @@ contract SearchParams is Test {
         uint256 totalBPT = OSETH_BPT.getActualSupply();
         uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
 
+        // Baseline to beat: (17, 67000) = 11474.72 ETH. Override via THRESHOLD env.
+        int256 threshold = int256(vm.envOr("THRESHOLD", uint256(11474724463088359625808)));
+
         int256 gBest = type(int256).min;
         uint256 gTk;
         uint256 gK;
         uint256 gR;
+        uint256 aboveCount;
 
+        console.log("=== (t_k, remain) with profit > threshold ===");
+        console.log("threshold(wei):", threshold);
         for (uint256 R = loR; R <= hiR; R += stepR) {
             Step1DetailedResult memory s1 = _simulateStep1ExtractionDetailed(rw, ro, R, totalBPT);
-            for (uint256 k = 1; k <= kMax; k++) {
+            for (uint256 k = kMin; k <= kMax; k++) {
                 uint256 tk = k * FixedPoint.ONE / delta; // t_k = floor(k*1e18/delta)
                 if (tk + 1 >= R) break; // larger k only grows tk -> swap1 underflows at round 0
                 // Phase 2: N-round cycling, stop early on revert
@@ -540,13 +567,19 @@ contract SearchParams is Test {
                     int256 netO = int256(s1.totalOsethOut) + int256(R) - int256(bO) - int256(oc);
                     int256 profit = netW + netO;
                     if (profit > gBest) { gBest = profit; gTk = tk; gK = k; gR = R; }
+                    if (profit > threshold) {
+                        aboveCount++;
+                        console.log("  k/tk/remain:", k, tk, R);
+                        console.log("     profit(wei):", profit);
+                    }
                 } catch {}
             }
         }
 
-        console.log("=== t_k PROFIT SEARCH (closed-form candidates only) ===");
+        console.log("=== SUMMARY ===");
         console.log("remain lo/hi:", loR, hiR);
         console.log("step / kMax:", stepR, kMax);
+        console.log("combos above threshold:", aboveCount);
         console.log("### BEST t_k =", gTk, "k=", gK);
         console.log("###   remain =", gR);
         console.log("###   profit(wei) =", gBest);
