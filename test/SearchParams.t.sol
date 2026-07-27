@@ -1789,6 +1789,36 @@ contract SearchParams is Test {
     }
 
     function test_detailedTokenBreakdown() public {
+        // ─────────────────────────────────────────────────────────────────────────
+        // trickAmt = floor(1e18 / (sf_osETH - 1e18)) = 17
+        //
+        // WHAT THIS FORMULA PROVES (pure math, verified vs ./balancer-v2-monorepo):
+        //   17 is the LARGEST x with mulDown(x, sf) == x — the biggest swap-out amount whose
+        //   _upscale (BaseGeneralPool._swapGivenOut -> ScalingHelpers._upscale = FixedPoint.mulDown
+        //   = floor(a*b/1e18)) fully discards osETH's rate premium ("Total Precision Loss", TPL):
+        //       mulDown(x,sf)==x  <=>  x*(sf-1e18) < 1e18  <=>  x <= floor(1e18/(sf-1e18)) = 17
+        //   (17*δ = 9.88e17 < 1e18 ✓ ; 18*δ = 1.046e18 ≥ 1e18 ✗ ; δ = sf-1e18 = 5.813e16).
+        //   The formula computes ONLY this TPL threshold — nothing more.
+        //
+        // WHAT IT DOES *NOT* PROVE: that 17 maximizes D-collapse or profit. That is an empirical,
+        // non-closed-form property of the 30-round iterated map (StableSwap Newton + swap-3
+        // truncation), and it is NOT even universally true. Profit is a JOINT (trickAmt, remain)
+        // search. Full-simulation results (Phase1+Phase2+Phase3, per-token profit baseline-matched
+        // to this very test at (17,67000)):
+        //     (17, 67000)  -> 11474.72  ETH   <- robust choice used below (wide attractor band)
+        //     (17, 94000)  -> 11554.998 ETH   <- 17's OWN maximum
+        //     (34, 117000) -> 11586.27  ETH   <- 34 is NON-TPL (mulDown(34,sf)=35 != 34); beats 17
+        //     (34, 143000) -> 11619.90  ETH   <- highest found; beats EVERY 17 combo
+        //   These high-remain winners sit on razor-thin, chaotic attractors: e.g. trickAmt=34
+        //   completes 30 rounds ONLY at remain=143000 — at 140000/142000/144000/145000 it dies
+        //   in 0-3 rounds. So max profit rises with remain via a sparse set of ever-narrower
+        //   spikes; it has no closed form and can only be found by numerical search.
+        //
+        // CONCLUSION: 17 is (a) the pool-forced TPL threshold [provable], and (b) the CLEAN +
+        // ROBUST D-collapse lever at a robust remain — which is why the real exploit and this PoC
+        // use (17, 67000). But 17 is NOT the unique profit-maximizing trickAmt: a larger, NON-TPL
+        // trickAmt at a higher (fragile) remain yields more raw profit, e.g. (34, 143000)=11619.9 ETH.
+        // ─────────────────────────────────────────────────────────────────────────
         uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
         bytes32 poolId = OSETH_BPT.getPoolId();
         (, uint256[] memory realBal,) = VAULT.getPoolTokens(poolId);
