@@ -26,6 +26,75 @@ import "../StableMath.sol";
 // Twitter Guy : https://x.com/BlockSecTeam/status/1986057732810518640, https://x.com/SlowMist_Team/status/1986379316935205299, https://x.com/hklst4r/status/1985872151077953827
 // Hacking God : N/A
 
+// @Deployment & Broadcast Reconstruction  (forensic, reconstructed purely from on-chain data)
+// ============================================================================================
+// How the attacker actually put this exploit on-chain, reconstructed from the attack tx
+// (0x6ed0...), the withdrawal tx (0xd155...), the deployed bytecode of 0x54B535, and
+// block-level data.  Confidence tags: [FACT]=on-chain verified, [STRONG]=strong inference,
+// [UNKNOWN]=not determinable from chain data.
+//
+// (1) Contract shape                                                                    [FACT]
+//   - Top-level CREATE tx (to = null); the ENTIRE attack executes in the CONSTRUCTOR
+//     (deploy == drain).  One tx: 361 logs, 226 Balancer Vault swaps.
+//   - Deployed runtime code carries 12/12 forge-std Test/StdInvariant selectors
+//     (IS_TEST, failed, targetContracts, excludeSenders, ...) => the exploit was written as
+//     a Foundry (forge-std) contract.  Compiler = solc 0.7.6 (no built-in overflow checks).
+//
+// (2) It was ONE single `forge script --broadcast` run                                [STRONG]
+//   - Two consecutive-nonce txs from EOA 0x506D...3207:
+//       nonce 80  attack   0x6ed0...  block 23717397  deploy + drain (constructor)
+//       nonce 81  withdraw 0xd155...  block 23717404  sweep funds out
+//   - Both carry the IDENTICAL fee: maxFee 169,610,062 / tip 39,074 wei, where
+//       maxFee == 2*baseFee + tip  and  baseFee == 84,785,494 == baseFee(block 23717390).
+//     Same fee on two txs => forge estimated the fee ONCE, upfront, at block 23717390.
+//   - gasLimit = floor(1.30 * base)  (forge default gas_estimate_multiplier = 130).  The "base" is
+//     forge's OWN gas figure, NOT eth_estimateGas (verified in foundry crates/script/src/runner.rs):
+//       CREATE (attack)   base = simulation gas_used (deploy path, no search):
+//         36,856,400 = 1.30 * 28,351,077  (~ gasUsed 28,348,674; +2,403 = sim@390 vs chain@397 noise)
+//       CALL (withdraw)   base = search_optimal_gas_usage(): a binary search over [g, 3g] that stops
+//         early at ~1.125*g (its 10% accuracy heuristic; NOT the 63/64 rule), so the CALL ends up at
+//         gasLimit/gasUsed = 1.30 * 1.125 = 1.4625:
+//         501,802 = 1.30 * 386,002,  386,002 = 1.125 * gasUsed 343,113
+//   - nonce 81 received a valid gas estimate while its target 0x54B535 did NOT yet exist
+//     on-chain (deployed only at block 23717397) => forge must have simulated the
+//     deploy->withdraw sequence together => a single script, not two separate commands.
+//
+// (3) Timing & submission
+//   - Fee basis = block 23717390 => the tx was constructed/fee-estimated when the chain head
+//     was 23717390, ~7 blocks (~84s) before inclusion.                                [STRONG]
+//     Neither 23717390 nor 23717397 was "chosen": one is run-time, the other inclusion-time.
+//     baseFee ~0.096 gwei was the ambient low-fee regime, not a hand-picked window.    [FACT]
+//   - Private submission: the attack tx is absent from the public mempool (Flashbots
+//     mempool-dumpster 2025-11-03; 113/214 same-block txs ARE archived, this one is not),
+//     and landed in a Titan-built block.                                               [FACT]
+//   - Titan also built 23717392/393/394/396 yet did NOT include it; only 23717397 did
+//     => the tx was submitted targeting ~397, not resubmitted from 391.                [FACT]
+//   - Builder payment = priority fee ONLY: 39,074 * 28,348,674 = 1.107696e12 wei
+//     (~0.0000011 ETH).  No coinbase transfer, no separate payment tx, no attacker-EOA ->
+//     Titan transfer in any block (callTracer x2 nodes + prestateTracer x2 + block scan). [FACT]
+//
+// (4) Pre-broadcast simulation                                                          [FACT]
+//   - `forge script --broadcast` first runs deploy->drain->withdraw locally on a fork of
+//     mainnet@23717390 and only broadcasts if it succeeds (no revert).  Prior development
+//     testing (forge test) is near-certain but off-chain / not observable.            [STRONG]
+//
+// (5) anvil verification of the reconstructed command
+//   - `forge script Deploy.s.sol --broadcast` against `anvil --base-fee 84785494` reproduces
+//     ALL fingerprints: consecutive nonce, CREATE+CALL, shared fee = 2*84,785,494 + tip,
+//     gasLimit (CREATE 1.30x, CALL/withdraw 1.4625x == mainnet), 12/12 forge-std selectors.
+//
+// Reconstructed command (shape):
+//     // script/Deploy.s.sol
+//     vm.startBroadcast(pk);
+//     Attacker a = new Attacker(pool, remain, steps); // nonce 80: deploy + drain (in constructor)
+//     a.withdraw(pool);                                // nonce 81: withdraw
+//     vm.stopBroadcast();
+//     $ PK=<key> forge script script/Deploy.s.sol:Deploy --broadcast --rpc-url <private-relay>
+//
+// [UNKNOWN] exact private relay/builder endpoint; whether literally `forge script` vs an
+// equivalent `forge create` combo; the tip's exact source parameter.
+// ============================================================================================
+
 address constant weth = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 address constant balancer = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
 address constant osETH_wETH = 0xDACf5Fa19b1f720111609043ac67A9818262850c;
