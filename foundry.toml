@@ -5,6 +5,11 @@ libs = ["dependencies"]
 via_ir = true
 #optimizer = true
 
+# Reference-only PoC source (copied from DeFiHackLabs); its ../interface.sol and
+# ../StableMath.sol imports follow the DeFiHackLabs layout and don't resolve here.
+# Skip it from compilation so it doesn't break `forge test`/`forge build`.
+skip = ["test/BalancerV2_exp.sol"]
+
 remappings = [
     "forge-std/=dependencies/forge-std-1.11.0/src/"
 ]
