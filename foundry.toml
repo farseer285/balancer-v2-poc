@@ -3,7 +3,7 @@ src = "src"
 out = "out"
 libs = ["dependencies"]
 via_ir = true
-#optimizer = true
+optimizer = true
 
 # Reference-only PoC source (copied from DeFiHackLabs); its ../interface.sol and
 # ../StableMath.sol imports follow the DeFiHackLabs layout and don't resolve here.

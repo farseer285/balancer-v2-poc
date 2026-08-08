@@ -431,7 +431,18 @@ contract DiagSim is Test {
     // ---- offline pool math (raw -> upscaled -> curve -> downscaled -> +fee) ----
     // mode == 0 : buggy   (mulDown on OUT amount = real on-chain behaviour)
     // mode == 1 : fixed   (mulUp on OUT amount, removes the user-favouring leak)
+    // Thin wrapper: routes the swap through the external (non-inlined) path so the heavy
+    // StableSwap math is never inlined into loop callers (which overflowed the 16-slot stack
+    // under via-ir + optimizer). Every existing simSwapGivenOut(...) call site is unchanged
+    // and behavior is identical (ext_simSwap -> _simSwapCore computes the exact same values).
     function simSwapGivenOut(
+        uint256[] memory bal, uint256[] memory sf,
+        uint256 idxIn, uint256 idxOut, uint256 outAmt, uint256 amp, uint256 fee, uint8 mode
+    ) internal view returns (uint256[] memory) {
+        return this.ext_simSwap(bal, sf, idxIn, idxOut, outAmt, amp, fee, mode);
+    }
+
+    function _simSwapCore(
         uint256[] memory bal,        // raw, length 2: [WETH, osETH]
         uint256[] memory sf,         // 18-dec scaling factors
         uint256 idxIn,
@@ -466,7 +477,14 @@ contract DiagSim is Test {
         return bal;
     }
 
+    // Thin wrapper -> external (non-inlined) path; see the simSwapGivenOut wrapper note.
     function invUp(uint256[] memory bal, uint256[] memory sf, uint256 amp)
+        internal view returns (uint256)
+    {
+        return this.ext_invUp(bal, sf, amp);
+    }
+
+    function _invUpCore(uint256[] memory bal, uint256[] memory sf, uint256 amp)
         internal pure returns (uint256)
     {
         uint256[] memory up = new uint256[](2);
@@ -586,7 +604,7 @@ contract DiagSim is Test {
         uint256 idxIn, uint256 idxOut, uint256 outAmt,
         uint256 amp, uint256 fee, uint8 mode
     ) external pure returns (uint256[] memory) {
-        return simSwapGivenOut(bal, sf, idxIn, idxOut, outAmt, amp, fee, mode);
+        return _simSwapCore(bal, sf, idxIn, idxOut, outAmt, amp, fee, mode);
     }
 
     function testDiag_buggy() public {
@@ -719,7 +737,7 @@ contract DiagSim is Test {
     function ext_invUp(uint256[] memory bal, uint256[] memory sf, uint256 amp)
         external pure returns (uint256)
     {
-        return invUp(bal, sf, amp);
+        return _invUpCore(bal, sf, amp);
     }
 
     function _u(uint256 n) internal pure returns (string memory) {
@@ -809,7 +827,15 @@ contract DiagSim is Test {
         emit log_named_uint("    D", invUp(bal, sf, amp));
     }
 
-    function _copy(uint256[] memory a) internal pure returns (uint256[] memory b) {
+    /// @dev Thin wrapper: forward to the external (non-inlined) body so the copy's own
+    /// loop + two arrays never inline into loop callers (e.g. _stepTrace's per-cycle
+    /// loop), which overflows the stack under via-ir + optimizer. Returns a fresh array
+    /// exactly as the direct copy did, so behavior is identical.
+    function _copy(uint256[] memory a) internal view returns (uint256[] memory) {
+        return this.ext_copy(a);
+    }
+
+    function ext_copy(uint256[] memory a) external pure returns (uint256[] memory b) {
         b = new uint256[](a.length);
         for (uint256 i = 0; i < a.length; i++) b[i] = a[i];
     }
@@ -838,7 +864,16 @@ contract DiagSim is Test {
         _stepBCompareOne(sf, amp, fee, 170);
     }
 
+    /// @dev Thin wrapper: forward to the external (non-inlined) body so the heavy
+    /// Step-A/Step-B math + array alloc stay in ext_stepBCompareOne's own stack frame
+    /// and never inline into leakSize_sweep's for-loops (stack-too-deep under
+    /// via-ir + optimizer). Forge captures logs/reverts across the self external call,
+    /// so behavior is identical.
     function _stepBCompareOne(uint256[] memory sf, uint256 amp, uint256 fee, uint256 trickAmt) internal {
+        this.ext_stepBCompareOne(sf, amp, fee, trickAmt);
+    }
+
+    function ext_stepBCompareOne(uint256[] memory sf, uint256 amp, uint256 fee, uint256 trickAmt) external {
         // Run Step A from (67000, 67000) to (W_A, trickAmt + 1)
         uint256[] memory bal = new uint256[](2);
         bal[0] = 67000;
@@ -904,7 +939,25 @@ contract DiagSim is Test {
         }
     }
 
-    function _safeInv(uint256 amp, uint256 W, uint256 O) internal returns (bool, uint256) {
+    // Thin wrapper -> external (non-inlined) path; see the simSwapGivenOut wrapper note.
+    function _safeInv(uint256 amp, uint256 W, uint256 O) internal view returns (bool, uint256) {
+        return this.ext_safeInv(amp, W, O);
+    }
+
+    function ext_safeInv(uint256 amp, uint256 W, uint256 O) external view returns (bool, uint256) {
+        return _safeInvCore(amp, W, O);
+    }
+
+    /// @dev External (non-inlined) safe invariant from RAW balances: does the two mulDown
+    /// upscales off-frame so they don't inline into loop callers (stack-too-deep under
+    /// via-ir + optimizer). Behavior identical to _safeInv(amp, Wraw*sf, Oraw*sf).
+    function ext_safeInvUp(uint256 amp, uint256[] memory sf, uint256 Wraw, uint256 Oraw)
+        external view returns (bool, uint256)
+    {
+        return _safeInvCore(amp, Wraw.mulDown(sf[0]), Oraw.mulDown(sf[1]));
+    }
+
+    function _safeInvCore(uint256 amp, uint256 W, uint256 O) internal view returns (bool, uint256) {
         uint256[] memory up = new uint256[](2);
         up[0] = W; up[1] = O;
         try this.ext_inv(amp, up) returns (uint256 d) { return (true, d); }
@@ -946,7 +999,7 @@ contract DiagSim is Test {
 
             uint256 W_A = bal[0];
             uint256 O_A = bal[1];
-            (bool okPre, uint256 D_pre) = _safeInv(amp, W_A.mulDown(sf[0]), O_A.mulDown(sf[1]));
+            (bool okPre, uint256 D_pre) = this.ext_safeInvUp(amp, sf, W_A, O_A);
             emit log_named_uint("  Step A done: W_A", W_A);
             emit log_named_uint("  Step A done: O_A", O_A);
             if (okPre) emit log_named_uint("  Step A done: D_pre", D_pre);
@@ -967,7 +1020,7 @@ contract DiagSim is Test {
             uint256 gap = O_up_post_curve > O_up_post_vault
                 ? O_up_post_curve - O_up_post_vault : 0;
 
-            (bool okPost, uint256 D_post) = _safeInv(amp, W_post.mulDown(sf[0]), O_up_post_vault);
+            (bool okPost, uint256 D_post) = this.ext_safeInvUp(amp, sf, W_post, O_post);
             emit log_named_uint("  Step A: O_up_pre = floor(O_A*sf)", O_up_pre);
             emit log_named_uint("  Step B: req_up = mulDown(17,sf)", req_up);
             emit log_named_uint("  Step B: O_up_post (CURVE view)", O_up_post_curve);
@@ -1166,7 +1219,7 @@ contract DiagSim is Test {
             emit log_named_uint("  Step B: end W_raw", W_post);
             emit log_named_uint("  Step B: end O_raw (claim: 1)", O_post);
 
-            (bool ok, uint256 D_post) = _safeInv(amp, W_post.mulDown(sf[0]), O_post.mulDown(sf[1]));
+            (bool ok, uint256 D_post) = this.ext_safeInvUp(amp, sf, W_post, O_post);
             if (!ok) { emit log_string("  Step B: D measurement REVERT (Newton diverged)"); continue; }
 
             int256 dD = int256(D_post) - int256(D_pre);
@@ -1269,7 +1322,7 @@ contract DiagSim is Test {
 
             uint256 W_post = bal[0];
             uint256 O_post = bal[1];
-            (bool ok, uint256 D_post) = _safeInv(amp, W_post.mulDown(sf[0]), O_post.mulDown(sf[1]));
+            (bool ok, uint256 D_post) = this.ext_safeInvUp(amp, sf, W_post, O_post);
             int256 dD = ok ? int256(D_post) - int256(D_pre) : int256(0);
             emit log_named_uint(string(abi.encodePacked("  trickAmt=", _u(t), "  amountIn")), W_post - W_A);
             emit log_named_int(string(abi.encodePacked("  trickAmt=", _u(t), "  dD")), dD);
@@ -1306,59 +1359,72 @@ contract DiagSim is Test {
         uint256 trickAmt = 17;
 
         for (uint256 i = 0; i < O_target.length; i++) {
-            emit log_string("====================================================");
-            emit log_named_uint("CASE: O_target (Step A end O_raw)", O_target[i]);
+            _gapAtDifferentOCase(sf, amp, fee, trickAmt, O_target[i]);
+        }
+    }
 
-            // Step A: drain (67000 - O_target) osETH out
-            uint256[] memory bal = new uint256[](2);
-            bal[0] = 67000; bal[1] = 67000;
-            try this.ext_simSwap(bal, sf, 0, 1, 67000 - O_target[i], amp, fee, 0) returns (uint256[] memory nb) {
-                bal = nb;
-            } catch { emit log_string("  Step A REVERT"); continue; }
+    /// @dev One O_target case, extracted from testDiag_gapAtDifferentO's loop so the
+    /// ~20 per-case locals live in this helper's own stack frame rather than the loop
+    /// body, which overflowed the stack by exactly 1 slot under via-ir + optimizer.
+    /// Passing the scalar O_target_i drops the loop counter and the O_target array
+    /// pointer from the hot frame. Behavior identical: each case is independent
+    /// (Step A always restarts from bal = (67000, 67000)), so the loop's `continue`
+    /// becomes this helper's `return` (both skip straight to the next case).
+    function _gapAtDifferentOCase(
+        uint256[] memory sf, uint256 amp, uint256 fee, uint256 trickAmt, uint256 O_target_i
+    ) internal {
+        emit log_string("====================================================");
+        emit log_named_uint("CASE: O_target (Step A end O_raw)", O_target_i);
 
-            uint256 W_A = bal[0];
-            uint256 O_A = bal[1];
-            (bool okPre, uint256 D_pre) = _safeInv(amp, W_A.mulDown(sf[0]), O_A.mulDown(sf[1]));
-            emit log_named_uint("  after Step A: W_A", W_A);
-            emit log_named_uint("  after Step A: O_A (raw)", O_A);
-            if (okPre) emit log_named_uint("  after Step A: D_pre", D_pre);
+        // Step A: drain (67000 - O_target) osETH out
+        uint256[] memory bal = new uint256[](2);
+        bal[0] = 67000; bal[1] = 67000;
+        try this.ext_simSwap(bal, sf, 0, 1, 67000 - O_target_i, amp, fee, 0) returns (uint256[] memory nb) {
+            bal = nb;
+        } catch { emit log_string("  Step A REVERT"); return; }
 
-            // Curve internal view of Step B
-            uint256 O_up_pre = O_A.mulDown(sf[1]);
-            uint256 req_up = trickAmt.mulDown(sf[1]);
-            uint256 O_up_post_curve = O_up_pre - req_up;
-            emit log_named_uint("  Step B: O_up_pre = mulDown(O_A, sf)", O_up_pre);
-            emit log_named_uint("  Step B: O_up_post (CURVE view)", O_up_post_curve);
+        uint256 W_A = bal[0];
+        uint256 O_A = bal[1];
+        (bool okPre, uint256 D_pre) = this.ext_safeInvUp(amp, sf, W_A, O_A);
+        emit log_named_uint("  after Step A: W_A", W_A);
+        emit log_named_uint("  after Step A: O_A (raw)", O_A);
+        if (okPre) emit log_named_uint("  after Step A: D_pre", D_pre);
 
-            // Step B: take 17 osETH out
-            try this.ext_simSwap(bal, sf, 0, 1, trickAmt, amp, fee, 0) returns (uint256[] memory nb2) {
-                bal = nb2;
-            } catch { emit log_string("  Step B REVERT"); continue; }
+        // Curve internal view of Step B
+        uint256 O_up_pre = O_A.mulDown(sf[1]);
+        uint256 req_up = trickAmt.mulDown(sf[1]);
+        uint256 O_up_post_curve = O_up_pre - req_up;
+        emit log_named_uint("  Step B: O_up_pre = mulDown(O_A, sf)", O_up_pre);
+        emit log_named_uint("  Step B: O_up_post (CURVE view)", O_up_post_curve);
 
-            uint256 W_post = bal[0];
-            uint256 O_post = bal[1];
-            uint256 O_up_post_vault = O_post.mulDown(sf[1]);
-            uint256 gap = O_up_post_curve > O_up_post_vault
-                ? O_up_post_curve - O_up_post_vault : 0;
+        // Step B: take 17 osETH out
+        try this.ext_simSwap(bal, sf, 0, 1, trickAmt, amp, fee, 0) returns (uint256[] memory nb2) {
+            bal = nb2;
+        } catch { emit log_string("  Step B REVERT"); return; }
 
-            emit log_named_uint("  Step B: O_up_post (VAULT view)", O_up_post_vault);
-            emit log_named_uint("  Step B: integer gap (curve - vault)", gap);
-            emit log_named_uint("  Step B: O_post raw (ABSOLUTE)", O_post);
-            emit log_named_uint("  Step B: amountIn paid", W_post - W_A);
-            emit log_named_uint("  Step B: W_post", W_post);
+        uint256 W_post = bal[0];
+        uint256 O_post = bal[1];
+        uint256 O_up_post_vault = O_post.mulDown(sf[1]);
+        uint256 gap = O_up_post_curve > O_up_post_vault
+            ? O_up_post_curve - O_up_post_vault : 0;
 
-            (bool okPost, uint256 D_post) = _safeInv(amp, W_post.mulDown(sf[0]), O_up_post_vault);
-            if (okPre && okPost) {
-                int256 dD = int256(D_post) - int256(D_pre);
-                emit log_named_uint("  Step B: D_post", D_post);
-                emit log_named_int("  Step B: dD (NEG = pool loss)", dD);
-                // Geometric prediction at O_post: |dD| ~ D_pre / (3 * O_up_post_vault)
-                if (O_up_post_vault > 0) {
-                    emit log_named_uint("  geometric predict |dD/dO|@O_vault = D/(3*O)", D_pre / (3 * O_up_post_vault));
-                }
-            } else {
-                emit log_string("  Step B: D_post = N/A (Newton diverged)");
+        emit log_named_uint("  Step B: O_up_post (VAULT view)", O_up_post_vault);
+        emit log_named_uint("  Step B: integer gap (curve - vault)", gap);
+        emit log_named_uint("  Step B: O_post raw (ABSOLUTE)", O_post);
+        emit log_named_uint("  Step B: amountIn paid", W_post - W_A);
+        emit log_named_uint("  Step B: W_post", W_post);
+
+        (bool okPost, uint256 D_post) = this.ext_safeInvUp(amp, sf, W_post, O_post);
+        if (okPre && okPost) {
+            int256 dD = int256(D_post) - int256(D_pre);
+            emit log_named_uint("  Step B: D_post", D_post);
+            emit log_named_int("  Step B: dD (NEG = pool loss)", dD);
+            // Geometric prediction at O_post: |dD| ~ D_pre / (3 * O_up_post_vault)
+            if (O_up_post_vault > 0) {
+                emit log_named_uint("  geometric predict |dD/dO|@O_vault = D/(3*O)", D_pre / (3 * O_up_post_vault));
             }
+        } else {
+            emit log_string("  Step B: D_post = N/A (Newton diverged)");
         }
     }
 
@@ -2539,32 +2605,12 @@ contract DiagSim is Test {
         bal[1] = 67000;
 
         int256 cumDW;
+        PoolCfg memory cfg = PoolCfg(sf, amp, fee);
         console.log("r | inA | inB | inA+inB | ext | dW = (inA+inB)-ext | cum dW");
         for (uint256 r = 0; r < 30; r++) {
-            uint256 wBefore;
-
-            wBefore = bal[0];
-            bal = simSwapGivenOut(bal, sf, 0, 1, bal[1] - 17 - 1, amp, fee, 0);
-            uint256 inA = bal[0] - wBefore;
-
-            wBefore = bal[0];
-            bal = simSwapGivenOut(bal, sf, 0, 1, 17, amp, fee, 0);
-            uint256 inB = bal[0] - wBefore;
-
-            uint256 inAB = inA + inB;
-            uint256 extR = ext[r];
-            int256 dW = int256(inAB) - int256(extR);
-            cumDW += dW;
-
-            bal = simSwapGivenOut(bal, sf, 1, 0, extR, amp, fee, 0);
-
-            console.log("r=", r);
-            console.log("  inA      :", inA);
-            console.log("  inB      :", inB);
-            console.log("  inA+inB  :", inAB);
-            console.log("  ext      :", extR);
-            console.log("  dW       :", dW);
-            console.log("  cum dW   :", cumDW);
+            // Per-round work is factored into _perRoundStep so its locals occupy a separate
+            // stack frame; inlining them here overflowed the stack under via-ir + optimizer.
+            (bal, cumDW) = _perRoundStep(bal, cfg, ext[r], r, cumDW);
         }
 
         console.log("");
@@ -2573,5 +2619,35 @@ contract DiagSim is Test {
         console.log("67000 + cum dW   ==:", int256(67000) + cumDW);
         assertEq(bal[0], 889, "exit W must be 889");
         assertEq(cumDW, int256(-66111), "cumulative dW must equal -66,111");
+    }
+
+    struct PoolCfg { uint256[] sf; uint256 amp; uint256 fee; }
+
+    /// @dev One round of testDiag_perRoundDW, in its own stack frame (the inlined loop body
+    /// overflowed the stack under via-ir + optimizer). Behavior/logging is identical.
+    function _perRoundStep(uint256[] memory bal, PoolCfg memory cfg, uint256 extR, uint256 r, int256 cumDW)
+        internal returns (uint256[] memory, int256)
+    {
+        uint256 wBefore = bal[0];
+        bal = simSwapGivenOut(bal, cfg.sf, 0, 1, bal[1] - 17 - 1, cfg.amp, cfg.fee, 0);
+        uint256 inA = bal[0] - wBefore;
+
+        wBefore = bal[0];
+        bal = simSwapGivenOut(bal, cfg.sf, 0, 1, 17, cfg.amp, cfg.fee, 0);
+        uint256 inB = bal[0] - wBefore;
+
+        int256 dW = int256(inA + inB) - int256(extR);
+        cumDW += dW;
+
+        bal = simSwapGivenOut(bal, cfg.sf, 1, 0, extR, cfg.amp, cfg.fee, 0);
+
+        console.log("r=", r);
+        console.log("  inA      :", inA);
+        console.log("  inB      :", inB);
+        console.log("  inA+inB  :", inA + inB);
+        console.log("  ext      :", extR);
+        console.log("  dW       :", dW);
+        console.log("  cum dW   :", cumDW);
+        return (bal, cumDW);
     }
 }
