@@ -2771,6 +2771,7 @@ contract SearchParams is Test {
     function test_diag_liveProviderRate_overEpoch() public {
         console.log("=== osETH rate provider .getRate() over 12h (pure view, no state changes) ===");
         vm.createSelectFork("ETH", 23717396);
+        vm.warp(FORK_BLOCK_TS); // pin to block 23717396's real ts; createSelectFork's reset is racy under parallel runs (cf. _setupEpochOffset)
         uint256 baseTs = block.timestamp;
         for (uint256 mins = 0; mins <= 720; mins += 60) {
             vm.warp(baseTs + mins * 60);
@@ -2808,7 +2809,7 @@ contract SearchParams is Test {
     /// across epoch offsets).
     function test_diag_providerSideEffects_at6h() public {
         vm.createSelectFork("ETH", 23717396);
-        vm.warp(block.timestamp + 1800 * 12); // +6h
+        vm.warp(FORK_BLOCK_TS + 1800 * 12); // +6h from block 23717396's real ts (deterministic; createSelectFork reset is racy under parallel runs)
 
         IERC20[] memory tokens;
         (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
@@ -3042,6 +3043,7 @@ contract SearchParams is Test {
         console.log("=== Cached sf[1] over 12h, NO forced update ===");
         // Fork once and only warp; do NOT call updateTokenRateCache.
         vm.createSelectFork("ETH", 23717396);
+        vm.warp(FORK_BLOCK_TS); // pin to block 23717396's real ts; createSelectFork's reset is racy under parallel runs (cf. _setupEpochOffset)
         IERC20[] memory tokens;
         (tokens,,) = VAULT.getPoolTokens(OSETH_BPT.getPoolId());
         IERC20 osETH = tokens[2];
@@ -3425,6 +3427,22 @@ contract SearchParams is Test {
         blockNums[9]  = 23566200;  // -151200 (-3 weeks)
         blockNums[10] = 23501400;  // -216000 (-1 month)
 
+        // Real on-chain timestamp of each block above (eth_getBlockByNumber). createSelectFork
+        // does not reliably reset block.timestamp under forge's parallel test execution (it can
+        // retain setUp's warp), so each fork's ts is pinned explicitly below (cf. _setupEpochOffset).
+        uint256[11] memory blockTs;
+        blockTs[0]  = 1762155995;
+        blockTs[1]  = 1762153595;
+        blockTs[2]  = 1762129427;
+        blockTs[3]  = 1762069067;
+        blockTs[4]  = 1761982115;
+        blockTs[5]  = 1761895103;
+        blockTs[6]  = 1761720923;
+        blockTs[7]  = 1761546551;
+        blockTs[8]  = 1760936411;
+        blockTs[9]  = 1760327099;
+        blockTs[10] = 1759544531;
+
         uint256[11] memory remains;
         remains[0]  = 67000;
         remains[1]  = 67000;
@@ -3452,6 +3470,7 @@ contract SearchParams is Test {
         for (uint256 i = 0; i < 11; i++) {
             // 1. Real fork at this block
             vm.createSelectFork("ETH", blockNums[i]);
+            vm.warp(blockTs[i]); // pin to block's real ts (createSelectFork reset is racy under parallel runs)
             swapMath = new SwapMath();
             _refreshAtCurrentFork();
             uint256 baseTs = block.timestamp;
@@ -3844,6 +3863,7 @@ contract SearchParams is Test {
         // (overrides whatever setUp() warped to). _refreshAtCurrentFork() then updates
         // the rate cache and re-reads amp / sf / swapFee at this fresh state.
         vm.createSelectFork("ETH", BLOCK_NUM);
+        vm.warp(FORK_BLOCK_TS); // BLOCK_NUM == FORK_BLOCK; pin its real ts (createSelectFork reset is racy under parallel runs)
         swapMath = new SwapMath();
         _refreshAtCurrentFork();
 
@@ -3937,6 +3957,7 @@ contract SearchParams is Test {
         uint256 LIMIT     = 400;
 
         vm.createSelectFork("ETH", BLOCK_NUM);
+        vm.warp(FORK_BLOCK_TS); // BLOCK_NUM == FORK_BLOCK; pin its real ts (createSelectFork reset is racy under parallel runs)
         swapMath = new SwapMath();
         _refreshAtCurrentFork();
         uint256 baseTs = block.timestamp;
@@ -4052,6 +4073,7 @@ contract SearchParams is Test {
 
         // Single real fork
         vm.createSelectFork("ETH", BLOCK_NUM);
+        vm.warp(FORK_BLOCK_TS); // BLOCK_NUM == FORK_BLOCK; pin its real ts (createSelectFork reset is racy under parallel runs)
         swapMath = new SwapMath();
         _refreshAtCurrentFork();
         uint256 baseTs = block.timestamp;
