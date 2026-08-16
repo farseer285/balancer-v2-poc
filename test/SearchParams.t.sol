@@ -522,7 +522,7 @@ contract SearchParams is Test {
         uint256 hiR = vm.envOr("WSWEEP_HI", uint256(250000));
         uint256 stepR = vm.envOr("WSWEEP_STRIDE", uint256(1000));
         uint256 kMin = vm.envOr("KMIN", uint256(1));
-        uint256 kMax = vm.envOr("KMAX", uint256(100));
+        uint256 kMax = vm.envOr("KMAX", uint256(300));
         uint256 N = 30;
         uint256 delta = sf[1] - FixedPoint.ONE;
 
