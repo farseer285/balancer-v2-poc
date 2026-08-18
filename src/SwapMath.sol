@@ -181,6 +181,40 @@ contract SwapMath {
         return newBalances;
     }
 
+    /// @notice Like getAfterSwapOutBalances, but also returns the calculated token-in amount
+    /// (raw, swap-fee-included) = the Vault's `amountCalculated` for GIVEN_OUT, which it stores as
+    /// `previousAmountCalculated` and reuses when a later multihop step carries amount==0
+    /// (Balancer Vault Swaps.sol _swapWithPools).
+    function getAfterSwapOutBalancesWithIn(
+        uint256[] memory balances,
+        uint256[] memory scalingFactors,
+        uint256 indexIn,
+        uint256 indexOut,
+        uint256 swapOutAmount,
+        uint256 amp,
+        uint256 swapFeePercentage
+    ) external pure returns (uint256[] memory, uint256 rawAmountInWithFee) {
+        uint256 balancesIn = balances[indexIn];
+        uint256 balancesOut = balances[indexOut];
+
+        _upscaleArray(balances, scalingFactors);
+
+        uint256 swapOutAmountAfterScale = swapOutAmount * scalingFactors[indexOut] / FixedPoint.ONE;
+
+        uint256 invariant = StableMath._calculateInvariant(amp, balances);
+        uint256 amountIn =
+            StableMath._calcInGivenOut(amp, balances, indexIn, indexOut, swapOutAmountAfterScale, invariant);
+
+        uint256 rawAmountIn = _downscaleUp(amountIn, scalingFactors[indexIn]);
+        rawAmountInWithFee = rawAmountIn.divUp(swapFeePercentage.complement());
+
+        uint256[] memory newBalances = new uint256[](balances.length);
+        newBalances[indexIn] = balancesIn + rawAmountInWithFee;
+        newBalances[indexOut] = balancesOut - swapOutAmount;
+
+        return (newBalances, rawAmountInWithFee);
+    }
+
     /// @notice Like getAfterSwapOutBalances, but also returns the post-swap invariant
     /// computed from the upscaled post-swap balances (matching the contract's _afterSwapJoinExit).
     function getAfterSwapOutBalancesAndPostInvariant(
