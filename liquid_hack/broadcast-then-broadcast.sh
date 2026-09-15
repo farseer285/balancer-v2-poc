@@ -11,8 +11,12 @@
 #
 # RPC methods used (Bitcoin Core / Elements, per official reference):
 #   sendrawtransaction <hex> [maxfeerate]   -> broadcast, returns txid
+#   gettransaction     <txid> [watch] [v]   -> WALLET JSON: blockhash,
+#                                              confirmations (own/wallet tx only,
+#                                              no txindex needed) -- DEFAULT
 #   getrawtransaction  <txid> true [bhash]  -> verbose JSON: blockhash,
 #                                              confirmations, in_active_chain
+#                                              (needs -txindex=1 out of mempool)
 #   getblockcount / getblockhash / getblock -> block-scan fallback (no txindex)
 #
 # Usage:
@@ -25,7 +29,16 @@
 #   POLL_INTERVAL  seconds between polls     (default: 5)
 #   TIMEOUT        give up after N seconds   (default: 3600)
 #   MAXFEERATE     sendrawtransaction fee cap; "0" disables it (default: unset)
-#   CONFIRM_METHOD "getraw" (needs txindex=1) | "scan" (no txindex) (default: getraw)
+#   CONFIRM_METHOD "wallet" (wallet gettransaction, no txindex; DEFAULT)
+#                | "getraw" (needs txindex=1)
+#                | "scan"   (block scan, no txindex)
+#
+# NOTE on the default "wallet" method:
+#   gettransaction only knows transactions the wallet is aware of -- i.e. txs
+#   that spend from or pay to this wallet's own keys (the usual case when you
+#   broadcast your own crafted txs). It therefore needs a loaded wallet, so pass
+#   -rpcwallet=<name> in ELEMENTS_CLI when more than one wallet is loaded. It
+#   works WITHOUT -txindex. If your TX1 is NOT a wallet tx, use CONFIRM_METHOD=scan.
 
 set -euo pipefail
 
@@ -35,7 +48,7 @@ REQUIRED_CONF="${REQUIRED_CONF:-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
 TIMEOUT="${TIMEOUT:-3600}"
 MAXFEERATE="${MAXFEERATE:-}"
-CONFIRM_METHOD="${CONFIRM_METHOD:-getraw}"
+CONFIRM_METHOD="${CONFIRM_METHOD:-wallet}"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -57,6 +70,25 @@ broadcast() {
   else
     rpc sendrawtransaction "$hex"
   fi
+}
+
+# --- confirmation via wallet gettransaction (DEFAULT; needs NO -txindex) ---
+# Works for transactions the wallet knows about (its own). While the tx sits in
+# the mempool, gettransaction reports confirmations=0 and no blockhash. Once
+# mined it reports blockhash + confirmations>0; a reorg drops it back to 0 (or
+# negative if a conflicting tx confirmed), so REQUIRED_CONF gates false starts.
+# Echoes the blockhash when confirmed with >= REQUIRED_CONF; echoes nothing
+# while still pending.
+confirmed_wallet() {
+  local txid="$1" json bh conf
+  json=$(rpc gettransaction "$txid" 2>/dev/null) || { printf ''; return 0; }
+  bh=$(jq -r '.blockhash // empty' <<< "$json")
+  conf=$(jq -r '.confirmations // 0' <<< "$json")
+  [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
+  if (( conf >= REQUIRED_CONF )); then                 # negative == conflicted
+    printf '%s' "$bh"
+  fi
+  printf ''
 }
 
 # --- confirmation via getrawtransaction (needs -txindex=1 once tx leaves mempool) ---
@@ -108,11 +140,12 @@ wait_confirmed() {
   local txid="$1" start now bh
   start=$(date +%s)
   while :; do
-    if [[ "$CONFIRM_METHOD" == "scan" ]]; then
-      bh=$(confirmed_scan "$txid")
-    else
-      bh=$(confirmed_getraw "$txid")
-    fi
+    case "$CONFIRM_METHOD" in
+      wallet) bh=$(confirmed_wallet "$txid") ;;
+      getraw) bh=$(confirmed_getraw "$txid") ;;
+      scan)   bh=$(confirmed_scan   "$txid") ;;
+      *)      die "unknown CONFIRM_METHOD: $CONFIRM_METHOD (use wallet|getraw|scan)" ;;
+    esac
     [[ -n "$bh" ]] && { printf '%s' "$bh"; return 0; }
     now=$(date +%s)
     if (( now - start >= TIMEOUT )); then die "timeout after ${TIMEOUT}s waiting for $txid"; fi

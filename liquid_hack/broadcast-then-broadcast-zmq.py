@@ -12,11 +12,13 @@ polled.
 
 Node requirements (elements.conf / bitcoin.conf):
     zmqpubhashblock=tcp://127.0.0.1:28332
+    (default CONFIRM_METHOD=wallet also needs a loaded wallet; CONFIRM_METHOD=getraw
+     needs -txindex=1. CONFIRM_METHOD=scan needs neither.)
 
 ZMQ 'hashblock' message (per official doc): 3 parts
     [ b"hashblock", <32-byte block hash, reversed byte order = RPC hex>, <4-byte LE seq> ]
-We use the event only as a wake signal; the authoritative confirmation check is a
-RPC block scan from the broadcast height (no -txindex needed, reorg-aware).
+The event is used only as a wake signal; the authoritative confirmation check is an
+RPC query chosen by CONFIRM_METHOD (default: wallet gettransaction, no -txindex).
 
 Usage:
     ./broadcast-then-broadcast-zmq.py <TX1_hex_or_file> <TX2_hex_or_file>
@@ -28,6 +30,16 @@ Env overrides:
     TIMEOUT         give up after N seconds  (default: 3600)
     FALLBACK_POLL   safety re-scan interval  (default: 60 seconds)
     MAXFEERATE      sendrawtransaction cap; "0" disables it (default: unset)
+    CONFIRM_METHOD  "wallet" (wallet gettransaction, no txindex; DEFAULT)
+                  | "getraw" (needs txindex=1)
+                  | "scan"   (block scan, no txindex)
+
+NOTE on the default "wallet" method:
+    gettransaction only knows transactions the wallet is aware of -- i.e. txs that
+    spend from or pay to this wallet's own keys (the usual case when you broadcast
+    your own crafted txs). It needs a loaded wallet (pass -rpcwallet=<name> in
+    ELEMENTS_CLI when several are loaded) and works WITHOUT -txindex. If TX1 is NOT
+    a wallet tx, use CONFIRM_METHOD=scan.
 """
 import binascii
 import json
@@ -45,6 +57,7 @@ REQUIRED_CONF = int(os.environ.get("REQUIRED_CONF", "1"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "3600"))
 FALLBACK_POLL = int(os.environ.get("FALLBACK_POLL", "60"))
 MAXFEERATE = os.environ.get("MAXFEERATE", "")
+CONFIRM_METHOD = os.environ.get("CONFIRM_METHOD", "wallet")
 
 
 def log(msg):
@@ -81,8 +94,59 @@ def broadcast(hexstr):
     return rpc("sendrawtransaction", hexstr)
 
 
-class Confirmer:
-    """Scan blocks from the broadcast height for txid; reorg-aware, no txindex."""
+class WalletConfirmer:
+    """Confirm via wallet gettransaction (DEFAULT). Needs a loaded wallet, no
+    -txindex. Only sees transactions the wallet knows about (its own). While the
+    tx is in the mempool, gettransaction reports confirmations=0 and no blockhash;
+    once mined it reports blockhash + confirmations>0. A reorg drops it back to 0,
+    or negative if a conflicting tx confirmed, so REQUIRED_CONF gates false starts.
+    """
+
+    def __init__(self, txid, start_height):
+        self.txid = txid
+
+    def blockhash_if_confirmed(self):
+        try:
+            info = rpc_json("gettransaction", self.txid)
+        except RuntimeError:
+            return None                       # not (yet) a wallet tx / not found
+        bh = info.get("blockhash")
+        if not bh:
+            return None                       # still in mempool
+        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:   # negative = conflicted
+            return bh
+        return None
+
+
+class RawConfirmer:
+    """Confirm via getrawtransaction (needs -txindex=1 once the tx leaves the
+    mempool). Reorg-safe: re-queries within the found block for in_active_chain.
+    """
+
+    def __init__(self, txid, start_height):
+        self.txid = txid
+
+    def blockhash_if_confirmed(self):
+        try:
+            info = rpc_json("getrawtransaction", self.txid, "true")
+        except RuntimeError:
+            return None                       # still in mempool / no txindex / unknown
+        bh = info.get("blockhash")
+        if not bh:
+            return None                       # still in mempool
+        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:
+            try:
+                inblk = rpc_json("getrawtransaction", self.txid, "true", bh)
+            except RuntimeError:
+                return None
+            if inblk.get("in_active_chain", True):
+                return bh
+        return None
+
+
+class ScanConfirmer:
+    """Confirm by scanning blocks from the broadcast height for txid; reorg-aware,
+    needs NO -txindex and NO wallet. Works for any transaction."""
 
     def __init__(self, txid, start_height):
         self.txid = txid
@@ -118,9 +182,19 @@ class Confirmer:
         return None
 
 
+CONFIRMERS = {
+    "wallet": WalletConfirmer,
+    "getraw": RawConfirmer,
+    "scan": ScanConfirmer,
+}
+
+
 def main():
     if len(sys.argv) != 3:
         die(f"usage: {sys.argv[0]} <TX1_hex_or_file> <TX2_hex_or_file>")
+    confirmer_cls = CONFIRMERS.get(CONFIRM_METHOD)
+    if confirmer_cls is None:
+        die(f"unknown CONFIRM_METHOD: {CONFIRM_METHOD} (use wallet|getraw|scan)")
     tx1 = load_hex(sys.argv[1])
     tx2 = load_hex(sys.argv[2])
     if not tx1 or not tx2:
@@ -140,14 +214,15 @@ def main():
     txid1 = broadcast(tx1)
     log(f"[1/3] TX1 broadcast, txid={txid1}")
 
-    conf = Confirmer(txid1, start_height)
+    conf = confirmer_cls(txid1, start_height)
     blockhash = conf.blockhash_if_confirmed()   # immediate check (fast-mine race)
 
-    # 3) Event loop: wake on each new block, re-check via RPC scan.
+    # 3) Event loop: wake on each new block, re-check via the chosen RPC method.
     poller = zmq.Poller()
     poller.register(sock, zmq.POLLIN)
     deadline = time.time() + TIMEOUT
-    log(f"[2/3] waiting for >= {REQUIRED_CONF} confirmation(s) via ZMQ ...")
+    log(f"[2/3] waiting for >= {REQUIRED_CONF} confirmation(s) "
+        f"(method={CONFIRM_METHOD}, trigger=ZMQ) ...")
     while blockhash is None:
         remaining = deadline - time.time()
         if remaining <= 0:
