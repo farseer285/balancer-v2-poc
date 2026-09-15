@@ -33,6 +33,19 @@ Env overrides:
     CONFIRM_METHOD  "wallet" (wallet gettransaction, no txindex; DEFAULT)
                   | "getraw" (needs txindex=1)
                   | "scan"   (block scan, no txindex)
+    REORG_CHECK     reorg re-verification: 0 = off (DEFAULT), 1 = on
+                    Set 1 only if sending TX2 requires TX1 to be FINAL on the active
+                    chain (e.g. TX2 spends a TX1 output). DEFAULT is OFF: the range-proof
+                    cache-key-collision exploit this repo targets does NOT need it. TX1
+                    (the primer) plants a genuine, VALID rangeproof result in the signers'
+                    in-memory verification cache; TX2 (the exploit) reuses that entry via
+                    a cache-key collision (forged variable-length fields concatenated
+                    without length prefixes hash to the same key). That entry is written
+                    at validation time in a process-static CuckooCache that a chain reorg
+                    does NOT evict (the disconnect path never touches the cache). So a
+                    reorg of TX1's block does not remove the planted entry and TX2 stays
+                    valid; gating on "TX1 still on the active chain" would only needlessly
+                    withhold a still-viable TX2.
 
 NOTE on the default "wallet" method:
     gettransaction only knows transactions the wallet is aware of -- i.e. txs that
@@ -58,6 +71,7 @@ TIMEOUT = int(os.environ.get("TIMEOUT", "3600"))
 FALLBACK_POLL = int(os.environ.get("FALLBACK_POLL", "60"))
 MAXFEERATE = os.environ.get("MAXFEERATE", "")
 CONFIRM_METHOD = os.environ.get("CONFIRM_METHOD", "wallet")
+REORG_CHECK = os.environ.get("REORG_CHECK", "0") == "1"   # off by default; see header note
 
 
 def log(msg):
@@ -120,7 +134,8 @@ class WalletConfirmer:
 
 class RawConfirmer:
     """Confirm via getrawtransaction (needs -txindex=1 once the tx leaves the
-    mempool). Reorg-safe: re-queries within the found block for in_active_chain.
+    mempool). With REORG_CHECK=1, re-queries within the found block for
+    in_active_chain; off by default (see the REORG_CHECK note in the header).
     """
 
     def __init__(self, txid, start_height):
@@ -135,6 +150,11 @@ class RawConfirmer:
         if not bh:
             return None                       # still in mempool
         if int(info.get("confirmations", 0)) >= REQUIRED_CONF:
+            if not REORG_CHECK:
+                # default: confirmed to depth is enough; do not re-verify the block is
+                # still on the active chain -- not needed for the cache-key-collision exploit.
+                return bh
+            # reorg-safety (opt-in): re-query within the found block for in_active_chain.
             try:
                 inblk = rpc_json("getrawtransaction", self.txid, "true", bh)
             except RuntimeError:
@@ -145,8 +165,9 @@ class RawConfirmer:
 
 
 class ScanConfirmer:
-    """Confirm by scanning blocks from the broadcast height for txid; reorg-aware,
-    needs NO -txindex and NO wallet. Works for any transaction."""
+    """Confirm by scanning blocks from the broadcast height for txid; needs NO
+    -txindex and NO wallet. Works for any transaction. Reorg re-check is opt-in
+    via REORG_CHECK=1 (off by default; see the REORG_CHECK note in the header)."""
 
     def __init__(self, txid, start_height):
         self.txid = txid
@@ -166,17 +187,18 @@ class ScanConfirmer:
                     break
                 self.scan_from += 1
         if self.found_hash is not None:
-            # reorg check: is our block still the one at that height?
-            cur = None
-            try:
-                cur = rpc("getblockhash", self.found_height)
-            except RuntimeError:
-                pass
-            if cur != self.found_hash:
-                self.scan_from = self.found_height
-                self.found_hash = None
-                self.found_height = 0
-                return None
+            if REORG_CHECK:
+                # reorg-safety (opt-in): is our block still the one at that height?
+                cur = None
+                try:
+                    cur = rpc("getblockhash", self.found_height)
+                except RuntimeError:
+                    pass
+                if cur != self.found_hash:
+                    self.scan_from = self.found_height
+                    self.found_hash = None
+                    self.found_height = 0
+                    return None
             if tip - self.found_height + 1 >= REQUIRED_CONF:
                 return self.found_hash
         return None
