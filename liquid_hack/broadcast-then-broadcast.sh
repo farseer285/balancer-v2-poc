@@ -102,7 +102,10 @@ confirmed_getraw() {
   [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
   if (( conf >= REQUIRED_CONF )); then
     # reorg-safety: re-query inside that specific block for in_active_chain
-    active=$(rpc getrawtransaction "$txid" true "$bh" 2>/dev/null | jq -r '.in_active_chain // true')
+    # NB: jq's `// true` would also swallow an explicit `false`; default ONLY when the
+    # field is absent (reorg re-check must honor in_active_chain==false).
+    active=$(rpc getrawtransaction "$txid" true "$bh" 2>/dev/null \
+             | jq -r 'if has("in_active_chain") then .in_active_chain else true end')
     [[ "$active" == "true" ]] && printf '%s' "$bh"
   fi
   printf ''
@@ -113,7 +116,11 @@ confirmed_getraw() {
 _scan_from=""; _found_hash=""; _found_height=0
 confirmed_scan() {
   local txid="$1" tip bh cur conf
-  [[ -z "$_scan_from" ]] && _scan_from=$(( $(rpc getblockcount) + 1 ))
+  # _scan_from MUST be seeded by main() with the tip captured BEFORE broadcast.
+  # Refuse rather than seed it here: a post-broadcast seed would silently
+  # reintroduce the fast-mine race (a block mined before the first poll would be
+  # skipped). An empty value means confirmed_scan was called outside main()'s flow.
+  [[ -n "$_scan_from" ]] || die "confirmed_scan: _scan_from not seeded (call via main with CONFIRM_METHOD=scan)"
   tip=$(rpc getblockcount)
   if [[ -z "$_found_hash" ]]; then
     while (( _scan_from <= tip )); do
@@ -161,6 +168,11 @@ main() {
   local tx1 tx2 txid1 blockhash txid2
   tx1=$(load_hex "$1"); tx2=$(load_hex "$2")
   [[ -n "$tx1" && -n "$tx2" ]] || die "empty transaction hex"
+
+  # For the scan method, remember the tip BEFORE broadcasting so the block that
+  # includes TX1 can never fall below the scan start (fast-mine race; mirrors the
+  # ZMQ script capturing start_height pre-broadcast).
+  [[ "$CONFIRM_METHOD" == scan ]] && _scan_from=$(( $(rpc getblockcount) + 1 ))
 
   log "[1/3] broadcasting TX1 ..."
   txid1=$(broadcast "$tx1")
