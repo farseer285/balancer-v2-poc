@@ -67,6 +67,14 @@ MAXFEERATE="${MAXFEERATE:-}"
 CONFIRM_METHOD="${CONFIRM_METHOD:-wallet}"
 REORG_CHECK="${REORG_CHECK:-0}"          # 0 = off (default; see header note), 1 = on
 
+# Result channel for the confirmed_* pollers. They MUST be called as PLAIN commands
+# (not `bh=$(confirmed_scan ...)`), otherwise they run in a command-substitution
+# subshell and their writes to the scan state (_scan_from/_found_hash/_found_height)
+# are discarded every poll -- silently defeating the memoization. So instead of
+# echoing the blockhash on stdout, each poller deposits it here (empty = not yet
+# confirmed) and returns 0, and wait_confirmed reads it after the call.
+_conf_result=""
+
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -103,14 +111,13 @@ broadcast() {
 # active-chain based), so REQUIRED_CONF=2 alone suffices; no extra reorg check needed.
 confirmed_wallet() {
   local txid="$1" json bh conf
-  json=$(rpc gettransaction "$txid" 2>/dev/null) || { printf ''; return 0; }
+  _conf_result=""                                      # result via global; see note above
+  json=$(rpc gettransaction "$txid" 2>/dev/null) || return 0
   bh=$(jq -r '.blockhash // empty' <<< "$json")
   conf=$(jq -r '.confirmations // 0' <<< "$json")
-  [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
-  if (( conf >= REQUIRED_CONF )); then                 # negative == conflicted
-    printf '%s' "$bh"
-  fi
-  printf ''
+  [[ -z "$bh" ]] && return 0                            # still in mempool
+  (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # negative == conflicted -> stays empty
+  return 0
 }
 
 # --- confirmation via getrawtransaction (needs -txindex=1 once tx leaves mempool) ---
@@ -124,12 +131,13 @@ confirmed_wallet() {
 # Echoes the blockhash when confirmed with >= REQUIRED_CONF; nothing while still pending.
 confirmed_getraw() {
   local txid="$1" json bh conf
-  json=$(rpc getrawtransaction "$txid" true 2>/dev/null) || { printf ''; return 0; }
+  _conf_result=""                                      # result via global; see note above
+  json=$(rpc getrawtransaction "$txid" true 2>/dev/null) || return 0
   bh=$(jq -r '.blockhash // empty' <<< "$json")
   conf=$(jq -r '.confirmations // 0' <<< "$json")
-  [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
-  (( conf >= REQUIRED_CONF )) && printf '%s' "$bh"     # active-chain depth; no re-check
-  printf ''
+  [[ -z "$bh" ]] && return 0                            # still in mempool
+  (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # active-chain depth; no re-check
+  return 0
 }
 
 # --- confirmation via block scanning (works WITHOUT txindex) ---
@@ -143,20 +151,38 @@ confirmed_getraw() {
 # chain) AND REQUIRED_CONF=2 (finality depth) on Liquid.
 _scan_from=""; _found_hash=""; _found_height=0
 confirmed_scan() {
-  local txid="$1" tip bh cur conf
+  local txid="$1" tip bh blk cur conf rc
+  # Result via the _conf_result global (see note near its declaration). This memoizes
+  # the found block ACROSS polls, so it MUST be called as a plain command, never as
+  # `$(confirmed_scan ...)` -- a command-substitution subshell would discard every
+  # write to _scan_from/_found_hash/_found_height and re-scan from the seed each poll.
+  _conf_result=""
   # _scan_from MUST be seeded by main() with the tip captured BEFORE broadcast.
   # Refuse rather than seed it here: a post-broadcast seed would silently
   # reintroduce the fast-mine race (a block mined before the first poll would be
   # skipped). An empty value means confirmed_scan was called outside main()'s flow.
   [[ -n "$_scan_from" ]] || die "confirmed_scan: _scan_from not seeded (call via main with CONFIRM_METHOD=scan)"
-  tip=$(rpc getblockcount)
+  tip=$(rpc getblockcount) || return 0   # transient RPC error -> retry next poll
   if [[ -z "$_found_hash" ]]; then
     while (( _scan_from <= tip )); do
-      bh=$(rpc getblockhash "$_scan_from")
-      if rpc getblock "$bh" 1 | jq -e --arg t "$txid" 'any(.tx[]; . == $t)' >/dev/null 2>&1; then
-        _found_hash="$bh"; _found_height="$_scan_from"; break
-      fi
-      _scan_from=$(( _scan_from + 1 ))
+      # A transient RPC failure must NOT be mistaken for "tx not in this block": that
+      # would advance _scan_from past the block, and since _scan_from never rewinds the
+      # tx could then never be found -> false TIMEOUT. So on ANY getblockhash/getblock
+      # failure, abandon THIS poll (retry next) WITHOUT advancing _scan_from.
+      bh=$(rpc getblockhash "$_scan_from") || return 0
+      blk=$(rpc getblock "$bh" 1)          || return 0
+      # blk is now known-valid JSON, so jq's OWN exit code cleanly separates the cases
+      # (a bare `jq -e` returning 1 would trip set -e, so it is guarded by `|| rc=$?`):
+      #   0    = tx present in this block   -> found
+      #   1    = tx absent from this block  -> advance to the next height
+      #   >=2  = jq itself errored (not expected on valid JSON) -> retry, do NOT skip
+      rc=0
+      jq -e --arg t "$txid" 'any(.tx[]; . == $t)' >/dev/null 2>&1 <<< "$blk" || rc=$?
+      case $rc in
+        0) _found_hash="$bh"; _found_height="$_scan_from"; break ;;
+        1) _scan_from=$(( _scan_from + 1 )) ;;
+        *) return 0 ;;
+      esac
     done
   fi
   if [[ -n "$_found_hash" ]]; then
@@ -166,26 +192,29 @@ confirmed_scan() {
       cur=$(rpc getblockhash "$_found_height" 2>/dev/null || echo "")
       if [[ "$cur" != "$_found_hash" ]]; then
         _scan_from="$_found_height"; _found_hash=""; _found_height=0
-        printf ''; return 0
+        return 0
       fi
     fi
     conf=$(( tip - _found_height + 1 ))
-    (( conf >= REQUIRED_CONF )) && printf '%s' "$_found_hash"
+    (( conf >= REQUIRED_CONF )) && _conf_result="$_found_hash"
   fi
-  printf ''
+  return 0
 }
 
 wait_confirmed() {
-  local txid="$1" start now bh
+  local txid="$1" start now
   start=$(date +%s)
   while :; do
+    # Call the poller as a PLAIN command (NOT `bh=$(confirmed_* ...)`): a command-
+    # substitution subshell would drop confirmed_scan's cross-poll state each iteration.
+    # The result comes back in the _conf_result global instead (empty = not yet).
     case "$CONFIRM_METHOD" in
-      wallet) bh=$(confirmed_wallet "$txid") ;;
-      getraw) bh=$(confirmed_getraw "$txid") ;;
-      scan)   bh=$(confirmed_scan   "$txid") ;;
+      wallet) confirmed_wallet "$txid" ;;
+      getraw) confirmed_getraw "$txid" ;;
+      scan)   confirmed_scan   "$txid" ;;
       *)      die "unknown CONFIRM_METHOD: $CONFIRM_METHOD (use wallet|getraw|scan)" ;;
     esac
-    [[ -n "$bh" ]] && { printf '%s' "$bh"; return 0; }
+    [[ -n "$_conf_result" ]] && { printf '%s' "$_conf_result"; return 0; }
     now=$(date +%s)
     if (( now - start >= TIMEOUT )); then die "timeout after ${TIMEOUT}s waiting for $txid"; fi
     sleep "$POLL_INTERVAL"
