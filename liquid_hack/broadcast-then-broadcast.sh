@@ -33,9 +33,10 @@
 #                | "getraw" (needs txindex=1)
 #                | "scan"   (block scan, no txindex)
 #   REORG_CHECK    reorg re-verification: 0 = off (DEFAULT), 1 = on
-#                  Set 1 only if sending TX2 requires TX1 to be FINAL on the active
-#                  chain (e.g. TX2 spends a TX1 output): getraw then re-checks
-#                  in_active_chain, scan re-checks its found block is still at height.
+#                  Applies to the SCAN method only (getraw's redundant in_active_chain
+#                  re-check has been removed; wallet and getraw are inherently active-
+#                  chain-fresh). Set 1 only if sending TX2 requires TX1 to be FINAL and
+#                  you use scan: it then re-verifies its found block is still at height.
 #                  DEFAULT is OFF: the range-proof cache-key-collision exploit this
 #                  repo targets does NOT need it. TX1 (the primer) plants a genuine,
 #                  VALID rangeproof result in the signers' in-memory verification cache;
@@ -95,6 +96,11 @@ broadcast() {
 # negative if a conflicting tx confirmed), so REQUIRED_CONF gates false starts.
 # Echoes the blockhash when confirmed with >= REQUIRED_CONF; echoes nothing
 # while still pending.
+# Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed by
+# any check. To make it HARMLESS when TX2 depends on TX1 finality, wait for finality
+# depth -- on Liquid (reorgs <= 1 block) set REQUIRED_CONF=2, so TX1 has a child block
+# and is final before TX2 is sent. gettransaction is read fresh each poll (already
+# active-chain based), so REQUIRED_CONF=2 alone suffices; no extra reorg check needed.
 confirmed_wallet() {
   local txid="$1" json bh conf
   json=$(rpc gettransaction "$txid" 2>/dev/null) || { printf ''; return 0; }
@@ -108,33 +114,33 @@ confirmed_wallet() {
 }
 
 # --- confirmation via getrawtransaction (needs -txindex=1 once tx leaves mempool) ---
-# Echoes the blockhash when confirmed with >= REQUIRED_CONF on the active chain;
-# echoes nothing while still pending.
+# Re-queried fresh each poll; getrawtransaction's `confirmations` counts ACTIVE-CHAIN
+# depth (txindex is synced to the current chain first, and a stale block reports 0), so
+# `conf >= REQUIRED_CONF` already means "REQUIRED_CONF-deep on the active chain." An
+# in_active_chain re-query would therefore be REDUNDANT, so it is intentionally omitted.
+# Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed by
+# any check. To make it HARMLESS when TX2 depends on TX1 finality, set REQUIRED_CONF=2
+# on Liquid (reorgs <= 1 block) so TX1 has a child block and is final before TX2 is sent.
+# Echoes the blockhash when confirmed with >= REQUIRED_CONF; nothing while still pending.
 confirmed_getraw() {
-  local txid="$1" json bh conf active
+  local txid="$1" json bh conf
   json=$(rpc getrawtransaction "$txid" true 2>/dev/null) || { printf ''; return 0; }
   bh=$(jq -r '.blockhash // empty' <<< "$json")
   conf=$(jq -r '.confirmations // 0' <<< "$json")
   [[ -z "$bh" ]] && { printf ''; return 0; }          # still in mempool
-  if (( conf >= REQUIRED_CONF )); then
-    if [[ "$REORG_CHECK" == 1 ]]; then
-      # reorg-safety (opt-in; see REORG_CHECK note in header): re-query inside that
-      # specific block for in_active_chain. NB: jq's `// true` would also swallow an
-      # explicit `false`; default ONLY when the field is absent (must honor false).
-      active=$(rpc getrawtransaction "$txid" true "$bh" 2>/dev/null \
-               | jq -r 'if has("in_active_chain") then .in_active_chain else true end')
-      [[ "$active" == "true" ]] && printf '%s' "$bh"
-    else
-      # REORG_CHECK=0 (default): confirmed to depth is enough; do not re-verify the block
-      # is still on the active chain -- not needed for the cache-key-collision exploit.
-      printf '%s' "$bh"
-    fi
-  fi
+  (( conf >= REQUIRED_CONF )) && printf '%s' "$bh"     # active-chain depth; no re-check
   printf ''
 }
 
 # --- confirmation via block scanning (works WITHOUT txindex) ---
-# Remembers the block the tx landed in and waits for depth; handles reorg.
+# Remembers the block the tx landed in and waits for depth. Unlike wallet/getraw, scan
+# counts depth from the REMEMBERED _found_height, so it must re-verify _found_hash is
+# still the block at that height (REORG_CHECK=1) -- otherwise depth could be counted
+# against an orphaned block. That re-check is NOT redundant here (it is for getraw), so
+# it is kept, gated by REORG_CHECK (default off; the cache-collision exploit doesn't
+# need it). Gap note: to make the confirm -> TX2-broadcast window HARMLESS when TX2
+# depends on TX1 finality, use BOTH REORG_CHECK=1 (keeps the depth count on the active
+# chain) AND REQUIRED_CONF=2 (finality depth) on Liquid.
 _scan_from=""; _found_hash=""; _found_height=0
 confirmed_scan() {
   local txid="$1" tip bh cur conf

@@ -34,8 +34,10 @@ Env overrides:
                   | "getraw" (needs txindex=1)
                   | "scan"   (block scan, no txindex)
     REORG_CHECK     reorg re-verification: 0 = off (DEFAULT), 1 = on
-                    Set 1 only if sending TX2 requires TX1 to be FINAL on the active
-                    chain (e.g. TX2 spends a TX1 output). DEFAULT is OFF: the range-proof
+                    Applies to the SCAN method only (getraw's redundant in_active_chain
+                    re-check has been removed; wallet and getraw are inherently active-
+                    chain-fresh). Set 1 only if sending TX2 requires TX1 to be FINAL and
+                    you use scan. DEFAULT is OFF: the range-proof
                     cache-key-collision exploit this repo targets does NOT need it. TX1
                     (the primer) plants a genuine, VALID rangeproof result in the signers'
                     in-memory verification cache; TX2 (the exploit) reuses that entry via
@@ -114,6 +116,12 @@ class WalletConfirmer:
     tx is in the mempool, gettransaction reports confirmations=0 and no blockhash;
     once mined it reports blockhash + confirmations>0. A reorg drops it back to 0,
     or negative if a conflicting tx confirmed, so REQUIRED_CONF gates false starts.
+
+    Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed
+    by any check. To make it HARMLESS when TX2 depends on TX1 finality, wait for
+    finality depth -- on Liquid (reorgs <= 1 block) set REQUIRED_CONF=2, so TX1 has a
+    child block and is final before TX2 is sent. gettransaction is read fresh each poll
+    (already active-chain based), so REQUIRED_CONF=2 alone suffices; no extra check.
     """
 
     def __init__(self, txid, start_height):
@@ -134,8 +142,14 @@ class WalletConfirmer:
 
 class RawConfirmer:
     """Confirm via getrawtransaction (needs -txindex=1 once the tx leaves the
-    mempool). With REORG_CHECK=1, re-queries within the found block for
-    in_active_chain; off by default (see the REORG_CHECK note in the header).
+    mempool). Re-queried fresh each poll; getrawtransaction's confirmations count
+    ACTIVE-CHAIN depth (txindex is synced first; a stale block reports 0), so
+    conf >= REQUIRED_CONF already means "REQUIRED_CONF-deep on the active chain." An
+    in_active_chain re-query would be REDUNDANT, so it is omitted.
+
+    Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed
+    by any check. To make it HARMLESS when TX2 depends on TX1 finality, set
+    REQUIRED_CONF=2 on Liquid (reorgs <= 1 block) so TX1 is final before TX2 is sent.
     """
 
     def __init__(self, txid, start_height):
@@ -149,25 +163,23 @@ class RawConfirmer:
         bh = info.get("blockhash")
         if not bh:
             return None                       # still in mempool
-        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:
-            if not REORG_CHECK:
-                # default: confirmed to depth is enough; do not re-verify the block is
-                # still on the active chain -- not needed for the cache-key-collision exploit.
-                return bh
-            # reorg-safety (opt-in): re-query within the found block for in_active_chain.
-            try:
-                inblk = rpc_json("getrawtransaction", self.txid, "true", bh)
-            except RuntimeError:
-                return None
-            if inblk.get("in_active_chain", True):
-                return bh
+        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:   # active-chain depth
+            return bh
         return None
 
 
 class ScanConfirmer:
     """Confirm by scanning blocks from the broadcast height for txid; needs NO
-    -txindex and NO wallet. Works for any transaction. Reorg re-check is opt-in
-    via REORG_CHECK=1 (off by default; see the REORG_CHECK note in the header)."""
+    -txindex and NO wallet. Works for any transaction. Unlike wallet/getraw, scan
+    counts depth from the REMEMBERED found_height, so it must re-verify found_hash is
+    still the block at that height (REORG_CHECK=1) -- otherwise depth could be counted
+    against an orphaned block. That re-check is NOT redundant here (it is for getraw),
+    so it is kept, gated by REORG_CHECK (off by default; the cache-collision exploit
+    does not need it).
+
+    Gap note: to make the confirm -> TX2-broadcast window HARMLESS when TX2 depends on
+    TX1 finality, use BOTH REORG_CHECK=1 (keeps the depth count on the active chain)
+    AND REQUIRED_CONF=2 (finality depth) on Liquid."""
 
     def __init__(self, txid, start_height):
         self.txid = txid
