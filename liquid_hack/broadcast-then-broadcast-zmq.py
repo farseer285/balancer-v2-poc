@@ -89,7 +89,10 @@ def rpc(*args):
     r = subprocess.run(CLI + [str(a) for a in args],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"rpc failed: {' '.join(args)}")
+        # args may contain non-str (e.g. an int height); stringify before joining
+        # so the error message itself can't raise TypeError and mask the real failure.
+        raise RuntimeError(r.stderr.strip()
+                           or f"rpc failed: {' '.join(str(a) for a in args)}")
     return r.stdout.strip()
 
 
@@ -188,16 +191,24 @@ class ScanConfirmer:
         self.found_height = 0
 
     def blockhash_if_confirmed(self):
-        tip = int(rpc("getblockcount"))
-        if self.found_hash is None:
-            while self.scan_from <= tip:
-                bh = rpc("getblockhash", self.scan_from)
-                block = rpc_json("getblock", bh, "1")
-                if self.txid in block.get("tx", []):
-                    self.found_hash = bh
-                    self.found_height = self.scan_from
-                    break
-                self.scan_from += 1
+        # A transient RPC failure must NOT be mistaken for "tx not in this block":
+        # raising out of the loop leaves scan_from unadvanced (it never rewinds), so
+        # the block is retried on the next tick rather than skipped -> the tx could
+        # otherwise never be found and cause a false TIMEOUT. Mirrors the bash
+        # confirmed_scan `|| return 0` hardening; the ZMQ FALLBACK_POLL re-check retries.
+        try:
+            tip = int(rpc("getblockcount"))
+            if self.found_hash is None:
+                while self.scan_from <= tip:
+                    bh = rpc("getblockhash", self.scan_from)
+                    block = rpc_json("getblock", bh, "1")
+                    if self.txid in block.get("tx", []):
+                        self.found_hash = bh
+                        self.found_height = self.scan_from
+                        break
+                    self.scan_from += 1
+        except RuntimeError:
+            return None                       # transient RPC error -> retry next tick
         if self.found_hash is not None:
             if REORG_CHECK:
                 # reorg-safety (opt-in): is our block still the one at that height?
@@ -264,10 +275,16 @@ def main():
         wait_ms = int(min(remaining, FALLBACK_POLL) * 1000)
         events = dict(poller.poll(timeout=wait_ms))
         if sock in events:
-            topic, body, seq = sock.recv_multipart()
-            newhash = binascii.hexlify(body).decode()   # = RPC block hash
-            seqno = int.from_bytes(seq, "little")
-            log(f"      block event #{seqno}: {newhash}")
+            # A 'hashblock' message is 3 parts [topic, hash, seq]; tolerate anything
+            # off-spec rather than crashing on a tuple-unpack. The RPC re-check below
+            # is authoritative either way -- the event is only a wake signal.
+            parts = sock.recv_multipart()
+            if len(parts) >= 2:
+                newhash = binascii.hexlify(parts[1]).decode()   # = RPC block hash
+                seqno = int.from_bytes(parts[2], "little") if len(parts) >= 3 else -1
+                log(f"      block event #{seqno}: {newhash}")
+            else:
+                log(f"      block event (unexpected {len(parts)}-part message)")
         # Authoritative re-check regardless of ZMQ payload (also the fallback path).
         blockhash = conf.blockhash_if_confirmed()
 
