@@ -25,9 +25,15 @@
 # Common env overrides:
 #   ELEMENTS_CLI   full cli invocation      (default: "elements-cli")
 #                  e.g. ELEMENTS_CLI="elements-cli -chain=liquidv1 -rpcwallet=w"
+#                  Split on whitespace, so it CANNOT carry an argument whose VALUE
+#                  contains spaces (e.g. -rpcpassword="a b"); for those use a cookie
+#                  file, elements.conf, or a small wrapper script named here instead.
 #   REQUIRED_CONF  confirmations to wait for (default: 1)
 #   POLL_INTERVAL  seconds between polls     (default: 5)
-#   TIMEOUT        give up after N seconds   (default: 3600)
+#   TIMEOUT        give up after N seconds   (default: 900)
+#                  ~ (REQUIRED_CONF + a few blocks) x block interval; Liquid is
+#                  ~60s/block so 900s ~= 15 blocks. Raise for slower chains (e.g.
+#                  Bitcoin ~600s/block) or a large REQUIRED_CONF.
 #   MAXFEERATE     sendrawtransaction fee cap; "0" disables it (default: unset)
 #   CONFIRM_METHOD "wallet" (wallet gettransaction, no txindex; DEFAULT)
 #                | "getraw" (needs txindex=1)
@@ -62,10 +68,26 @@ set -euo pipefail
 read -ra CLI <<< "${ELEMENTS_CLI:-elements-cli}"
 REQUIRED_CONF="${REQUIRED_CONF:-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
-TIMEOUT="${TIMEOUT:-3600}"
+TIMEOUT="${TIMEOUT:-900}"
 MAXFEERATE="${MAXFEERATE:-}"
 CONFIRM_METHOD="${CONFIRM_METHOD:-wallet}"
 REORG_CHECK="${REORG_CHECK:-0}"          # 0 = off (default; see header note), 1 = on
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# ----- validate config: fail fast with a clear message instead of a silent
+# misbehaviour later. A non-numeric REQUIRED_CONF/TIMEOUT is read as 0 by the
+# arithmetic (confirming at 0 depth, or "timing out" on the first check); an empty
+# ELEMENTS_CLI trips `set -u` on ${CLI[0]}; an unknown CONFIRM_METHOD would only
+# surface deep inside the poll loop. -----
+[[ ${#CLI[@]} -ge 1 ]] || die "ELEMENTS_CLI is empty"
+[[ "$REQUIRED_CONF" =~ ^[1-9][0-9]*$ ]] || die "REQUIRED_CONF must be a positive integer (got: '$REQUIRED_CONF')"
+[[ "$TIMEOUT"       =~ ^[1-9][0-9]*$ ]] || die "TIMEOUT must be a positive integer seconds (got: '$TIMEOUT')"
+[[ "$POLL_INTERVAL" =~ ^[0-9]+(\.[0-9]+)?$ && "$POLL_INTERVAL" != 0 && "$POLL_INTERVAL" != 0.0 ]] \
+  || die "POLL_INTERVAL must be a positive number of seconds (got: '$POLL_INTERVAL')"
+case "$CONFIRM_METHOD" in wallet|getraw|scan) ;; *) die "unknown CONFIRM_METHOD: '$CONFIRM_METHOD' (use wallet|getraw|scan)" ;; esac
+case "$REORG_CHECK"    in 0|1) ;;               *) die "REORG_CHECK must be 0 or 1 (got: '$REORG_CHECK')" ;; esac
 
 # Result channel for the confirmed_* pollers. They MUST be called as PLAIN commands
 # (not `bh=$(confirmed_scan ...)`), otherwise they run in a command-substitution
@@ -75,10 +97,22 @@ REORG_CHECK="${REORG_CHECK:-0}"          # 0 = off (default; see header note), 1
 # confirmed) and returns 0, and wait_confirmed reads it after the call.
 _conf_result=""
 
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-
 rpc() { "${CLI[@]}" "$@"; }
+
+# A confirmation query that FAILS is normally just "not confirmed yet", so the pollers
+# treat failure as "keep waiting". But a PERMANENT failure (wrong/absent -rpcwallet,
+# getraw without -txindex once the tx leaves the mempool, an auth/chain misconfig)
+# looks identical and would otherwise burn the whole TIMEOUT in silence. Surface the
+# node's error text once (and again only if it changes) so the cause is visible while
+# we keep retrying. State lives in a global so it dedups across polls -- like the scan
+# state it survives across iterations because the whole loop runs in one subshell.
+_last_query_err=""
+note_query_error() {
+  local msg="$1"
+  [[ "$msg" == "$_last_query_err" ]] && return 0
+  _last_query_err="$msg"
+  log "confirmation query failed (still retrying): ${msg:-<no error text>}"
+}
 
 # Read hex from a file if the argument is an existing path, else treat it as
 # literal hex. Whitespace/newlines are stripped either way.
@@ -112,9 +146,16 @@ broadcast() {
 confirmed_wallet() {
   local txid="$1" json bh conf
   _conf_result=""                                      # result via global; see note above
-  json=$(rpc gettransaction "$txid" 2>/dev/null) || return 0
-  bh=$(jq -r '.blockhash // empty' <<< "$json")
-  conf=$(jq -r '.confirmations // 0' <<< "$json")
+  # Capture stderr too (2>&1): on success elements-cli writes only JSON to stdout, so
+  # `json` is clean; on failure it writes the error text (now captured) and exits non-
+  # zero -- surface it once via note_query_error, then keep retrying. jq is guarded so
+  # an unparseable (but "successful") response retries instead of aborting under set -e.
+  if ! json=$(rpc gettransaction "$txid" 2>&1); then
+    note_query_error "$json"
+    return 0
+  fi
+  bh=$(jq -r '.blockhash // empty' <<< "$json" 2>/dev/null)   || return 0
+  conf=$(jq -r '.confirmations // 0' <<< "$json" 2>/dev/null) || return 0
   [[ -z "$bh" ]] && return 0                            # still in mempool
   (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # negative == conflicted -> stays empty
   return 0
@@ -132,9 +173,14 @@ confirmed_wallet() {
 confirmed_getraw() {
   local txid="$1" json bh conf
   _conf_result=""                                      # result via global; see note above
-  json=$(rpc getrawtransaction "$txid" true 2>/dev/null) || return 0
-  bh=$(jq -r '.blockhash // empty' <<< "$json")
-  conf=$(jq -r '.confirmations // 0' <<< "$json")
+  # Same stderr-capture + surface-once pattern as confirmed_wallet: a permanent error
+  # here (e.g. the tx left the mempool and there is no -txindex) is otherwise invisible.
+  if ! json=$(rpc getrawtransaction "$txid" true 2>&1); then
+    note_query_error "$json"
+    return 0
+  fi
+  bh=$(jq -r '.blockhash // empty' <<< "$json" 2>/dev/null)   || return 0
+  conf=$(jq -r '.confirmations // 0' <<< "$json" 2>/dev/null) || return 0
   [[ -z "$bh" ]] && return 0                            # still in mempool
   (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # active-chain depth; no re-check
   return 0
@@ -188,8 +234,11 @@ confirmed_scan() {
   if [[ -n "$_found_hash" ]]; then
     if [[ "$REORG_CHECK" == 1 ]]; then
       # reorg-safety (opt-in; see REORG_CHECK note in header): if our block is no longer
-      # at that height it was reorged out -> rescan.
-      cur=$(rpc getblockhash "$_found_height" 2>/dev/null || echo "")
+      # at that height it was reorged out -> rescan. Only a SUCCESSFUL re-query is
+      # trusted: a transient getblockhash failure must not be read as "reorged" (a
+      # needless reset) NOR as "still there" (could confirm against an orphan), so on
+      # RPC failure skip this poll and retry.
+      cur=$(rpc getblockhash "$_found_height" 2>/dev/null) || return 0
       if [[ "$cur" != "$_found_hash" ]]; then
         _scan_from="$_found_height"; _found_hash=""; _found_height=0
         return 0
@@ -230,10 +279,17 @@ main() {
   tx1=$(load_hex "$1"); tx2=$(load_hex "$2")
   [[ -n "$tx1" && -n "$tx2" ]] || die "empty transaction hex"
 
-  # For the scan method, remember the tip BEFORE broadcasting so the block that
-  # includes TX1 can never fall below the scan start (fast-mine race; mirrors the
-  # ZMQ script capturing start_height pre-broadcast).
-  [[ "$CONFIRM_METHOD" == scan ]] && _scan_from=$(( $(rpc getblockcount) + 1 ))
+  # Startup connectivity/auth check for ALL methods -- and, for scan, seed the scan
+  # start BEFORE broadcasting so the block that includes TX1 can never fall below it
+  # (fast-mine race; mirrors the ZMQ script capturing start_height pre-broadcast).
+  # getblockcount needs no wallet and no -txindex, so it validates the RPC connection
+  # for every method and fails fast, instead of letting a bad endpoint/auth/-chain
+  # masquerade as "still unconfirmed" until TIMEOUT. Capturing into a variable (not
+  # nesting the RPC in $(( ... ))) also stops a transient failure from being read as 0
+  # and seeding _scan_from=1, which would rescan from genesis.
+  local tip
+  tip=$(rpc getblockcount) || die "cannot reach node via '${CLI[*]}' (getblockcount failed) -- check ELEMENTS_CLI / rpc endpoint / auth / -chain"
+  [[ "$CONFIRM_METHOD" == scan ]] && _scan_from=$(( tip + 1 ))
 
   log "[1/3] broadcasting TX1 ..."
   txid1=$(broadcast "$tx1")

@@ -27,7 +27,10 @@ Env overrides:
     ELEMENTS_CLI    cli invocation           (default: "elements-cli")
     ZMQ_HASHBLOCK   zmq endpoint             (default: "tcp://127.0.0.1:28332")
     REQUIRED_CONF   confirmations to wait    (default: 1)
-    TIMEOUT         give up after N seconds  (default: 3600)
+    TIMEOUT         give up after N seconds  (default: 900)
+                    ~ (REQUIRED_CONF + a few blocks) x block interval; Liquid is
+                    ~60s/block so 900s ~= 15 blocks. Raise for slower chains (e.g.
+                    Bitcoin ~600s/block) or a large REQUIRED_CONF.
     FALLBACK_POLL   safety re-scan interval  (default: 60 seconds)
     MAXFEERATE      sendrawtransaction cap; "0" disables it (default: unset)
     CONFIRM_METHOD  "wallet" (wallet gettransaction, no txindex; DEFAULT)
@@ -60,21 +63,16 @@ import binascii
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 
-import zmq
-
-CLI = shlex.split(os.environ.get("ELEMENTS_CLI", "elements-cli"))
-ZMQ_ENDPOINT = os.environ.get("ZMQ_HASHBLOCK", "tcp://127.0.0.1:28332")
-REQUIRED_CONF = int(os.environ.get("REQUIRED_CONF", "1"))
-TIMEOUT = int(os.environ.get("TIMEOUT", "3600"))
-FALLBACK_POLL = int(os.environ.get("FALLBACK_POLL", "60"))
-MAXFEERATE = os.environ.get("MAXFEERATE", "")
-CONFIRM_METHOD = os.environ.get("CONFIRM_METHOD", "wallet")
-REORG_CHECK = os.environ.get("REORG_CHECK", "0") == "1"   # off by default; see header note
-
+try:
+    import zmq
+except ImportError:
+    sys.stderr.write("error: pyzmq is required (pip install pyzmq)\n")
+    sys.exit(1)
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr, flush=True)
@@ -83,6 +81,52 @@ def log(msg):
 def die(msg):
     print(f"error: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def _int_env(name, default):
+    """Parse a positive-integer env var, dying with a clean message (not a traceback)
+    on a bad value -- so a typo can't silently misbehave or dump a stack trace."""
+    raw = os.environ.get(name, default)
+    try:
+        n = int(raw)
+    except ValueError:
+        die(f"{name} must be a positive integer (got: {raw!r})")
+    if n < 1:
+        die(f"{name} must be >= 1 (got: {n})")
+    return n
+
+
+# elements-cli invocation: treat unset OR empty as the default; whitespace-only (which
+# shlex splits to nothing) is an error rather than an accidental empty command.
+CLI = shlex.split(os.environ.get("ELEMENTS_CLI") or "elements-cli")
+if not CLI:
+    die("ELEMENTS_CLI is empty")
+ZMQ_ENDPOINT = os.environ.get("ZMQ_HASHBLOCK", "tcp://127.0.0.1:28332")
+REQUIRED_CONF = _int_env("REQUIRED_CONF", "1")
+TIMEOUT = _int_env("TIMEOUT", "900")
+FALLBACK_POLL = _int_env("FALLBACK_POLL", "60")
+MAXFEERATE = os.environ.get("MAXFEERATE", "")
+CONFIRM_METHOD = os.environ.get("CONFIRM_METHOD", "wallet")
+_reorg_raw = os.environ.get("REORG_CHECK", "0")
+if _reorg_raw not in ("0", "1"):
+    die(f"REORG_CHECK must be 0 or 1 (got: {_reorg_raw!r})")
+REORG_CHECK = _reorg_raw == "1"   # off by default; see header note
+
+# A confirmation query that FAILS is normally just "not confirmed yet", so the
+# confirmers treat failure as "keep waiting". But a PERMANENT failure (wrong/absent
+# -rpcwallet, getraw without -txindex once the tx leaves the mempool, an auth/chain
+# misconfig) looks identical and would otherwise burn the whole TIMEOUT in silence.
+# Surface the node's error text once (and again only if it changes) so the cause is
+# visible while we keep retrying.
+_last_query_err = None
+
+
+def note_query_error(msg):
+    global _last_query_err
+    if msg == _last_query_err:
+        return
+    _last_query_err = msg
+    log(f"confirmation query failed (still retrying): {msg or '<no error text>'}")
 
 
 def rpc(*args):
@@ -133,8 +177,9 @@ class WalletConfirmer:
     def blockhash_if_confirmed(self):
         try:
             info = rpc_json("gettransaction", self.txid)
-        except RuntimeError:
-            return None                       # not (yet) a wallet tx / not found
+        except (RuntimeError, ValueError) as e:   # ValueError covers a bad-JSON response
+            note_query_error(str(e))              # permanent misconfig (bad wallet/auth)
+            return None                           # vs still-pending: surface it once, retry
         bh = info.get("blockhash")
         if not bh:
             return None                       # still in mempool
@@ -161,8 +206,9 @@ class RawConfirmer:
     def blockhash_if_confirmed(self):
         try:
             info = rpc_json("getrawtransaction", self.txid, "true")
-        except RuntimeError:
-            return None                       # still in mempool / no txindex / unknown
+        except (RuntimeError, ValueError) as e:   # ValueError covers a bad-JSON response
+            note_query_error(str(e))              # e.g. tx left mempool and no -txindex
+            return None                           # surface it once, keep retrying
         bh = info.get("blockhash")
         if not bh:
             return None                       # still in mempool
@@ -207,16 +253,19 @@ class ScanConfirmer:
                         self.found_height = self.scan_from
                         break
                     self.scan_from += 1
-        except RuntimeError:
-            return None                       # transient RPC error -> retry next tick
+        except (RuntimeError, ValueError) as e:
+            note_query_error(str(e))          # transient RPC error -> retry next tick
+            return None
         if self.found_hash is not None:
             if REORG_CHECK:
                 # reorg-safety (opt-in): is our block still the one at that height?
-                cur = None
+                # Only a SUCCESSFUL re-query is trusted: a transient getblockhash failure
+                # must not be read as "reorged" (needless reset) nor "still there" (could
+                # confirm against an orphan) -- skip this tick and retry.
                 try:
                     cur = rpc("getblockhash", self.found_height)
-                except RuntimeError:
-                    pass
+                except (RuntimeError, ValueError):
+                    return None
                 if cur != self.found_hash:
                     self.scan_from = self.found_height
                     self.found_hash = None
@@ -240,6 +289,8 @@ def main():
     confirmer_cls = CONFIRMERS.get(CONFIRM_METHOD)
     if confirmer_cls is None:
         die(f"unknown CONFIRM_METHOD: {CONFIRM_METHOD} (use wallet|getraw|scan)")
+    if shutil.which(CLI[0]) is None:
+        die(f"cli not found: {CLI[0]}")       # fail fast instead of a FileNotFoundError later
     tx1 = load_hex(sys.argv[1])
     tx2 = load_hex(sys.argv[2])
     if not tx1 or not tx2:
@@ -297,4 +348,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("interrupted")
+    except FileNotFoundError as e:
+        die(f"command not found: {e}")
+    except RuntimeError as e:
+        die(str(e))                           # e.g. a sendrawtransaction / RPC failure
