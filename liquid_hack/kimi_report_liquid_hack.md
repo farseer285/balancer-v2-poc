@@ -100,9 +100,11 @@ bool CachingRangeProofChecker::VerifyRangeProof(
 - `secp256k1_rangeproof_verify` binds the proof to three things: the **commitment**,
   the **generator** (asset), and the **extra commitment** (the output's scriptPubKey,
   hashed into the proof's message). Two of the three are missing from the cache key.
-- `Set` is called only on successful verification (no negative caching), and
-  `Get(entry, /*erase=*/!store)` removes the entry on read during block validation
-  (`store == false`) but keeps it during mempool acceptance (`store == true`).
+- `Set` is called only on successful verification (no negative caching). `Get(entry,
+  /*erase=*/!store)` *requests* erase during block validation (`store == false`) and
+  keeps the entry during mempool acceptance (`store == true`) — but CuckooCache's erase
+  is **lazy** (§2.3), so even the block-validation read does **not** actually remove the
+  entry; it only marks the slot reusable for a later insert.
 - The cache is a per-process in-memory `CuckooCache` (`SignatureCache`), salted per
   process: each node must be primed individually; entries do not survive restarts.
 
@@ -169,17 +171,29 @@ ahead, fixed-width generator behind), so no end-to-end boundary shift exists.
   `Get(entry, erase=false)` — hits do not consume.
 - **Block validation:** `ConnectBlock` → `CheckTxInputs` (`validation.cpp:3041`,
   `fCacheResults = fJustCheck`, i.e. false when actually connecting): the cache is
-  read with `Get(entry, /*erase=*/true)` — **a hit is consumed** — and nothing new is
-  stored.
+  read with `Get(entry, /*erase=*/true)` and nothing new is stored (`store == false`).
+  The `erase=true` does **not** consume the hit: CuckooCache's erase is **lazy** —
+  `contains(key, /*erase=*/true)` calls `allow_erase(loc)`, which only sets a
+  `collection_flags` bit and *still returns the hit*; the element physically stays in
+  `table[loc]` and keeps matching until a **future `insert` reuses that slot**
+  (`cuckoocache.h:28` "Elements are lazily erased on the next insert"; `:152`
+  "`allow_erase` … the real discard happens later"). So a block-connect read leaves the
+  entry in place.
 
-Consequences: (i) only mempool acceptance primes; (ii) a primed entry survives until
-a block-connect read erases it, so the primer must be **mempool-live in the same
-inter-block era** as the attack block's connection; (iii) after the accepting side
-connected 4050336 the entry was consumed — those nodes cannot re-validate the very
-block they accepted (reorg disconnect/reconnect, or startup `-checkblocks`
-re-validation, fails), which explains part of the observed post-attack network
-fragility; (iv) `testmempoolaccept` would also store entries but requires RPC auth;
-no block-relay or orphan path stores.
+Consequences (corrected for lazy erase; an earlier revision assumed eager
+erase-on-connect, which the source refutes): (i) only mempool acceptance primes
+(`ConnectBlock` runs `store == false` and never inserts); (ii) once planted, `K`
+**persists across its own block-connect and across many later blocks** — until some
+`insert` happens to overwrite that slot, rare on low-volume Liquid — so there is **no
+"same inter-block era" constraint** and the exploit's block-timing window is **wide**: a
+forged `V1` in block N+1, N+2 or N+k all still hit `K`. This is the article's plain
+memoization model and matches the on-chain data; (iii) because the entry is not
+consumed, a node **can** re-validate the block it accepted (a reorg disconnect/reconnect
+*without a restart* still finds `K`); the residual fragility is that the cache is
+per-process and **wiped on restart** (§5.2), not that reads consume entries. The real
+driver of the persistent split is therefore **which nodes ever mempool-accepted the
+primer** (→ `K` inserted), not any erase timing; (iv) `testmempoolaccept` would also
+store entries but requires RPC auth; no block-relay or orphan path stores.
 
 ### 2.4 The attacker's byte-level construction (reproduced from on-chain data)
 
@@ -191,12 +205,12 @@ X  = 0a ‖ 0a488de4899d0ae757f6cf8368663184d164106111ed9eaecf510e35282ddc6d
      independently reproduced via the Shallue–van de Woestijne map with the two
      tagged-hash candidates ("1st/2nd generation: ") → MATCH (gen_check.py)
 S0 = 6a 43 ‖ C1 ‖ X ‖ 6a            (69 B = OP_RETURN + push opcode 0x43 + 67 B payload)
-P1 = P0 ‖ C0 ‖ X ‖ 6a 43            (4,234 B = the 4,166 B dry-run proof + 68 B tail)
+P1 = P0 ‖ C0 ‖ X ‖ 6a 43            (4,234 B = the 4,166 B primer proof + 68 B tail)
 S1 = 6a                             (1 B, bare OP_RETURN)
 ```
 
 - **Primer tuple** `(P0, C0, X, S0)` — the explicit-L-BTC OP_RETURN output of the
-  dry-run txs (§4.6): `P0` verifies **VALID** against `(C0, X, S0)`
+  primer txs (§4.6): `P0` verifies **VALID** against `(C0, X, S0)`
   (`prime_verify_test.py`: VALID, min/max `0/4503599627370495`), so ordinary
   verification stores `K = salted-hash(P0‖C0‖X‖S0)` on every fixed-code node that
   accepts the tx to its mempool.
@@ -248,7 +262,7 @@ block data itself.**
 | Crafted rangeproof `P1` | sha256 prefix `6619fa29…`, 4,234 bytes (= `P0 ‖ C0 ‖ X ‖ 6a 43`; §2.4) |
 | Attack tx (mined) `V1` | `f24a4b179b5cc7e88b25a763911f7cbdf2bf45d1d1b5ab611e94461cef0a183f` @ block 4050336 |
 | Double-spend variant `V2` | txid `a1669379f6204f066320974effeefcad2d758fa8ee408c35ae07bc8580c4abe9` (raw bytes recovered from the network; never mined) |
-| Priming dry-run pair | `71c93d43…f411` and `27114710…7ec5` @ 4050335; identical explicit-L-BTC OP_RETURN outputs `(P0, C0, X, S0)`, `S0 = 6a 43 ‖ C1 ‖ X ‖ 6a`, `X` = L-BTC generator serialization (§2.4) |
+| Primer pair | `71c93d43…f411` and `27114710…7ec5` @ 4050335; identical explicit-L-BTC OP_RETURN outputs `(P0, C0, X, S0)`, `S0 = 6a 43 ‖ C1 ‖ X ‖ 6a`, `X` = L-BTC generator serialization (§2.4) |
 | Laundering tx | `46f117c9…` @ 4050344 (peg-out 2.65138358 BTC) |
 | Peg-out tx | `ce4caece413cd9d444ce7ed9f54e5b328b3da5e4af301aff59a3571f76e988f2` @ 4050349 (peg-out 3,996.01834922 BTC) |
 | Federation mainnet payout | `8db751a650ae2f12006b7e8c69a75e4df360e8afd6b9e05ae0b9fa6458a7b140`, first seen 2026-09-06 14:25:13 UTC, confirmed BTC block 965783 (14:28:56 UTC), 83 in / 13 out, 4,019.44 BTC total — **verified via blockstream.info 2026-09-07**: out0 pays `bc1qgsl…wt7p` exactly 3,996.01834922 BTC, out1 pays `bc1qkxwv…h98my` exactly 2.65138358 BTC (both attack destinations, exact peg-out amounts); no OP_RETURN output |
@@ -258,7 +272,7 @@ block data itself.**
 
 - **08-03** fix authored (`c26d719c29`)
 - **08-03** fix commit authored (`c26d719c29` git author date) — internal knowledge ~4 weeks pre-attack; **09-01** merged to `master`; **09-02** cherry-picked to `elements-23.x` (`6253d7e103`); **09-03/09-04** the `elements-23.3.x` cherry-pick (`212c43f475`) and its backport PR #1599 become public. **No release ever tags the fix.**
-- **09-06 ~12:30–12:39** blocks 4050334–4050335 (valid on both future sides). `71c93d43…f411` and `27114710…7ec5` in 4050335 carry *identical* explicit-L-BTC OP_RETURN outputs `(P0, C0, X, S0)` — the primer tuple (§2.4): the first copy stores cache entry `K` on every fixed-code mempool that verifies it, and the duplicate reads `K` back — a live end-to-end dry run of the cache-hit path on the functionaries' own nodes, minutes before the attack.
+- **09-06 ~12:30–12:39** blocks 4050334–4050335 (valid on both future sides). `71c93d43…f411` and `27114710…7ec5` in 4050335 carry *identical* explicit-L-BTC OP_RETURN outputs `(P0, C0, X, S0)` — the primer tuple (§2.4): the first copy stores cache entry `K` on every fixed-code mempool that verifies it, and the duplicate independently re-plants the same `K` (hitting it on its own mempool acceptance) — **redundancy / insurance** so at least one primer propagates, not a rehearsal (§4.6), minutes before the attack.
 - **~12:40** block 4050336 `e1d9a2aa…` mined with `f24a4b17…183f` (`V1`). **Fork.** Acceptance by the signing functionaries identifies their builds as **unreleased fixed code with primed caches** — pre-fix code cannot accept this tuple (§2.4, §4.5).
 - **~12:44** `46f117c9…` @4050344: 2.65138358 BTC explicit `sendtomainchain` OP_RETURN.
 - **~12:49** `ce4caece…f2` @4050349: 3,996.01834922 BTC explicit `sendtomainchain` OP_RETURN.
@@ -304,9 +318,10 @@ Empirical verification (local libsecp256k1-zkp via ctypes): `P1`/`C1` verifies
 alternates — and it is never verified on the attack path at all: the priming side is
 now **fully demonstrated**. `P0` verifies **VALID** against `(C0, X, S0)`; the primer
 and attack fixed-key input streams are byte-identical (4,301 B, sha256
-`82b0b8cc…9c01a`; `collision_test.py`, §2.4) while the pre-fix keys differ. The live
-primer never needed to be mined: it only had to be mempool-live on the accepting
-nodes in the ~60 s era before 4050336 connected (§2.3, §4.5, §6).
+`82b0b8cc…9c01a`; `collision_test.py`, §2.4) while the pre-fix keys differ. Priming
+only needs the primer to be **mempool-accepted** on the fixed-code nodes (that is what
+inserts `K`); because the erase is lazy the entry then persists across blocks (§2.3), so
+the exploit window is wide rather than a single ~60 s era (§4.5, §6).
 
 
 ### 4.4 Why `HasValidFee` / `MoneyRange` don't save the network
@@ -325,7 +340,7 @@ nodes in the ~60 s era before 4050336 connected (§2.3, §4.5, §6).
 |---|---|---|
 | pre-fix release (≤ 23.3.3), any cache state | reject (real verify fails — pre-fix keys provably differ, §2.4) | **reject block** |
 | fixed code (post-`c26d719c29` build), cold cache | reject (miss → real verify fails) | **reject block** |
-| fixed code, primer entry `K` live in cache | accept (hit, no erase) | **accept** (hit, entry erased) |
+| fixed code, primer entry `K` live in cache | accept (hit, no erase) | **accept** (hit; entry **not** consumed — lazy erase) |
 
 The fork sides therefore identify the running software *inversely* to the first-reading
 assumption: the **accepting** side (the signing functionaries, blockstream.info's
@@ -335,13 +350,14 @@ never saw the primer. Rejecting nodes never see a valid heavier chain (the
 functionaries kept building on the invalid chain — their own nodes were primed), so
 their tip freezes at 4050335: exactly what liquid.network's backend shows a day later.
 
-Era mechanics (§2.3): the dry-run entries from 4050335 were erased when that block
-connected, so the attack required a live primer in the accepting mempools in the
-~60 s before 4050336 connected. The other five non-coinbase transactions in 4050336
-were fetched from the accepting-side explorer and parsed (`09016269…`, `c652a104…`,
-`efa5e6e6…`, `5707d0ce…`, `2817e839…`): **none carries the primer tuple** — the live
-primer was never mined and is identifiable only in accepting nodes' mempool
-acceptance logs. On pre-fix nodes the same primer is a harmless, valid tx.
+Cache persistence (§2.3): because CuckooCache's erase is lazy, the `K` planted when the
+4050335 primers were **mempool-accepted** was **not** consumed when 4050335 connected —
+it persisted into the ~60 s window before 4050336, where the forged `V1` reused it. No
+separate, later live primer was needed. Consistent with this, the other five
+non-coinbase transactions in 4050336 were fetched from the accepting-side explorer and
+parsed (`09016269…`, `c652a104…`, `efa5e6e6…`, `5707d0ce…`, `2817e839…`): **none carries
+the primer tuple** — the key-planting happened at the 4050335 primers' mempool
+acceptance, not in 4050336. On pre-fix nodes the same primer is a harmless, valid tx.
 
 Consistent confirmation of this partition: a published node log from a fresh-sync
 node running `elements-23.3.4rc1` (tagged 2026-07-01 — **pre-fix code**) shows
@@ -354,16 +370,21 @@ is the *required* behavior of pre-fix code; a cold-synced fixed build would reje
 identically (no live entry). Acceptance is a property of (fixed code ∧ live primed
 entry) — cf. §5.2 item 8.
 
-### 4.6 Pre-fork dry run
+### 4.6 The pre-fork primer pair (redundancy, not a rehearsal)
 
 `71c93d43…f411` and `27114710…7ec5` (both @4050335) contain *identical* explicit-L-BTC
 OP_RETURN outputs: same 4,166-byte proof `P0`, same commitment `C0` = `09d6c615…83f5`,
 explicit L-BTC asset (→ generator `X` in the fixed key), same 69-byte script
 `S0 = 6a 43 ‖ C1 ‖ X ‖ 6a`. The output genuinely verifies (VALID, min=0, max=2^52−1,
 re-verified 2026-09-07) — so on fixed-code nodes the first copy **stores** cache entry
-`K`, and the duplicate in the sibling tx **reads `K` back** (identical key, no
-re-verification): a live end-to-end dry run of the cache-hit path on the
-functionaries' own mempools, in the last block before the attack. The "34-byte blob"
+`K`, and the duplicate in the sibling tx, sharing the identical key, **hits `K`** on its
+own mempool acceptance (no re-verification). Two independent plantings of the same `K`
+are **redundancy / insurance** — the article notes "just one transaction would have
+sufficed" and the second "is presumably insurance" — **not a rehearsal or a
+discriminating test**: because both proofs are genuinely valid, each is accepted on every
+node via a real re-verify even on a cache miss, so nothing about the pair exercises the
+cache-hit path in a way an outside observer could distinguish (observability caveat (b)
+below). This was the last block before the attack. The "34-byte blob"
 that resisted decoding in the first analysis is now fully identified: it is `X ‖ 6a` —
 the **L-BTC generator serialization** (byte-exact reproduction via the
 Shallue–van de Woestijne map, §2.4) plus the script's final opcode — planted as inert
@@ -373,8 +394,305 @@ tuple places its commitment and generator fields. Byte forensics (`prooflen_test
 (§2.4). Liquid uses the original Borromean-style CT rangeproofs (kilobyte-scale; size
 varies with encoding parameters and message), so the 4,166/4,174/4,234-byte sizes are
 all legitimate, and verification is exact-length — truncating or extending `P0` by
-even one byte makes it INVALID (relevant to the dry run's own validity; `P1` is never
+even one byte makes it INVALID (relevant to the primer's own validity; `P1` is never
 parsed on the attack path).
+
+**Observability — why on-chain confirmation is the go-signal, and what it does *not*
+prove.** The event the attacker actually needs — the functionaries' nodes writing `K`
+on the `cacheStore=true` mempool-acceptance path (§2.3) — is **not directly
+observable**: no p2p or RPC method reports another node's mempool contents or cache
+state, and the attacker's own node accepting the primer proves only that *its own*
+cache is primed. The single network-wide, publicly observable proxy is **whether the
+primer got mined into a block the network accepted** — strong evidence that it
+propagated through the p2p mempool layer and was therefore accepted (and primed) by the
+well-connected functionary nodes en route. This is the natural trigger for firing `V1`,
+and it plausibly explains why primer-tuple outputs sit in 4050335 at all rather than
+only in an unmined mempool tx: they double as an on-chain propagation receipt. Three
+caveats keep this a *probabilistic proxy*, not a proof:
+
+- **On-chain ≠ primed.** Priming happens only on the mempool-acceptance path
+  (`cacheStore=true`); `ConnectBlock` runs `cacheStore=false` and stores nothing (§2.3).
+  A node that first sees the primer *inside the block* (never via mempool relay) is
+  therefore **not** primed. Confirmation evidences the *cause* (propagation) that
+  primes, not the priming event itself.
+- **Non-discriminating.** `P0` verifies VALID against `(C0,X,S0)`, so a mined primer is
+  accepted on **every** node — fixed-code (cache hit) and pre-fix (real re-verify)
+  alike. On-chain data cannot separate "cache-hit path exercised" from "ordinary
+  verification," so the twin 4050335 copies read better as **redundancy / insurance**
+  (maximize the chance the key is planted and propagated) than as a discriminating
+  rehearsal; the only tx whose acceptance actually discriminates the mechanism is the
+  forged `V1`, and broadcasting it *is* the attack.
+- **Sound only if `K` outlives the confirming block.** Gating on "primer confirmed in
+  block N → fire `V1` into N+1" is viable only if the planted entry survives past N's
+  connection. Were the erase eager it would not. But CuckooCache's erase is **lazy**
+  (§2.3) — `contains(key, /*erase=*/true)` calls `allow_erase`, which only *marks* the
+  slot reusable and leaves the element findable until a later `insert` overwrites it — so
+  `K` in fact persists across the connect and the window is wide, not a single
+  "inter-block era." Under that lazy-erase behavior the on-chain go-signal is
+  straightforwardly usable.
+
+**Manual on-chain check — `waitfornewblock` as trigger + `gettransaction` as probe.**
+First, a naming correction: **`waitnextblock` is not an RPC** (absent from `src/rpc/*` —
+verified against the `elements` tree). The real block-wait calls are the *hidden* RPCs
+`waitfornewblock [timeout_ms]`, `waitforblock <blockhash> [timeout_ms]` and
+`waitforblockheight <height> [timeout_ms]` (`src/rpc/blockchain.cpp`); each blocks until
+the tip changes and returns only `{ hash, height }` — **none takes a txid**, so a
+block-wait alone never confirms the primer. The confirmation itself needs a tx-scoped
+call. The natural pairing is therefore **`waitfornewblock` (block-arrival trigger) +
+`gettransaction <primer_txid>` (confirmation probe)**, and that combination is valid and
+sensible, subject to two conditions:
+
+- **`gettransaction` is wallet-scoped — and on-chain the txs are wallet-shaped, so it
+  applies.** *(Verified on blockstream.info, 2026-09-18.)* Both primers (`271147…`,
+  `71c93d…`) and the exploit (`f24a4b…`) are **self-funded**: each is a single-input tx
+  spending one output (`:0`/`:1`/`:2`) of a common funding tx
+  `0fbde521636bd2c3…` (block 4050333, two blocks before the primers), whose 7 inputs and
+  3 fan-out outputs are all the attacker's own P2WPKH address
+  `ex1q7kgx4ptje7px48tn0nsmc6se5pngdp3smpqa2w`; change on every attack tx returns to that
+  same address; fees are 58 sats in L-BTC; only the OP_RETURN payloads (primer `scriptPubKey`
+  = 69 B `S0`, exploit = 1 B bare `6a`) are exotic. That is textbook wallet coin-control (a
+  deliberate 3-UTXO pre-stage). So if the `ex1q7kg…` key sits in the node's `elementsd`
+  wallet, `gettransaction` reports each tx's `confirmations`/`blockhash` with **no
+  `-txindex`**. The only thing on-chain data cannot settle is key custody — node wallet vs.
+  an external signer + raw assembly; only in the latter case does `gettransaction` return
+  "Invalid or non-wallet transaction id", and you fall back to `getrawtransaction <txid>
+  true` +txindex, `gettxout`/`scantxoutset`, a `getblock <hash> 2` scan, or an explorer.
+  *(Corrects an earlier draft that claimed the byte-level construction made these non-wallet
+  txs — the actual on-chain shape is plainly wallet-funded.)*
+- **Loop with a confirmation gate, not one-shot.** `waitfornewblock` fires on *any* new
+  block, which may not contain the primer:
+  `gettransaction` once; then `while conf < REQUIRED_CONF: waitfornewblock;
+  gettransaction`. On Liquid (reorgs ≤ 1 block, `gettransaction` confirmations are
+  active-chain-fresh) `REQUIRED_CONF=1` suffices, `2` is the safe choice.
+
+This pattern is exactly the **event-driven form of this repo's default wallet method**:
+`broadcast-then-broadcast.sh` polls with `sleep POLL_INTERVAL` + `gettransaction`
+(`CONFIRM_METHOD=wallet`); swapping the sleep for a `waitfornewblock` trigger is the
+middle rung; `broadcast-then-broadcast-zmq.py` (ZMQ `hashblock`) is the fully
+event-driven rung. All three answer the same question — *did the primer propagate and
+confirm* (the network-wide go-signal) — and none of them, by construction, proves the
+functionaries wrote `K` (that lives in their mempool-acceptance path and is
+unobservable; see the caveats above).
+
+**Block-inclusion timing — the adjacency (`f24a4b17…` @4050336, one block after the
+4050335 primers `71c93d43…`/`27114710…`) is neither guaranteed by the confirmation
+method nor required by the exploit.** A `waitfornewblock`+`gettransaction` gate is purely
+*reactive*: it fires `V1` only *after* observing the primer confirmed in block N, then
+races the ~60 s Liquid block cadence to land `V1` in N+1. That is a *high-probability*
+outcome (a freshly observed N leaves nearly the full ~60 s until N+1) but **not a
+guarantee**:
+
+- **Inclusion is the signer's choice, not the broadcaster's.** Which block a tx enters is
+  decided by the N+1 proposer's template selection; a broadcaster can bias the odds (fee,
+  timing, connectivity) but cannot pin a target block. Detection lag, or a template
+  already cut, pushes `V1` to N+2+.
+- **`V1`'s propagation is partition-limited to the primed fixed-code subgraph.** `V1` is
+  *invalid* on any node without `K` (all pre-fix nodes, and cold-cache fixed nodes) — they
+  reject and **do not relay** it. But the primer, being valid, floods everywhere and plants
+  `K` on every fixed-code node it reaches, *paving a road*: `V1` can then travel exactly
+  that primed fixed-code subgraph. So a plain local `sendrawtransaction` + P2P **does**
+  carry `V1` to the signer — *provided the attacker's node is connected into that subgraph*
+  (peered with a functionary / Blockstream-infra fixed node); point-to-point delivery
+  straight to the signer is only the most reliable form of that, not a hard requirement.
+  (Correcting an earlier overstatement that `V1` "must be submitted directly to the
+  specific signer".) Either way, `V1` cannot ride the general (mostly pre-fix) network, so
+  reaching the *specific* N+1 signer before it cuts its template is topology- and
+  latency-dependent — not controllable — which removes "next block" from any broadcast
+  method's guarantees.
+- **Adjacency is not required.** Because the CuckooCache erase is lazy (`K` persists
+  across connects — §2.3 correction above), a `V1` landing several blocks later still hits
+  `K`; the observed N→N+1 adjacency is the natural result of prompt/direct submission into
+  a 60 s window, not something the gate enforces. Conversely, under an eager-erase model
+  reading adjacency *would* be mandatory — and a reactive gate provably cannot guarantee
+  it — so the attack's success is itself evidence for the wide-window (lazy-erase) model.
+- **Confirmation-gating is stricter than the mechanism needs.** Priming happens at the
+  primer's *mempool acceptance*, not its confirmation; to maximize the chance of catching
+  a chosen next block one would keep the primer mempool-live (re-broadcasting) and time /
+  directly submit `V1`, rather than wait for a confirmation that only arrives later.
+
+**Did the real attacker use the manual `waitfornewblock`+`gettransaction` flow? —
+Judgment: possible, but unlikely the actual method.** On-chain data fixes the *sequence*
+(primers @4050335 → exploit @4050336) and the adjacency, but not the operator's tooling.
+The manual CLI flow is a faithful, working *reconstruction* of that observable sequence,
+and `gettransaction` on the attacker's own wallet tx is the simplest confirmation probe
+(no `-txindex`). But four features of this operation point away from a hand-typed check
+and toward an automated, directly-fed pipeline:
+
+1. **Sophistication + value + a ~60 s window.** Reverse-engineering an unreleased patch, a
+   byte-level cache-key collision, ~4,000 BTC at stake, and a one-minute cadence make a
+   hand-driven "watch the output, then paste `sendrawtransaction`" flow needlessly
+   fragile; such an operator scripts the broadcast-then-broadcast sequence (ZMQ
+   `hashblock` / `waitfornewblock` in code — the `.py`/`.sh` rungs above), not eyeballs it.
+2. **`V1` can only ride the primed fixed-code subgraph** (partition-limited relay, above),
+   so the attacker's node had to be deliberately **connected into that subgraph** (peered
+   with a functionary / Blockstream-infra fixed node) — engineered network positioning, not
+   a broadcast to random public peers. A plain local `sendrawtransaction` + P2P then
+   suffices once the node is so positioned (point-to-point delivery to the signer is only
+   the strongest form); either way it is not a generic public broadcast.
+3. **The redundant twin primers** read as fire-and-forget robustness (plant `K` on as many
+   mempools as possible), a mindset more consistent with an automated, resilient pipeline
+   than with careful manual per-step verification.
+
+*(An earlier draft listed a fourth point — that the byte-level tx construction might make
+these non-wallet txs, so `gettransaction` would not apply. The on-chain data
+**retracts** it: the cluster is plainly wallet-funded and self-financed from one P2WPKH
+address, used wallet-style coin-control, and only the OP_RETURN payloads were
+hand-crafted — so `gettransaction`-based confirmation is fully viable, and this point no
+longer argues either way.)*
+
+On balance: the wallet-shaped self-funding makes the `waitfornewblock`+`gettransaction`
+manual flow **entirely viable** and consistent with the data, so it cannot be ruled out.
+The two things that still tilt toward a **scripted, well-positioned** run are non-wallet
+facts: the ~60 s window against a byte-crafted `V1`, and `V1`'s partition-limited relay
+(invalid on unprimed nodes → rides only the primed fixed-code subgraph, so the attacker's
+node had to be **positioned inside that subgraph** — via peering or direct submission —
+not a generic public broadcast). So: manual confirmation is plausible; a local
+`sendrawtransaction`+P2P submission of `V1` is also plausible *if* the node was so
+positioned; what is ruled out is `V1` reaching the signer via the general public network.
+Tooling and topology are not recoverable from on-chain data — this is inference from
+operational constraints, not a forensic fact.
+
+### 4.7 Operator procedure — reconstruction, footprint-identical alternatives, and OPSEC
+
+On-chain data fixes the *sequence* (primers @4050335 → exploit @4050336) and the
+one-block adjacency, but not the operator's tooling, network position, or confirmation
+method. This section reconstructs the most-likely procedure, shows that several distinct
+methods all leave an **identical** on-chain footprint (so none can be proven from the
+chain), and reads the OPSEC. Everything here is inference from operational constraints
+and verified client behavior, **not** forensic fact; the repo's
+`broadcast-then-broadcast.sh` / `-zmq.py` are the *user's* POC tooling, not recovered
+attacker artifacts.
+
+**Verified Elements block-wait RPC / CLI facts** (against local official source
+`../elements`). The three block-wait calls — `waitfornewblock`
+(`src/rpc/blockchain.cpp:347`), `waitforblock <hash>` (`:389`), `waitforblockheight <N>`
+(`:443`) — are all registered under the **`"hidden"`** category (`:3797`–`:3799`, so
+`help` never lists them). Each blocks on `miner.waitTipChanged` and returns only
+`{ hash, height }` of the **tip**; **none takes a txid**, so a block-wait alone can never
+confirm a specific primer — a tx-scoped call (`gettransaction` / `getrawtransaction` / a
+block scan) is always required. Their `timeout` argument is in **milliseconds** (`0` =
+block indefinitely). Separately, `elements-cli`'s own `-rpcclienttimeout` is a
+**client-side HTTP timeout in seconds** (`src/bitcoin-cli.cpp:99`, default
+`DEFAULT_HTTP_CLIENT_TIMEOUT = 900` = 15 min; `=0` is implemented as ~5 years because
+libevent cannot express true-infinite, `:858`–`:866`). A blocking `waitfor*` therefore
+needs **both** timeouts set (server-side ms `0` *and* client-side `-rpcclienttimeout=0`),
+or the CLI disconnects at 900 s before the block arrives.
+
+**Reconstructed most-likely manual flow.** The article documents none of the operator
+procedure, so this is an informed reconstruction of the observed sequence:
+
+- **Phase 0 — offline prep:** construct and sign both primers and the exploit; keep the
+  raw hex ready; own `elementsd` synced to the Liquid tip; an Esplora explorer open as a
+  visual second-eye. (Byte-crafting the 4,234 B forged proof is the bulk of the work and
+  is never done in the live window.)
+- **Phase 1 — broadcast primers:** `sendrawtransaction` both (`271147…`, `71c93d…`). Two
+  copies are redundancy / insurance (maximize the chance `K` is planted and propagated),
+  **not** a rehearsal (§4.6).
+- **Phase 2 — the confirm gate (core action):** a **level-triggered, check-first** loop —
+  probe the tx *first*, wait only if not yet confirmed, repeat. The authoritative probe
+  is a tx-level RPC (`getrawtransaction <txid> true`, or `gettransaction`, which works
+  without `-txindex` because the txs are wallet-shaped and self-funded, §4.6) or an
+  explorer refresh. A block-wait / sleep is at most an optional early-wake *between*
+  probes, and only with a finite timeout. The criterion is coarse: seeing one primer in a
+  block is enough.
+- **Phase 3 — fire:** immediately `sendrawtransaction <exploit_hex>`; the pre-built hex
+  lands in the next block (4050336), well within the ~60 s cadence.
+- **Phase 4 — (optional) confirm** the exploit tx / that the funds moved.
+
+**Why a `waitfornewblock`-first gate is the wrong primitive (and why the repo scripts
+avoid it).** `waitfornewblock` is both **edge-triggered** (it snapshots the current tip,
+then blocks for the *next* change — it never level-checks current state, verified
+`blockchain.cpp:347`) and **block-level** (no txid). That yields two independent
+footguns: (a) if the primer already confirmed *before* the call, the wait ignores it and
+blocks ~60 s for the block *after* — late notice; (b) the block it returns is merely "the
+next block after call-time," which may not contain the primer, so "wait returns → assume
+primer in it → fire" can fire on a false premise. A human naturally reads *current* state
+(refresh the explorer, or run `getrawtransaction` on their own node), so a hand-driven
+check is inherently level-triggered and dodges both. The repo scripts are correct to use
+`waitfornewblock` **nowhere**: `broadcast-then-broadcast.sh` is a check-first
+fixed-interval poll (absolute / idempotent, `TIMEOUT`-bounded, never hangs), and
+`broadcast-then-broadcast-zmq.py` uses ZMQ `hashblock` only as a *wake*, with the
+authoritative confirm still a tx-level RPC plus a 60 s fallback poll. ZMQ `hashblock` and
+`waitfornewblock` are in fact the **same class of signal** — both fire from the same
+chainstate tip-update (`zmq/zmqnotificationinterface.cpp:150`–`156`;
+`node/interfaces.cpp:1000`–`1006` ← `node/kernel_notifications.cpp:51`–`57`), both
+edge-triggered and block-level — differing only in transport (async buffered pub/sub vs.
+a blocking RPC condition-variable wait). So if event-driven is wanted, ZMQ is the right
+primitive; a bare blocking `waitfornewblock` (server timeout 0) additionally risks
+hanging forever across a chain halt.
+
+**Footprint-identical alternatives — the go-signal need not be a confirmation at all.**
+Because `K` persists (wide window, §2.3), even a **blind fixed-60 s timer** works:
+broadcast a primer at `t0`, wait exactly one block interval, broadcast the exploit, with
+*no* confirmation probe. Phase-preservation argument: let `T_next` be the first block
+boundary after `t0` (so `T_next ∈ (t0, t0+60]`); if the primer's lead margin
+`m = T_next − t0` sufficed to land it in block N, then the exploit fired at `t0+60` has
+margin `(T_next+60) − (t0+60) = m` into N+1 — the **same** margin. A fixed 60 s wait thus
+*preserves the phase* relative to the block boundary and naturally yields N/N+1. Its only
+genuinely fatal mode is broadcasting the primer too close to a boundary, so it slips to a
+later block and the exploit fires **before** the primer is mempool-accepted (hitting a
+`K`-less node → rejected as invalid); mere block-time jitter only causes an off-by-one to
+N+2/N+3, which the wide window forgives. So **poll-then-fire, ZMQ-event and blind-timer
+all leave the identical footprint** (primer @N, exploit @N+1); poll-vs-event,
+manual-vs-scripted and timer-vs-gate are equally chain-unrecoverable. (A mild lean toward
+a confirm-gate over a blind timer: the txs sit in *adjacent* rather than the *same*
+block — the natural output of "see primer in N, then fire," since a near-simultaneous
+mempool dump would tend to co-locate both in one block, the exploit needing only `K`
+already present, not the primer mined. Not dispositive.)
+
+**Manual confirmation cadence (if hand-driven).** A human re-issuing `gettransaction`
+would type at ~10–20 s per attempt during an active watch burst, not starting until
+~30–60 s post-broadcast (the first block is tens of seconds away and `confirmations` can
+change only once per 60 s, so sub-10 s polling is pointless). The N+1 requirement pins a
+*lower* bound — effective discovery latency ≤ ~30 s to reliably make N+1 — which trims the
+minute-scale tail but does **not** push toward sub-second / high-frequency polling. Net
+shape: idle ~45 s → 10–20 s bursts near the expected block → fire on first sight of a
+primer in a block. The exact in-band cadence is chain-unrecoverable.
+
+**Does hand-polling load the RPC node? No — negligible.** The human is the rate limiter
+(~0.05–0.1 req/s at a 10–20 s cadence); `gettransaction` is a read-only, sub-ms
+`mapWallet` lookup that touches neither mempool acceptance nor block validation nor
+consensus; and a serial "next call only after the previous returns" loop keeps ≤ 1
+request in flight, so it structurally cannot overflow `-rpcworkqueue` (default 16) or
+starve `-rpcthreads` (default 4) — those need *concurrent* flooding. Even a machine
+busy-loop stays a few % of one core server-side; a human is 2–3 orders of magnitude
+slower. (This mirrors the `POLL_INTERVAL` note: a 1 s poll does ~5× the calls of the 5 s
+default for identical information — waste, not a stability risk.)
+
+**OPSEC reads.**
+
+- **Trace *location*, not density, is the axis that matters.** Hand-confirming against
+  one's own `elementsd` over `127.0.0.1` leaves traces only on the attacker's own box
+  (shell history; `debug.log` only if `-debug=rpc`, off by default) with **no network
+  egress** — invisible to ISP, explorer and the Liquid network; forensics reaches them
+  only by seizing / imaging the machine, at which point RPC-log *density* is trivia next
+  to the wallet keys, exploit hex and reused address already on disk. By contrast a
+  third-party **explorer** query plants the txid + timing on someone else's server,
+  subpoena-able without ever touching the attacker — that is the real leak, and it is what
+  makes own-node querying beat explorer-refresh. Poll frequency is OPSEC-neutral.
+  ("Local ⇒ unreachable" is not absolute: machine seizure / arrest, VPS / cloud imaging or
+  remote syslog, and non-loopback RPC over LAN / SSH each move the trace onto hardware the
+  attacker does not fully control.)
+- **Address reuse is the one OPSEC-unclean point.** All three attack txs *and* the funding
+  tx return change to the same P2WPKH `ex1q7kg…` (§4.6). On a permanent public ledger this
+  is explicit clustering: it hands analysts the change-address heuristic for free, extends
+  linkage beyond the already-unhideable primer↔exploit relation to bind the **funding
+  source** and change trail into one identity anchor, and creates a single point of
+  de-anonymization — if that address ever touches an identifiable event (KYC, IP leak,
+  reuse elsewhere) the whole campaign collapses to it in one step. Clean OPSEC would use a
+  fresh address per output and unlinkable (e.g. coinjoined) funding. That the attacker did
+  not suggests anonymity was deprioritized in favor of simple 3-UTXO coin-control, or that
+  the far end of the funds path was already considered clean. (Consistent with the
+  "conservative prep, coarse confirmation" character of the operation.)
+
+**Bottom line.** The wallet-shaped self-funding makes a manual
+`getrawtransaction` / `gettransaction` confirm-then-fire flow entirely viable and
+data-consistent, so it cannot be ruled out; a local `sendrawtransaction` + P2P submission
+of `V1` is likewise viable **if** the node was positioned inside the primed fixed-code
+subgraph (§4.6). What is ruled out is `V1` reaching the signer over the general public
+network. The features that tilt toward a scripted, well-positioned run — the ~60 s window
+against a byte-crafted `V1`, and `V1`'s partition-limited relay — are non-wallet facts;
+tooling and topology are simply not recoverable from on-chain data.
 
 ---
 
@@ -426,13 +744,16 @@ which was identified by an independent researcher; see §5.2 items 7–8.):
   amounts use rangeproofs that went through the same (formerly buggy) checker —
   covered by the same fix.
 - **Consequence landmine (not a separate vuln, and *not* addressed by the fix):** the
-  erase-on-read semantics (`Get(entry, /*erase=*/!store)`) mean a node that accepted
-  the invalid block *consumed* its cache entry. On reorg disconnect/reconnect, or on
-  the startup `-checkblocks` re-validation of recent blocks (which re-runs
-  `ConnectBlock`), such a node **fails to re-validate the very block it accepted**
-  and errors out (forcing a reindex onto the honest chain). Restarting also wipes
-  the cache. This explains part of the observed post-attack network behavior and
-  means accepting-side infrastructure is fragile until patched and reindexed.
+  rangeproof cache is per-process, in-memory and **wiped on restart** (per-process
+  salt). The entry itself is *not* consumed on read — the erase is lazy (§2.3) — so a
+  node that accepted the invalid block re-validates it fine on a reorg
+  disconnect/reconnect **without** a restart. But once the process restarts, or on a
+  startup `-checkblocks` re-validation that runs after the cache is already empty, `K`
+  is gone and such a node **fails to re-validate the very block it accepted**, erroring
+  out (forcing a reindex onto the honest chain). This explains part of the observed
+  post-attack network behavior and means accepting-side infrastructure is fragile until
+  patched and reindexed. *(An earlier revision blamed erase-on-read for consuming the
+  entry; the source shows the erase is lazy, so the real fragility is the restart-wipe.)*
 
 ### 5.2 Adjudication of alternative root-cause theories (rev. 2, 2026-09-07)
 
@@ -467,8 +788,8 @@ follow from the byte-level reproduction in §2.4.
    because the key encoding is ambiguous (item 7): the attacker's two tuples have
    different contexts but identical key byte streams (§2.4). What remains true: a
    restart wipes the cache (per-process salt), so a primed entry cannot survive a
-   restart; and priming requires mempool acceptance in the same inter-block era
-   (§2.3).
+   restart; and priming requires mempool acceptance to plant `K`, which then persists
+   across blocks (lazy erase, §2.3) — with no same-inter-block-era constraint.
 6. **The August 2026 secp256k1-zkp update is the "real" fix / the split cause?** No.
    The subtree bump `95b983597a..a2b001cc20` (merged 2026-08-14, `9bc77876a3`;
    deployed to 23.3.x/23.x/29.x on 2026-08-21 via #1585/#1586/#1587) hardens
@@ -506,7 +827,7 @@ follow from the byte-level reproduction in §2.4.
    researcher's claim, 2026-09-07)** **Yes — confirmed and reproduced.** The
    third-party analysis argued: the *fixed* key is a raw, undelimited concatenation
    `proof‖commitment‖asset‖script`; the attacker stretched the proof and shrank the
-   script so the exploit tuple and a dry-run primer tuple hash to identical bytes;
+   script so the exploit tuple and a primer tuple hash to identical bytes;
    therefore the accepting side ran the fixed code and the fork attribution is
    inverted. Every element checks out byte-for-byte (§2.4): the fixed-key streams
    are identical (4,301 B, sha256 `82b0b8cc…9c01a`), the pre-fix keys are not, and
@@ -544,7 +865,8 @@ as of this writing **no delimiting follow-up exists in any branch**
 
 **Residual operational exposure:** Bug A is live in every released version; Bug B is
 live in every build of the fix; and the patch leaves the fragile cache-as-consensus
-design in place (erase-on-read footgun, §2.3) rather than removing the rangeproof
+design in place (a valid-proof memoization on the consensus path that a forged
+key-collision can hit, §2.3) rather than removing the rangeproof
 cache from the consensus path. Until a delimiting fix (or cache removal) ships, the
 network is one primed mempool away from a repeat — against *whichever* keying the
 victim runs. Rev. 1's "residual gap" caveat (accepting nodes possibly running fixed
@@ -557,14 +879,16 @@ mempool logs show (§6).
 
 ## 6. Open items / limitations
 
-1. **Live priming transaction mempool-only — now the expected shape, not a gap.**
-   Cache-era mechanics (§2.3) require the primer to be mempool-live on the accepting
-   nodes in the ~60 s before 4050336 connected; it never needed to be mined.
+1. **`K` came from the 4050335 primers' mempool acceptance — not a hidden mempool-only
+   primer.** Priming needs the primer **mempool-accepted** on the accepting nodes (that
+   inserts `K`); because the erase is lazy, `K` then persists across blocks (§2.3), so
+   the two primers mined into 4050335 suffice and no separate, later primer is required.
    Consistent with that: the **1,500-block (~25 h) pre-fork scan** on the valid chain
    (`scan_back.py`, `DONE found=[]`) found no `C1` and no blob bytes except the
-   4050335 dry-run pair, and **all five other non-coinbase txs of 4050336** were
-   fetched and parsed (§4.5) — none carries the primer tuple. Only the accepting
-   nodes' mempool acceptance logs / `debug.log` can identify the live primer.
+   4050335 primer pair, and **all five other non-coinbase txs of 4050336** were
+   fetched and parsed (§4.5) — none carries the primer tuple. The only thing not on
+   chain is the exact mempool-acceptance timing, visible only in the accepting nodes'
+   `debug.log` / mempool logs.
 2. Which exact builds the accepting functionaries/explorers ran — established to be
    **post-fix, unreleased** (23.3.4rc2-era; §2.4, §4.5), but the precise commit set
    and deployment date can only be confirmed by the vendor.
