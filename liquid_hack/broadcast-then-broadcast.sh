@@ -285,8 +285,10 @@ main() {
   # getblockcount needs no wallet and no -txindex, so it validates the RPC connection
   # for every method and fails fast, instead of letting a bad endpoint/auth/-chain
   # masquerade as "still unconfirmed" until TIMEOUT. Capturing into a variable (not
-  # nesting the RPC in $(( ... ))) also stops a transient failure from being read as 0
-  # and seeding _scan_from=1, which would rescan from genesis.
+  # nesting the RPC in $(( ... ))) also stops a transient failure from silently seeding
+  # _scan_from=1: an empty command substitution vanishes, leaving `$(( + 1 ))`, which
+  # bash evaluates via the UNARY plus (NOT "empty read as 0" -- `$(( <empty> * 1 ))` is a
+  # syntax error, not 0) to 1, then rescanning the whole chain from height 1.
   local tip
   tip=$(rpc getblockcount) || die "cannot reach node via '${CLI[*]}' (getblockcount failed) -- check ELEMENTS_CLI / rpc endpoint / auth / -chain"
   [[ "$CONFIRM_METHOD" == scan ]] && _scan_from=$(( tip + 1 ))
