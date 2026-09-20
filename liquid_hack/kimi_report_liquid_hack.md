@@ -453,7 +453,10 @@ sensible, subject to two conditions:
   = 69 B `S0`, exploit = 1 B bare `6a`) are exotic. That is textbook wallet coin-control (a
   deliberate 3-UTXO pre-stage). So if the `ex1q7kg…` key sits in the node's `elementsd`
   wallet, `gettransaction` reports each tx's `confirmations`/`blockhash` with **no
-  `-txindex`**. The only thing on-chain data cannot settle is key custody — node wallet vs.
+  `-txindex`** (both fields are filled by the wallet helper `WalletTxToJSON` straight from
+  the tx's own `CWalletTx` state — `src/wallet/rpc/transactions.cpp:19`–`36`; `blockhash` is
+  optional, present only once the tx reaches `TxStateConfirmed`, i.e. is mined into the main
+  chain). The only thing on-chain data cannot settle is key custody — node wallet vs.
   an external signer + raw assembly; only in the latter case does `gettransaction` return
   "Invalid or non-wallet transaction id", and you fall back to `getrawtransaction <txid>
   true` +txindex, `gettxout`/`scantxoutset`, a `getblock <hash> 2` scan, or an explorer.
@@ -463,7 +466,10 @@ sensible, subject to two conditions:
   block, which may not contain the primer:
   `gettransaction` once; then `while conf < REQUIRED_CONF: waitfornewblock;
   gettransaction`. On Liquid (reorgs ≤ 1 block, `gettransaction` confirmations are
-  active-chain-fresh) `REQUIRED_CONF=1` suffices, `2` is the safe choice.
+  active-chain-fresh — `confirmations = tip_height − block_height + 1`, recomputed against
+  the current tip on every call, `CWallet::GetTxDepthInMainChain`, `src/wallet/wallet.cpp:3908`;
+  so `confirmations == 1` means the tx's block is itself the tip, and a negative value means
+  the tx conflicts with a block that many deep) `REQUIRED_CONF=1` suffices, `2` is the safe choice.
 
 This pattern is exactly the **event-driven form of this repo's default wallet method**:
 `broadcast-then-broadcast.sh` polls with `sleep POLL_INTERVAL` + `gettransaction`
