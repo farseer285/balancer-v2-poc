@@ -186,7 +186,7 @@ erase-on-connect, which the source refutes): (i) only mempool acceptance primes
 **persists across its own block-connect and across many later blocks** — until some
 `insert` happens to overwrite that slot, rare on low-volume Liquid — so there is **no
 "same inter-block era" constraint** and the exploit's block-timing window is **wide**: a
-forged `V1` in block N+1, N+2 or N+k all still hit `K`. This is the article's plain
+forged `V1` in block N+1, N+2 or N+k all still hit `K`. Quantitatively, the rangeproof cache defaults to `DEFAULT_VALIDATION_CACHE_BYTES/4` = 8 MiB = **262,144** 32-byte slots (`sigcache.h:33`, `kernel/validation_cache_sizes.h:18`), and evicting a lazily-marked `K` requires a later `insert()` to reuse its slot — on the order of the cache's own capacity in *new, distinct* rangeproofs (physical overwrite ≈ N/8–N inserts; epoch aging is the same order, `cuckoocache.h:286`/`414-420`). At Liquid's ~1-block/min, few-rangeproofs-per-block volume that is on the order of **weeks** of continuous traffic (a throughput-dependent estimate), ~3–5 orders of magnitude beyond the minute-scale exploit window — so the window is bounded in practice by process restart, not by cache churn. This is the article's plain
 memoization model and matches the on-chain data; (iii) because the entry is not
 consumed, a node **can** re-validate the block it accepted (a reorg disconnect/reconnect
 *without a restart* still finds `K`); the residual fragility is that the cache is
@@ -807,7 +807,7 @@ follow from the byte-level reproduction in §2.4.
    because the key encoding is ambiguous (item 7): the attacker's two tuples have
    different contexts but identical key byte streams (§2.4). What remains true: a
    restart wipes the cache (per-process salt), so a primed entry cannot survive a
-   restart; and priming requires mempool acceptance to plant `K`, which then persists
+   restart (on restart, `LoadMempool` re-runs ATMP per persisted tx — `node/mempool_persist.cpp:61`, expired txs skipped `:59` — so an *unconfirmed* primer still in mempool.dat re-plants `K` on reload, whereas a *confirmed* primer — out of the mempool, in an already-connected block that is not re-validated — does not, so re-priming a restarted node needs a fresh primer); and priming requires mempool acceptance to plant `K`, which then persists
    across blocks (lazy erase, §2.3) — with no same-inter-block-era constraint.
 6. **The August 2026 secp256k1-zkp update is the "real" fix / the split cause?** No.
    The subtree bump `95b983597a..a2b001cc20` (merged 2026-08-14, `9bc77876a3`;
