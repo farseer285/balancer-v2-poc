@@ -509,6 +509,22 @@ guarantee**:
   primer's *mempool acceptance*, not its confirmation; to maximize the chance of catching
   a chosen next block one would keep the primer mempool-live (re-broadcasting) and time /
   directly submit `V1`, rather than wait for a confirmation that only arrives later.
+- **RPC submission order does not control cross-node processing order — so back-to-back
+  `sendrawtransaction` cannot sequence primer-before-`V1` at the signer.** `sendrawtransaction`
+  runs ATMP synchronously under `cs_main` (`rpc/mempool.cpp:110` → `BroadcastTransaction`),
+  so on the *entry* node the primer is accepted (and `K` planted) before `V1` is evaluated.
+  That guarantee is **local to the entry node and dies at the P2P hop**: a node announces
+  queued tx inventory to each peer in **fee/ancestor order, not submission order** —
+  `net_processing.cpp:5809` heap-sorts via `CompareInvMempoolOrder` →
+  `CTxMemPool::CompareDepthAndScore` (fewer-ancestors first, tie → higher fee-rate) — so a
+  higher-fee `V1` can be *announced before* the primer, and poisson-jittered trickle timers
+  (`net_processing.cpp:133-144`) plus multi-hop paths desynchronize the two further. Hence
+  `sendrawtransaction(primer); sendrawtransaction(V1)` does **not** guarantee the functionary
+  mempool-accepts (and primes `K` for) the primer first — if `V1` reaches it first it hits a
+  `K`-less mempool and is rejected as invalid. What makes priming reliable is not call order
+  but **temporal separation** — the primer propagating and being mempool-accepted network-wide
+  before `V1` is broadcast — underwritten by `K`'s cross-block persistence (§2.3). This is
+  exactly why the confirm-gate / wide-window posture, not tight call ordering, is the robust one.
 
 **Did the real attacker use the manual `waitfornewblock`+`gettransaction` flow? —
 Judgment: possible, but unlikely the actual method.** On-chain data fixes the *sequence*
@@ -638,7 +654,10 @@ manual-vs-scripted and timer-vs-gate are equally chain-unrecoverable. (A mild le
 a confirm-gate over a blind timer: the txs sit in *adjacent* rather than the *same*
 block — the natural output of "see primer in N, then fire," since a near-simultaneous
 mempool dump would tend to co-locate both in one block, the exploit needing only `K`
-already present, not the primer mined. Not dispositive.)
+already present, not the primer mined — though such a dump does **not** itself guarantee
+the signer accepts the primer first: P2P relay announces in fee/ancestor order, not
+submission order (§4.6), so `V1` can reach the signer before `K` is planted and be rejected,
+a further reason to prefer the confirm-gate. Not dispositive.)
 
 **Manual confirmation cadence (if hand-driven).** A human re-issuing `gettransaction`
 would type at ~10–20 s per attempt during an active watch burst, not starting until
