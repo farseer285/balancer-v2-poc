@@ -132,10 +132,18 @@ broadcast() {
 }
 
 # --- confirmation via wallet gettransaction (DEFAULT; needs NO -txindex) ---
-# Works for transactions the wallet knows about (its own). While the tx sits in
-# the mempool, gettransaction reports confirmations=0 and no blockhash. Once
-# mined it reports blockhash + confirmations>0; a reorg drops it back to 0 (or
-# negative if a conflicting tx confirmed), so REQUIRED_CONF gates false starts.
+# Works for transactions the wallet knows about (its own).
+# confirmations semantics (wallet gettransaction):
+#   > 0  active-chain depth; blockhash present         (state TxStateConfirmed)
+#   = 0  in mempool / not in any block; no blockhash
+#   < 0  conflicted: inputs re-spent by a mined tx; |value| = that tx's depth;
+#        no blockhash                            (state TxStateBlockConflicted)
+# So blockhash present <=> confirmations >= 1, and a conflicted (negative) tx
+# never carries a blockhash: it is already caught by the `[[ -z "$bh" ]]` guard
+# below, so the `>= REQUIRED_CONF` test only gates depth (fires at REQUIRED_CONF>=2).
+# A reorg moves a tx out of Confirmed back to 0/negative (its blockhash goes too).
+# (getrawtransaction is never negative: a stale/side-chain block reports 0 WITH a
+# blockhash -- see confirmed_getraw.)
 # Echoes the blockhash when confirmed with >= REQUIRED_CONF; echoes nothing
 # while still pending.
 # Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed by
@@ -157,7 +165,7 @@ confirmed_wallet() {
   bh=$(jq -r '.blockhash // empty' <<< "$json" 2>/dev/null)   || return 0
   conf=$(jq -r '.confirmations // 0' <<< "$json" 2>/dev/null) || return 0
   [[ -z "$bh" ]] && return 0                            # still in mempool
-  (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # negative == conflicted -> stays empty
+  (( conf >= REQUIRED_CONF )) && _conf_result="$bh"     # blockhash => conf>=1; gates depth only
   return 0
 }
 
@@ -166,6 +174,13 @@ confirmed_wallet() {
 # depth (txindex is synced to the current chain first, and a stale block reports 0), so
 # `conf >= REQUIRED_CONF` already means "REQUIRED_CONF-deep on the active chain." An
 # in_active_chain re-query would therefore be REDUNDANT, so it is intentionally omitted.
+# confirmations semantics (getrawtransaction), unlike the wallet's:
+#   >= 1  block on the active chain (depth); blockhash present
+#   = 0   block exists but is stale/side-chain (off active); blockhash present
+#   mempool: NO confirmations field AND no blockhash -- the RPC skips its whole
+#            block branch (hashBlock is null), so `[[ -z "$bh" ]]` catches it
+# Never negative (no wallet conflict tracking). So an emitted `confirmations == 0`
+# always means a stale block WITH a blockhash, which `>= REQUIRED_CONF` rejects.
 # Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed by
 # any check. To make it HARMLESS when TX2 depends on TX1 finality, set REQUIRED_CONF=2
 # on Liquid (reorgs <= 1 block) so TX1 has a child block and is final before TX2 is sent.

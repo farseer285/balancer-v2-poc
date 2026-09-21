@@ -159,10 +159,19 @@ def broadcast(hexstr):
 
 class WalletConfirmer:
     """Confirm via wallet gettransaction (DEFAULT). Needs a loaded wallet, no
-    -txindex. Only sees transactions the wallet knows about (its own). While the
-    tx is in the mempool, gettransaction reports confirmations=0 and no blockhash;
-    once mined it reports blockhash + confirmations>0. A reorg drops it back to 0,
-    or negative if a conflicting tx confirmed, so REQUIRED_CONF gates false starts.
+    -txindex. Only sees transactions the wallet knows about (its own).
+
+    confirmations semantics (wallet gettransaction):
+      > 0  active-chain depth; blockhash present         (state TxStateConfirmed)
+      = 0  in mempool / not in any block; no blockhash
+      < 0  conflicted: inputs re-spent by a mined tx; |value| = that tx's depth;
+           no blockhash                            (state TxStateBlockConflicted)
+    So blockhash present <=> confirmations >= 1, and a conflicted (negative) tx
+    never carries a blockhash: it is already rejected by the `if not bh` guard
+    below, so the >= REQUIRED_CONF test only gates depth (fires at REQUIRED_CONF>=2).
+    A reorg moves a tx out of Confirmed back to 0/negative (its blockhash goes too).
+    (getrawtransaction is never negative: a stale/side-chain block reports 0 WITH
+    a blockhash -- see RawConfirmer.)
 
     Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed
     by any check. To make it HARMLESS when TX2 depends on TX1 finality, wait for
@@ -183,7 +192,7 @@ class WalletConfirmer:
         bh = info.get("blockhash")
         if not bh:
             return None                       # still in mempool
-        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:   # negative = conflicted
+        if int(info.get("confirmations", 0)) >= REQUIRED_CONF:   # blockhash => conf>=1; gates depth only
             return bh
         return None
 
@@ -194,6 +203,14 @@ class RawConfirmer:
     ACTIVE-CHAIN depth (txindex is synced first; a stale block reports 0), so
     conf >= REQUIRED_CONF already means "REQUIRED_CONF-deep on the active chain." An
     in_active_chain re-query would be REDUNDANT, so it is omitted.
+
+    confirmations semantics (getrawtransaction), unlike the wallet's:
+      >= 1  block on the active chain (depth); blockhash present
+      = 0   block exists but is stale/side-chain (off active); blockhash present
+      mempool: NO confirmations field AND no blockhash -- the RPC skips its whole
+               block branch (hashBlock is null), so `if not bh` catches it
+    Never negative (no wallet conflict tracking). So an emitted `confirmations == 0`
+    always means a stale block WITH a blockhash, which the >= REQUIRED_CONF test rejects.
 
     Gap note: the confirm-decision -> TX2-broadcast window (in main) cannot be closed
     by any check. To make it HARMLESS when TX2 depends on TX1 finality, set
