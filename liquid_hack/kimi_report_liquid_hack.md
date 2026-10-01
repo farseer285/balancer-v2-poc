@@ -272,6 +272,7 @@ block data itself.**
 
 - **08-03** fix authored (`c26d719c29`)
 - **08-03** fix commit authored (`c26d719c29` git author date) — internal knowledge ~4 weeks pre-attack; **09-01** merged to `master`; **09-02** cherry-picked to `elements-23.x` (`6253d7e103`); **09-03/09-04** the `elements-23.3.x` cherry-pick (`212c43f475`) and its backport PR #1599 become public. **No release ever tags the fix.**
+- **08-03** fix also **deployed to production + testnet _bridge_ nodes** the same day; **08-11** **13 of 15 _functionary_ nodes updated** with the fix (rest shortly after) — per Blockstream's incident assessment. The signing set thus ran the Bug-B build ~3.5 weeks pre-attack, well before the 09-01 public merge (§4.8).
 - **09-06 ~12:30–12:39** blocks 4050334–4050335 (valid on both future sides). `71c93d43…f411` and `27114710…7ec5` in 4050335 carry *identical* explicit-L-BTC OP_RETURN outputs `(P0, C0, X, S0)` — the primer tuple (§2.4): the first copy stores cache entry `K` on every fixed-code mempool that verifies it, and the duplicate independently re-plants the same `K` (hitting it on its own mempool acceptance) — **redundancy / insurance** so at least one primer propagates, not a rehearsal (§4.6), minutes before the attack.
 - **~12:40** block 4050336 `e1d9a2aa…` mined with `f24a4b17…183f` (`V1`). **Fork.** Acceptance by the signing functionaries identifies their builds as **unreleased fixed code with primed caches** — pre-fix code cannot accept this tuple (§2.4, §4.5).
 - **~12:44** `46f117c9…` @4050344: 2.65138358 BTC explicit `sendtomainchain` OP_RETURN.
@@ -719,6 +720,109 @@ network. The features that tilt toward a scripted, well-positioned run — the ~
 against a byte-crafted `V1`, and `V1`'s partition-limited relay — are non-wallet facts;
 tooling and topology are simply not recoverable from on-chain data.
 
+### 4.8 Network topology, the signing threshold, and the official deployment timeline (vendor assessment + protocol/code verification)
+
+This section integrates Blockstream's published *Liquid Network Security Incident
+Assessment* with a protocol/topology verification run against the local `../elements`
+tree (HEAD `c7e856fab1`, which contains the fix commit `c26d719c29`) and Blockstream's
+own participant documentation. It resolves part of §6 item 2 (deployment date) and gives
+§4.6's "primed fixed-code subgraph" its concrete shape.
+
+**(a) Official deployment timeline — reconciles §4.2.** The vendor assessment states the
+fix was *deployed before it was public*, in this order:
+
+| date | event | source |
+|---|---|---|
+| **08-03** | fix authored (`c26d719c29`) **and deployed to production + testnet _bridge_ nodes** the same day | assessment; git author date (§2.2) |
+| **08-11** | **13 of 15 _functionary_ nodes updated** with the fix (rest "shortly afterward") | assessment |
+| **09-01** | fix merged to public `master` — "the code containing Bug B is publicly visible" | assessment; §2.2 |
+| **09-06** | attack | §4.2 |
+
+This does **not** contradict the git facts of §2.2/§4.2 — it adds the operational dates
+git history cannot show. The functionaries ran a *private build of the Aug-3 commit* from
+≈08-11, ~3.5 weeks before the attack and a month before the public merge. So the exposure
+has two distinct spans: the **production exposure of the signing set** opened ≈08-11
+(vendor-confirmed), while the **public-diff window** the attacker is presumed to have
+reverse-engineered (§1, §7.5) is the 09-01→09-06 span. The attacker could learn Bug B
+from the 09-01 diff *and* rely on the standard "deploy-before-disclose" ordering to infer
+the signing set was already running it: publishing the fix both revealed the bug and
+signalled that production was armed.
+
+**(b) The signing threshold is 11-of-15 — not "majority."** A Liquid block is canonical
+only if its witness satisfies the `signblockscript`, an **11-of-15** federation multisig
+(Blockstream help center; in code `block_proof.cpp` `CheckProof → CheckProofGeneric →
+GenericVerifyScript(…, challenge = signblockscript)`, enforced by every node at
+`validation.cpp:4471`). A functionary signs only after its own node validates the proposed
+block (§4.8(d)), so **`V1`'s block can collect a signature only from a functionary that is
+both fixed-code and primed** — an unpatched functionary (still Bug A) or a cold-cache
+fixed one runs the real check, fails, and refuses to sign (the §4.5 matrix, now applied to
+the *signing* decision). Consensus-exploitability therefore requires **≥11 functionaries
+simultaneously fixed-code and primed**, not a bare majority (8). The 08-11 snapshot (13/15)
+clears 11, so the network was consensus-exploitable **no later than 08-11**; the true start
+is whenever the 11th node crossed over (≤08-11, not disclosed). Priming the signing set is
+attacker-controllable and network-wide — the valid primer floods and plants `K` on every
+fixed node it reaches (§4.6), bridges and functionaries alike.
+
+**(c) The "primed fixed-code subgraph" of §4.6 is, concretely, the federation bridge
+layer.** Blockstream's participant documentation states that ordinary Liquid full nodes
+**cannot connect directly to functionaries** — the participant table marks *"connects
+directly to functionaries: ✗"* for Liquid nodes — that "bridge nodes connect Liquid nodes
+to the functionaries," are operated by federation members only, reach the functionaries
+over Tor, and that "nearly all transactions pass through a bridge node before reaching
+block-producing nodes." A bridge node is a **standard `elementsd` full node** (the Elements
+tree has no "bridge" concept at all — grep over `src` finds only `fsbridge`/i2p) configured
+as a relay/DoS shield. Being `elementsd`, it validates every transaction's rangeproof on
+the mempool-acceptance path (`MemPoolAccept::PreChecks` → `Consensus::CheckTxInputs(…,
+cacheStore=true, fScriptChecks=true)` at `validation.cpp:1100` → the `fScriptChecks &&
+!VerifyAmounts(...)` gate at `tx_verify.cpp:250` → the Bug-B cache), and it **relays only
+what it accepts** (`RelayTransaction` fires only after `AcceptToMemoryPool` succeeds,
+`net_processing.cpp:3070`; there is no relay-without-validate mode short of `-blocksonly`,
+which relays nothing).
+
+Consequence: an **unpatched bridge rejects `V1` and does not relay it** — `V1` dies at the
+gateway and never reaches a functionary mempool. So under the §4.6 model (local
+`sendrawtransaction` + P2P, no direct functionary channel), **the bridge nodes running the
+fixed (Bug B) build is a necessary precondition** for `V1` to reach the signers — satisfied
+on **08-03**. This refines §4.6: the subgraph `V1` rides is `attacker node → fixed+primed
+federation bridge(s) → functionaries`, and the earlier phrase "peered with a functionary"
+should read **"peered with a federation bridge node,"** since outside nodes cannot peer a
+functionary directly. The bridge patch (08-03) is a genuine link in the chain — necessary,
+but earlier than and dominated by the 11-of-15 functionary bottleneck (08-11).
+
+**(d) Where Bug B runs — `elementsd` vs. the functionary daemon + HSM.** Bridges and
+functionaries both run `elementsd`, and the rangeproof cache (Bug B,
+`src/script/sigcache.cpp`) lives in `elementsd`; both therefore validate `V1` with the
+identical buggy code — which is why the §4.5 behavior matrix is node-type-agnostic. A
+functionary is **not** just `elementsd`: it additionally runs the separately open-sourced
+blocksigner/watchman daemon and an HSM holding the signing keys ("no signing key material
+is stored on the host"). None of that is in the Elements tree — grep finds only the
+`MatchLiquidWatchman` *script-matching* helper (`pegins.cpp`) and RPC help strings, no HSM
+or signing daemon (an absence-of-code inference; the orchestration lives in the separate
+functionary repo). The signing decision is nonetheless gated by `elementsd`: the
+proposal/`signblock` path calls `TestBlockValidity` (`rpc/mining.cpp:412,774`,
+`fCheckPOW=false`) → `ConnectBlock` → the Bug-B cache. The HSM signs *after* `elementsd`
+reports the block valid, so **Bug B in the `elementsd` layer alone is sufficient to make a
+functionary sign `V1`'s block** — the key module signs what the (fooled) node validated.
+
+**Two necessary preconditions (external-attacker + P2P model).**
+
+| precondition | satisfied | role | evidence |
+|---|---|---|---|
+| Bridge layer fixed-code (+primed) — lets `V1` cross the only gateway to the signers | **08-03** | necessary, not the bottleneck | official topology + ATMP code (c) |
+| ≥11 functionaries fixed-code + primed — lets `V1`'s block reach 11/15 signatures | **08-11** (13/15) | **bottleneck** | assessment + `block_proof.cpp` (b) |
+
+The attack-feasible window opens at the later condition, ≈**08-11**. Scope caveat: this
+holds for an *external* attacker relying on P2P delivery; a federation insider with a
+direct functionary channel would make the bridge precondition moot (not supported by any
+evidence, and outside the vendor assessment).
+
+*Sources: Blockstream, "Liquid Network Security Incident Assessment"; Blockstream Help
+Center — "types of participants in the Liquid Network" (direct-to-functionary ✗) and "how
+the federation multisig works" (11-of-15); docs.liquid.net Technical Overview; local
+`../elements` @ `c7e856fab1` (`script/sigcache.cpp`, `confidential_validation.cpp:64`,
+`consensus/tx_verify.cpp:250`, `validation.cpp:916/1100/2780/4471`, `block_proof.cpp`,
+`rpc/mining.cpp:412,774`, `net_processing.cpp:3070`).*
+
 ---
 
 ## 5. Affected versions
@@ -915,8 +1019,10 @@ mempool logs show (§6).
    chain is the exact mempool-acceptance timing, visible only in the accepting nodes'
    `debug.log` / mempool logs.
 2. Which exact builds the accepting functionaries/explorers ran — established to be
-   **post-fix, unreleased** (23.3.4rc2-era; §2.4, §4.5), but the precise commit set
-   and deployment date can only be confirmed by the vendor.
+   **post-fix, unreleased** (23.3.4rc2-era; §2.4, §4.5). The **deployment dates are now
+   vendor-confirmed** by Blockstream's incident assessment — _bridge_ nodes 08-03, 13/15
+   _functionary_ nodes 08-11 (§4.8) — but the precise commit set per node remains
+   vendor-only.
 3. Whether `V2` was ever broadcast on the P2P network or only seen by one explorer
    backend; its purpose is inferred (first-generation design, killed by `HasValidFee`).
 4. mempool.space's Liquid backend was unreachable during analysis; its fork position
